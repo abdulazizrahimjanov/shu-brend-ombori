@@ -11,7 +11,7 @@ export default defineConfig(() => {
       tailwindcss(),
       VitePWA({
         registerType: 'autoUpdate',
-        includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png'],
+I        includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png'],
         manifest: {
           id: '/',
           name: 'SHU BREND OMBOR — Chakana savdo va ombor',
@@ -93,7 +93,7 @@ export default defineConfig(() => {
       forwardConsole: false,
     },
     preview: {
-      allowedHosts: ['ombor-hvw6.onrender.com'],
+     allowedHosts: ['ombor-hvw6.onrender.com', 'shu-brend-ombori.onrender.com'],
     },
   };
 });
