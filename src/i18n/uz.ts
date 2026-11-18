@@ -50,6 +50,7 @@ export const uz = {
     internetAvailable: 'Internet mavjud',
     syncing: 'Sinxronlanmoqda...',
     cloudSynced: 'Bulutga ulangan',
+    localOnlyShort: 'Bulut ulanmagan',
     syncPending: 'Sinxronlash kutilmoqda',
     syncNow: 'Sinxronlash',
     installApp: "Ilovani o'rnatish",

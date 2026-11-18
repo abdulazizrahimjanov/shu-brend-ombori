@@ -27,6 +27,7 @@ import {
   Info,
   Check,
   ChevronRight,
+  Cloud,
 } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
 import { useT } from '../i18n';
@@ -73,6 +74,7 @@ export const Layout: React.FC = () => {
   const isOnline = useAppStore((s) => s.isOnline);
   const syncStatus = useAppStore((s) => s.syncStatus);
   const cloudConnected = useAppStore((s) => s.cloudConnected);
+  const firebaseEmail = useAppStore((s) => s.firebaseEmail);
   const cloudError = useAppStore((s) => s.cloudError);
   const lastSyncAt = useAppStore((s) => s.lastSyncAt);
   const checkAndSyncNow = useAppStore((s) => s.checkAndSyncNow);
@@ -86,6 +88,7 @@ export const Layout: React.FC = () => {
   const switchUserByPin = useAppStore((s) => s.switchUserByPin);
   const updateUserCredentials = useAppStore((s) => s.updateUserCredentials);
   const setShowOnboarding = useAppStore((s) => s.setShowOnboarding);
+  const loginWithGoogle = useAppStore((s) => s.loginWithGoogle);
   const logout = useAppStore((s) => s.logout);
   const toasts = useAppStore((s) => s.toasts);
   const dismissToast = useAppStore((s) => s.dismissToast);
@@ -303,19 +306,31 @@ export const Layout: React.FC = () => {
             <div className="flex items-center gap-2 shrink-0">
               <button
                 type="button"
-                onClick={() => void checkAndSyncNow()}
+                onClick={() => {
+                  if (!cloudConnected && isOnline) {
+                    void loginWithGoogle().then((res) => {
+                      if (!res.ok && res.error) notify(res.error, 'error');
+                    });
+                  } else {
+                    void checkAndSyncNow();
+                  }
+                }}
                 title={
-                  lastSyncAt
+                  !cloudConnected
+                    ? "Bulutli sinxronlash uchun Google orqali kiring"
+                    : lastSyncAt
                     ? `Oxirgi tekshiruv: ${new Date(lastSyncAt).toLocaleTimeString()}`
                     : 'Sinxronlash holatini tekshirish'
                 }
-                className={`hidden sm:inline-flex items-center gap-1.5 px-2.5 h-8 rounded-lg border text-[11px] font-medium whitespace-nowrap transition-opacity hover:opacity-80 ${
+                className={`inline-flex items-center gap-1.5 px-2 sm:px-2.5 h-8 rounded-lg border text-[11px] font-medium whitespace-nowrap transition-opacity hover:opacity-80 ${
                   !isOnline
                     ? 'border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300'
                     : cloudError
                     ? 'border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/50 text-red-700 dark:text-red-300'
                     : syncStatus === 'syncing'
                     ? 'border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300'
+                    : !cloudConnected
+                    ? 'border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300'
                     : 'border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300'
                 }`}
               >
@@ -327,6 +342,8 @@ export const Layout: React.FC = () => {
                       ? 'bg-red-500'
                       : syncStatus === 'syncing'
                       ? 'bg-blue-500 animate-pulse'
+                      : !cloudConnected
+                      ? 'bg-amber-500'
                       : 'bg-emerald-500'
                   }`}
                 />
@@ -337,7 +354,7 @@ export const Layout: React.FC = () => {
                     ? t.common.syncing
                     : cloudConnected
                     ? t.common.cloudSynced
-                    : t.common.internetAvailable}
+                    : t.common.localOnlyShort}
                 </span>
               </button>
 
@@ -614,6 +631,36 @@ export const Layout: React.FC = () => {
                   ))}
                 </div>
               )}
+
+              <button
+                type="button"
+                onClick={() => {
+                  setAvatarSheetOpen(false);
+                  if (!cloudConnected && isOnline) {
+                    void loginWithGoogle().then((res) => {
+                      if (!res.ok && res.error) notify(res.error, 'error');
+                    });
+                  } else {
+                    void checkAndSyncNow();
+                  }
+                }}
+                className="w-full px-4 py-3.5 flex items-center justify-between text-sm font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800/60"
+              >
+                <span className="flex items-center gap-3 min-w-0">
+                  <Cloud className={`w-4 h-4 shrink-0 ${cloudConnected ? 'text-emerald-600' : 'text-amber-500'}`} />
+                  <span className="truncate text-left">
+                    <span className="block text-sm font-semibold">
+                      {cloudConnected ? t.common.cloudSynced : t.common.localOnlyShort}
+                    </span>
+                    <span className="block text-[11px] font-normal text-slate-500 truncate">
+                      {cloudConnected
+                        ? firebaseEmail || 'Firebase Firestore'
+                        : 'Google orqali bulutga ulash'}
+                    </span>
+                  </span>
+                </span>
+                <ChevronRight className="w-4 h-4 text-slate-400 shrink-0" />
+              </button>
 
               <button
                 type="button"

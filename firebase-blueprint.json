@@ -1076,14 +1076,18 @@
     },
     "StaffCredential": {
       "title": "StaffCredential",
-      "description": "Isolated PII, credentials, and payroll data for employees (admin-only).",
+      "description": "Isolated PII, hashed credentials, and payroll data for employees (admin-only).",
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 128 },
         "userId": { "type": "string", "maxLength": 128 },
         "phone": { "type": "string", "maxLength": 40 },
-        "password": { "type": "string", "maxLength": 120 },
-        "pin": { "type": "string", "maxLength": 10 },
+        "password": { "type": "string", "maxLength": 120, "description": "Legacy plaintext field (forbidden on new writes)" },
+        "pin": { "type": "string", "maxLength": 10, "description": "Legacy plaintext field (forbidden on new writes)" },
+        "passwordHash": { "type": "string", "maxLength": 256 },
+        "pinHash": { "type": "string", "maxLength": 256 },
+        "hashAlgo": { "type": "string", "enum": ["sha256", "pbkdf2-sha256", "firebase-auth"] },
+        "authMigrated": { "type": "boolean" },
         "googleEmail": { "type": "string", "maxLength": 200 },
         "baseSalary": { "type": "number" },
         "commissionPercent": { "type": "number" },
@@ -1099,12 +1103,41 @@
         "id",
         "userId",
         "phone",
-        "password",
-        "pin",
         "baseSalary",
         "commissionPercent",
         "hiredAt",
         "storeId",
+        "ownerUid",
+        "adminUids",
+        "createdBy",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "StaffInvite": {
+      "title": "StaffInvite",
+      "description": "Zero-PII SHA-256 email hash invite binding for RBAC role, assigned stores, and permissions.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "staffId": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "roleId": { "type": "string", "maxLength": 64 },
+        "assignedStoreIds": { "type": "array" },
+        "permissions": { "type": "array" },
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "adminUids": { "type": "array" },
+        "createdBy": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "staffId",
+        "userId",
+        "roleId",
+        "assignedStoreIds",
+        "permissions",
         "ownerUid",
         "adminUids",
         "createdBy",
@@ -1190,11 +1223,10 @@
         "id": { "type": "string", "maxLength": 128 },
         "userId": { "type": "string", "maxLength": 128 },
         "userName": { "type": "string", "maxLength": 120 },
-        "action": { "type": "string", "maxLength": 64 },
+        "action": { "type": "string", "maxLength": 80 },
         "entityType": { "type": "string", "maxLength": 64 },
-        "entityId": { "type": "string", "maxLength": 300 },
-        "summary": { "type": "string", "maxLength": 500 },
-        "details": { "type": "string", "maxLength": 1000 },
+        "entityId": { "type": "string", "maxLength": 128 },
+        "details": { "type": "string", "maxLength": 500 },
         "storeId": { "type": "string", "maxLength": 128 },
         "ownerUid": { "type": "string", "maxLength": 128 },
         "memberUids": { "type": "array" },
@@ -1209,7 +1241,7 @@
         "action",
         "entityType",
         "entityId",
-        "summary",
+        "details",
         "storeId",
         "ownerUid",
         "memberUids",
@@ -1224,14 +1256,16 @@
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 128 },
-        "opType": { "type": "string", "maxLength": 64 },
-        "actorId": { "type": "string", "maxLength": 128 },
+        "opType": { "type": "string", "maxLength": 80 },
+        "actorUid": { "type": "string", "maxLength": 128 },
+        "storeId": { "type": "string", "maxLength": 128 },
         "ownerUid": { "type": "string", "maxLength": 128 },
         "memberUids": { "type": "array" },
+        "createdBy": { "type": "string", "maxLength": 128 },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["id", "opType", "actorId", "ownerUid", "memberUids", "createdAt", "updatedAt"]
+      "required": ["id", "opType", "actorUid", "storeId", "ownerUid", "memberUids", "createdBy", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -1370,6 +1404,10 @@
     "/workspaces/{workspaceId}/staffCredentials/{staffId}": {
       "schema": { "$ref": "#/entities/StaffCredential" },
       "description": "Admin-isolated staff phone, PIN, password, email, and salary details."
+    },
+    "/workspaces/{workspaceId}/staffInvites/{inviteId}": {
+      "schema": { "$ref": "#/entities/StaffInvite" },
+      "description": "Zero-PII SHA-256 email hash invite bindings for RBAC seat claiming."
     },
     "/workspaces/{workspaceId}/targets/{targetId}": {
       "schema": { "$ref": "#/entities/Target" },

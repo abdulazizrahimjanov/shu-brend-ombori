@@ -16,6 +16,7 @@ import {
   AlertTriangle,
   X,
   Save,
+  CloudUpload,
 } from 'lucide-react';
 import { useAppStore, uid } from '../store/useAppStore';
 import { useT } from '../i18n';
@@ -40,6 +41,9 @@ export const SettingsPage: React.FC = () => {
   const resetDemoData = useAppStore((s) => s.resetDemoData);
   const clearAllTestData = useAppStore((s) => s.clearAllTestData);
   const importBackupJson = useAppStore((s) => s.importBackupJson);
+  const migrateLocalDataToCloud = useAppStore((s) => s.migrateLocalDataToCloud);
+  const cloudConnected = useAppStore((s) => s.cloudConnected);
+  const isOnline = useAppStore((s) => s.isOnline);
   const notify = useAppStore((s) => s.notify);
   const t = useT();
 
@@ -68,6 +72,7 @@ export const SettingsPage: React.FC = () => {
   // Clear all confirmation modal
   const [clearModalOpen, setClearModalOpen] = useState(false);
   const [clearConfirmText, setClearConfirmText] = useState('');
+  const [migratingCloud, setMigratingCloud] = useState(false);
 
   // Roles CRUD state
   const [newRoleName, setNewRoleName] = useState('');
@@ -109,8 +114,17 @@ export const SettingsPage: React.FC = () => {
     if (!file) return;
     try {
       const text = await file.text();
-      await importBackupJson(text);
-      notify('Zaxira nusxa tiklandi', 'success');
+      const res = await importBackupJson(text);
+      if (res.syncedToCloud) {
+        notify(
+          `Zaxira tiklandi: ${res.uploadedCount} ta yozuv bulutga yuklandi${
+            res.skippedDuplicates > 0 ? ` (${res.skippedDuplicates} ta takroriy o'tkazildi)` : ''
+          }`,
+          'success'
+        );
+      } else {
+        notify("Zaxira qurilmada tiklandi. Bulutga yuklash uchun Google orqali ulaning", 'info');
+      }
     } catch {
       notify("Fayl formati noto'g'ri", 'error');
     } finally {
@@ -994,6 +1008,43 @@ export const SettingsPage: React.FC = () => {
               >
                 <RotateCcw className="w-4 h-4" />
                 <span>Demo bazani tiklash</span>
+              </button>
+              <button
+                type="button"
+                disabled={migratingCloud || !isOnline}
+                onClick={async () => {
+                  if (!cloudConnected) {
+                    notify("Avval yuqoridan Google hisobingiz bilan bulutga ulaning", 'info');
+                    return;
+                  }
+                  setMigratingCloud(true);
+                  try {
+                    const res = await migrateLocalDataToCloud();
+                    if (!res.ok) {
+                      notify(res.error || "Bulutga ko'chirishda xatolik", 'error');
+                    } else if (res.uploadedCount === 0) {
+                      notify(
+                        res.skippedDuplicates > 0
+                          ? `Barcha ma'lumotlar allaqachon bulutda (${res.skippedDuplicates} ta takroriy mahsulot o'tkazildi)`
+                          : "Barcha lokal ma'lumotlar allaqachon bulut bilan sinxronlangan",
+                        'info'
+                      );
+                    } else {
+                      notify(
+                        `${res.uploadedCount} ta lokal yozuv bulutga ko'chirildi${
+                          res.skippedDuplicates > 0 ? ` (${res.skippedDuplicates} ta takroriy o'tkazildi)` : ''
+                        }`,
+                        'success'
+                      );
+                    }
+                  } finally {
+                    setMigratingCloud(false);
+                  }
+                }}
+                className="h-10 px-4 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 font-semibold inline-flex items-center gap-1.5 disabled:opacity-50"
+              >
+                <CloudUpload className="w-4 h-4" />
+                <span>{migratingCloud ? "Ko'chirilmoqda..." : "Lokal ma'lumotlarni bulutga ko'chirish"}</span>
               </button>
             </div>
           </div>

@@ -43,9 +43,9 @@ import { repository } from '../data/repository';
 import { getMensClothingCategories } from '../data/seed';
 import { Language } from '../i18n';
 import {
+  auth,
   ensureFirestoreNetwork,
   formatFirebaseErrorMessage,
-  probeFirestoreConnection,
   signInWithGooglePopup,
   signOutFirebase,
   testConnection,
@@ -56,8 +56,11 @@ import {
   bootstrapOrJoinWorkspace,
   checkWorkspaceSyncHealth,
   clearWorkspaceOperationalData,
+  hasCustomLocalMigrationCandidates,
   isBootstrappedAdminEmail,
+  migrateLocalAdditionsToWorkspace,
   pushSyncItemToFirestore,
+  savePreCloudSafetyBackup,
   stockItemDocId,
   subscribeWorkspaceRealtime,
   WorkspaceContext,
@@ -277,7 +280,15 @@ interface AppState {
   deleteRole: (roleId: RoleId) => Promise<{ ok: boolean; error?: string }>;
   resetDemoData: () => Promise<void>;
   clearAllTestData: () => Promise<void>;
-  importBackupJson: (json: string) => Promise<void>;
+  importBackupJson: (
+    json: string
+  ) => Promise<{ uploadedCount: number; skippedDuplicates: number; syncedToCloud: boolean }>;
+  migrateLocalDataToCloud: () => Promise<{
+    ok: boolean;
+    uploadedCount: number;
+    skippedDuplicates: number;
+    error?: string;
+  }>;
 }
 
 function applyThemeToDOM(theme: 'light' | 'dark') {
@@ -419,49 +430,41 @@ export const useAppStore = create<AppState>((set, get) => {
     const { cloudConnected, workspaceContext, isOnline } = get();
 
     // Always persist immediately on device first (offline-first PWA)
-    if (!isOnline) {
+    if (!isOnline || !cloudConnected || !workspaceContext) {
       if (!nextDb.offlineQueue.some((q) => q.id === op.id)) {
         nextDb.offlineQueue.push(op);
       }
       await repository.save(nextDb);
-      set({ db: nextDb, syncStatus: 'offline' });
+      set({ db: nextDb, syncStatus: isOnline ? 'online' : 'offline' });
       return;
     }
 
     await repository.save(nextDb);
-    set({ db: nextDb });
+    set({ db: nextDb, syncStatus: 'syncing' });
 
-    if (cloudConnected && workspaceContext) {
-      set({ syncStatus: 'syncing' });
-      try {
-        await pushSyncItemToFirestore(workspaceContext, op, nextDb);
-        set({
-          syncStatus: get().isOnline ? 'online' : 'offline',
-          cloudError: null,
-          lastSyncAt: new Date().toISOString(),
-        });
-      } catch (err) {
-        const friendlyMsg = formatFirebaseErrorMessage(err, get().language);
-        if (isPermissionError(err)) {
-          get().notify(friendlyMsg, 'error');
-          set({
-            syncStatus: get().isOnline ? 'online' : 'offline',
-            cloudError: friendlyMsg,
-          });
-        } else {
-          // Transient / network issue -> queue for auto-sync when connection stabilizes
-          const latestDb = structuredClone(get().db ?? nextDb);
-          if (!latestDb.offlineQueue.some((q) => q.id === op.id)) {
-            latestDb.offlineQueue.push({ ...op, attempts: (op.attempts || 0) + 1 });
-          }
-          await repository.save(latestDb);
-          set({
-            db: latestDb,
-            syncStatus: get().isOnline ? 'online' : 'offline',
-            cloudError: friendlyMsg,
-          });
-        }
+    try {
+      await pushSyncItemToFirestore(workspaceContext, op, nextDb);
+      set({
+        syncStatus: get().isOnline ? 'online' : 'offline',
+        cloudError: null,
+        lastSyncAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      const friendlyMsg = formatFirebaseErrorMessage(err, get().language);
+      if (isPermissionError(err)) {
+        get().notify(friendlyMsg, 'error');
       }
+      // Preserve unsynced operation in offlineQueue until Firestore write actually succeeds
+      const latestDb = structuredClone(get().db ?? nextDb);
+      if (!latestDb.offlineQueue.some((q) => q.id === op.id)) {
+        latestDb.offlineQueue.push({ ...op, attempts: (op.attempts || 0) + 1 });
+      }
+      await repository.save(latestDb);
+      set({
+        db: latestDb,
+        syncStatus: get().isOnline ? 'online' : 'offline',
+        cloudError: friendlyMsg,
+      });
     }
   };
 
@@ -542,10 +545,13 @@ export const useAppStore = create<AppState>((set, get) => {
         }
 
         const currentSession = get().currentUserId;
+        const hasValidSession = Boolean(
+          currentSession && localCopy.users.some((u) => u.id === currentSession && u.isActive)
+        );
         const nextSessionId =
           options?.forceInteractiveLogin && matchedUser
             ? matchedUser.id
-            : (!currentSession || options?.setSessionIfMissing) && matchedUser
+            : !hasValidSession && matchedUser
             ? matchedUser.id
             : currentSession;
 
@@ -569,6 +575,26 @@ export const useAppStore = create<AppState>((set, get) => {
             ? { activeStoreId: resolveDefaultStoreForUser(effectiveUser, localCopy) }
             : {}),
         });
+
+        // Safe incremental migration of user-created/modified local records BEFORE realtime listener hydrates cloud state
+        savePreCloudSafetyBackup(localCopy);
+        if (ctx.isWsAdmin && hasCustomLocalMigrationCandidates(localCopy)) {
+          try {
+            const migRes = await migrateLocalAdditionsToWorkspace(ctx, localCopy, {
+              includeSeedLike: false,
+            });
+            if (migRes.uploadedCount > 0) {
+              get().notify(
+                get().language === 'ru'
+                  ? `${migRes.uploadedCount} локальных записей синхронизированы в облако`
+                  : `${migRes.uploadedCount} ta lokal yozuv bulutga ko'chirildi`,
+                'success'
+              );
+            }
+          } catch {
+            // Non-blocking: local pre-cloud safety backup remains preserved in localStorage
+          }
+        }
 
         unsubscribeRealtime = subscribeWorkspaceRealtime(
           ctx,
@@ -818,7 +844,7 @@ export const useAppStore = create<AppState>((set, get) => {
       if (!get().isOnline) {
         set({ isOnline: true });
       }
-      const { cloudConnected, workspaceContext, db } = get();
+      const { cloudConnected, cloudConnecting, workspaceContext, db } = get();
       if (cloudConnected && workspaceContext) {
         const health = await checkWorkspaceSyncHealth(workspaceContext);
         if (!health.ok) {
@@ -833,11 +859,16 @@ export const useAppStore = create<AppState>((set, get) => {
           lastSyncAt: new Date().toISOString(),
           syncStatus: get().isOnline ? 'online' : 'offline',
         });
-      } else {
-        const reachable = await probeFirestoreConnection();
-        if (reachable) {
-          set({ lastSyncAt: new Date().toISOString() });
-        }
+      } else if (auth.currentUser && !cloudConnecting) {
+        await connectFirebaseUser(auth.currentUser, { setSessionIfMissing: false });
+      } else if (!auth.currentUser) {
+        set({
+          cloudConnected: false,
+          firebaseUid: null,
+          firebaseEmail: null,
+          workspaceContext: null,
+          syncStatus: 'online',
+        });
       }
     },
 
@@ -1118,10 +1149,30 @@ export const useAppStore = create<AppState>((set, get) => {
       );
       if (!user) return false;
       localStorage.setItem(SESSION_KEY, user.id);
+      const fbUser = auth.currentUser;
       set({
         currentUserId: user.id,
         activeStoreId: resolveDefaultStoreForUser(user, db),
+        ...(!fbUser
+          ? {
+              cloudConnected: false,
+              firebaseUid: null,
+              firebaseEmail: null,
+              workspaceContext: null,
+              lastSyncAt: null,
+            }
+          : {}),
       });
+      if (fbUser && !get().cloudConnected && !get().cloudConnecting && get().isOnline) {
+        void connectFirebaseUser(fbUser, { setSessionIfMissing: false });
+      } else if (!fbUser && get().isOnline) {
+        get().notify(
+          get().language === 'ru'
+            ? 'Вход выполнен локально. Подключите Google в шапке для синхронизации между устройствами'
+            : "Qurilmaga kirildi. Boshqa qurilmalarga sinxronlash uchun yuqoridan Google bilan ulang",
+          'info'
+        );
+      }
       return true;
     },
 
@@ -1144,10 +1195,23 @@ export const useAppStore = create<AppState>((set, get) => {
       const user = db.users.find((u) => u.isActive && u.pin === pin);
       if (!user) return null;
       localStorage.setItem(SESSION_KEY, user.id);
+      const fbUser = auth.currentUser;
       set({
         currentUserId: user.id,
         activeStoreId: resolveDefaultStoreForUser(user, db),
+        ...(!fbUser
+          ? {
+              cloudConnected: false,
+              firebaseUid: null,
+              firebaseEmail: null,
+              workspaceContext: null,
+              lastSyncAt: null,
+            }
+          : {}),
       });
+      if (fbUser && !get().cloudConnected && !get().cloudConnecting && get().isOnline) {
+        void connectFirebaseUser(fbUser, { setSessionIfMissing: false });
+      }
       return user;
     },
 
@@ -1175,9 +1239,12 @@ export const useAppStore = create<AppState>((set, get) => {
         currentUserId: null,
         cloudConnected: false,
         cloudError: null,
+        lastSyncAt: null,
+        fatalSyncError: null,
         firebaseUid: null,
         firebaseEmail: null,
         workspaceContext: null,
+        syncStatus: get().isOnline ? 'online' : 'offline',
       });
     },
 
@@ -2284,21 +2351,11 @@ export const useAppStore = create<AppState>((set, get) => {
       const { db, cloudConnected, workspaceContext, isOnline } = get();
       if (!db || db.offlineQueue.length === 0) return 0;
 
-      if (!cloudConnected || !workspaceContext) {
-        if (!isOnline) return 0;
-        const nextDb: DatabaseSnapshot = structuredClone(db);
-        const count = nextDb.offlineQueue.length;
-        const nowIso = new Date().toISOString();
-        nextDb.sales.forEach((s) => {
-          if (s.offlineCreated && !s.syncedAt) s.syncedAt = nowIso;
-        });
-        nextDb.offlineQueue = [];
-        await repository.save(nextDb);
-        set({ db: nextDb });
-        return count;
+      // Never discard queued offline items or falsely mark synced if Firebase is not connected
+      if (!isOnline || !cloudConnected || !workspaceContext) {
+        return 0;
       }
 
-      if (!isOnline) return 0;
       set({ syncStatus: 'syncing' });
 
       const remaining: OfflineSyncItem[] = [];
@@ -2317,11 +2374,6 @@ export const useAppStore = create<AppState>((set, get) => {
             if (s) s.syncedAt = nowIso;
           }
         } catch (err) {
-          if (isPermissionError(err)) {
-            // Drop operations rejected by rules so queue doesn't spin forever
-            lastErrMsg = formatFirebaseErrorMessage(err, get().language);
-            continue;
-          }
           lastErrMsg = formatFirebaseErrorMessage(err, get().language);
           remaining.push({ ...item, attempts: (item.attempts || 0) + 1 });
         }
@@ -2333,7 +2385,7 @@ export const useAppStore = create<AppState>((set, get) => {
         db: workingDb,
         syncStatus: get().isOnline ? 'online' : 'offline',
         cloudError: remaining.length > 0 ? lastErrMsg : null,
-        ...(syncedCount > 0 && remaining.length === 0 ? { lastSyncAt: nowIso } : {}),
+        ...(syncedCount > 0 ? { lastSyncAt: nowIso } : {}),
       });
       return syncedCount;
     },
@@ -2931,6 +2983,12 @@ export const useAppStore = create<AppState>((set, get) => {
       const nextDb: DatabaseSnapshot = structuredClone(db);
       const nowIso = new Date().toISOString();
       const idx = nextDb.employees.findIndex((e) => e.id === emp.id);
+      const existingEmp = idx >= 0 ? nextDb.employees[idx] : undefined;
+      const uIdx = nextDb.users.findIndex((u) => u.id === emp.userId);
+      const existingUser = uIdx >= 0 ? nextDb.users[uIdx] : undefined;
+      const previousGoogleEmail =
+        (existingEmp?.googleEmail || existingUser?.googleEmail || '').trim().toLowerCase() || undefined;
+
       const cleanEmail = emp.googleEmail?.trim().toLowerCase() || userUpdates?.googleEmail?.trim().toLowerCase() || undefined;
       const empToSave: Employee = {
         ...emp,
@@ -2940,9 +2998,7 @@ export const useAppStore = create<AppState>((set, get) => {
       if (idx >= 0) nextDb.employees[idx] = empToSave;
       else nextDb.employees.unshift(empToSave);
 
-      const uIdx = nextDb.users.findIndex((u) => u.id === emp.userId);
-      if (uIdx >= 0) {
-        const existingUser = nextDb.users[uIdx];
+      if (uIdx >= 0 && existingUser) {
         const nextPassword = userUpdates?.password?.trim()
           ? userUpdates.password.trim()
           : existingUser.password;
@@ -2988,7 +3044,12 @@ export const useAppStore = create<AppState>((set, get) => {
       await syncOrEnqueue(nextDb, {
         id: uid('sync'),
         type: 'employee',
-        payload: { empId: emp.id, userId: emp.userId, storeId: emp.storeId },
+        payload: {
+          empId: emp.id,
+          userId: emp.userId,
+          storeId: emp.storeId,
+          ...(previousGoogleEmail ? { previousGoogleEmail } : {}),
+        },
         createdAt: nowIso,
         attempts: 0,
       });
@@ -3006,6 +3067,9 @@ export const useAppStore = create<AppState>((set, get) => {
       if (emp.userId === currentUserId) {
         return { ok: false, error: "Joriy tizimga kirgan o'z hisobingizni o'chira olmaysiz" };
       }
+      const linkedUser = db.users.find((u) => u.id === emp.userId);
+      const deletedGoogleEmail =
+        (emp.googleEmail || linkedUser?.googleEmail || '').trim().toLowerCase() || undefined;
       const nextDb: DatabaseSnapshot = structuredClone(db);
       nextDb.employees = nextDb.employees.filter((e) => e.id !== empId);
       nextDb.users = nextDb.users.filter((u) => u.id !== emp.userId);
@@ -3013,7 +3077,12 @@ export const useAppStore = create<AppState>((set, get) => {
       await syncOrEnqueue(nextDb, {
         id: uid('sync'),
         type: 'employee_delete',
-        payload: { empId, storeId: emp.storeId },
+        payload: {
+          empId,
+          deletedUserId: emp.userId,
+          storeId: emp.storeId,
+          ...(deletedGoogleEmail ? { deletedGoogleEmail } : {}),
+        },
         createdAt: new Date().toISOString(),
         attempts: 0,
       });
@@ -3498,6 +3567,16 @@ export const useAppStore = create<AppState>((set, get) => {
     resetDemoData: async () => {
       const fresh = await repository.resetToDemo();
       set({ db: fresh });
+      const { cloudConnected, workspaceContext, isOnline } = get();
+      if (cloudConnected && workspaceContext?.isWsAdmin && isOnline) {
+        try {
+          await migrateLocalAdditionsToWorkspace(workspaceContext, fresh, {
+            includeSeedLike: true,
+          });
+        } catch {
+          // ignore if cloud sync fails; local reset succeeded
+        }
+      }
     },
 
     clearAllTestData: async () => {
@@ -3548,7 +3627,97 @@ export const useAppStore = create<AppState>((set, get) => {
 
     importBackupJson: async (json) => {
       const imported = await repository.importJson(json);
+      // Normalize legacy branch/owner defaults if present in older backup files
+      const nowIso = new Date().toISOString();
+      let normalized = false;
+      const ownerUser = imported.users.find((u) => u.id === 'usr-owner' || u.roleId === 'owner');
+      if (ownerUser && ownerUser.name === 'Sardorbek Karimov') {
+        ownerUser.name = 'ISLOMBEK';
+        ownerUser.updatedAt = nowIso;
+        normalized = true;
+      }
+      const ownerEmp = imported.employees.find((e) => e.id === 'emp-owner' || e.roleId === 'owner');
+      if (ownerEmp && ownerEmp.name === 'Sardorbek Karimov') {
+        ownerEmp.name = 'ISLOMBEK';
+        ownerEmp.updatedAt = nowIso;
+        normalized = true;
+      }
+      const st1 = imported.stores.find((s) => s.id === 'store-chilonzor');
+      if (st1 && st1.name === 'Chilonzor Flagman') {
+        st1.name = 'SHU BREND TORAQORGON';
+        st1.address = "To'raqo'rg'on";
+        st1.updatedAt = nowIso;
+        normalized = true;
+      }
+      const st2 = imported.stores.find((s) => s.id === 'store-samdarvoza');
+      if (st2 && st2.name === 'Samarqand Darvoza') {
+        st2.name = 'SHU BREND MINGBULOQ';
+        st2.address = 'Mingbuloq';
+        st2.updatedAt = nowIso;
+        normalized = true;
+      }
+      if (normalized) {
+        await repository.save(imported);
+      }
       set({ db: imported });
+
+      const { cloudConnected, workspaceContext, isOnline } = get();
+      if (cloudConnected && workspaceContext?.isWsAdmin && isOnline) {
+        const res = await migrateLocalAdditionsToWorkspace(workspaceContext, imported, {
+          includeSeedLike: true,
+        });
+        await get().checkAndSyncNow();
+        return {
+          uploadedCount: res.uploadedCount,
+          skippedDuplicates: res.skippedDuplicates,
+          syncedToCloud: true,
+        };
+      }
+      return { uploadedCount: 0, skippedDuplicates: 0, syncedToCloud: false };
+    },
+
+    migrateLocalDataToCloud: async () => {
+      const { db, cloudConnected, workspaceContext, isOnline } = get();
+      if (!db) {
+        return { ok: false, uploadedCount: 0, skippedDuplicates: 0, error: 'Baza yuklanmagan' };
+      }
+      if (!isOnline) {
+        return { ok: false, uploadedCount: 0, skippedDuplicates: 0, error: "Internet aloqasi yo'q" };
+      }
+      if (!cloudConnected || !workspaceContext) {
+        return {
+          ok: false,
+          uploadedCount: 0,
+          skippedDuplicates: 0,
+          error: "Bulutga sinxronlash uchun avval Google orqali kiring",
+        };
+      }
+      if (!workspaceContext.isWsAdmin) {
+        return {
+          ok: false,
+          uploadedCount: 0,
+          skippedDuplicates: 0,
+          error: "Faqat administrator lokal ma'lumotlarni bulutga ko'chira oladi",
+        };
+      }
+      try {
+        const res = await migrateLocalAdditionsToWorkspace(workspaceContext, db, {
+          includeSeedLike: true,
+        });
+        await get().checkAndSyncNow();
+        return {
+          ok: true,
+          uploadedCount: res.uploadedCount,
+          skippedDuplicates: res.skippedDuplicates,
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          uploadedCount: 0,
+          skippedDuplicates: 0,
+          error: formatFirebaseErrorMessage(err, get().language),
+        };
+      }
     },
   };
 });

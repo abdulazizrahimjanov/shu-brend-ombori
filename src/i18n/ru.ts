@@ -50,6 +50,7 @@ export const ru = {
     internetAvailable: 'Подключено к интернету',
     syncing: 'Синхронизация...',
     cloudSynced: 'Подключено к облаку',
+    localOnlyShort: 'Только локально',
     syncPending: 'Ожидает синхронизации',
     syncNow: 'Синхронизировать',
     installApp: 'Установить приложение',

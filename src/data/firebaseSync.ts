@@ -90,9 +90,22 @@ export interface WorkspaceContext {
   adminUids: string[];
   invitedEmails: string[];
   isWsAdmin: boolean;
+  isPlatformAdmin: boolean;
   roleId: RoleId;
   assignedStoreIds: string[];
   staffId?: string;
+}
+
+export async function sha256Hex(raw: string): Promise<string> {
+  const normalized = String(raw || '').trim().toLowerCase();
+  const data = new TextEncoder().encode(normalized);
+  if (typeof crypto !== 'undefined' && crypto.subtle) {
+    const hashBuf = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(hashBuf))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+  throw new Error('WebCrypto SHA-256 is unavailable in this environment');
 }
 
 export function sanitizeId(raw: string): string {
@@ -818,6 +831,37 @@ function serializeStaffCredential(
   };
 }
 
+function serializeStaffInvite(
+  user: User,
+  emp: Employee | undefined,
+  roles: Role[],
+  ctx: { ownerUid: string; adminUids: string[]; uid: string },
+  emailHash: string
+) {
+  const staffId = sanitizeId(emp?.id || user.id);
+  const effectiveRoleId = clampStr(emp?.roleId || user.roleId, 64, 'cashier') as RoleId;
+  const effectiveRoleIdForInvite = effectiveRoleId === 'owner' ? 'admin' : effectiveRoleId;
+  const rolePerms =
+    user.customPermissions ?? roles.find((r) => r.id === effectiveRoleId)?.permissions ?? [];
+  const storeList =
+    Array.isArray(user.assignedStoreIds) && user.assignedStoreIds.length > 0
+      ? user.assignedStoreIds.slice(0, 20).map(String)
+      : [nonEmptyStr(emp?.storeId || user.storeId, 128, 'store-chilonzor')];
+  return {
+    id: emailHash,
+    staffId,
+    userId: sanitizeId(user.id),
+    roleId: effectiveRoleIdForInvite,
+    assignedStoreIds: storeList,
+    permissions: mapAppPermissionsToRuleTokens(rolePerms, effectiveRoleIdForInvite),
+    ownerUid: ctx.ownerUid,
+    adminUids: Array.from(new Set([ctx.ownerUid, ...ctx.adminUids])).slice(0, 20),
+    createdBy: ctx.uid,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+}
+
 function serializeTarget(tg: Target, ctx: { ownerUid: string; memberUids: string[]; uid: string }) {
   return withTenantCreate(
     {
@@ -925,9 +969,10 @@ export async function bootstrapOrJoinWorkspace(
   const email = (fbUser.email || '').trim().toLowerCase();
   const displayName = nonEmptyStr(fbUser.displayName || email.split('@')[0] || 'Xodim', 120, 'Xodim');
 
-  // 1. Bootstrap platform admin record if bootstrapped owner email
-  if (isBootstrappedAdminEmail(email)) {
-    const adminRef = doc(firestoreDb, 'admins', uid);
+  // 1. Bootstrap platform admin record if bootstrapped owner email & resolve isPlatformAdmin
+  let isPlatformAdmin = isBootstrappedAdminEmail(email);
+  const adminRef = doc(firestoreDb, 'admins', uid);
+  if (isPlatformAdmin) {
     try {
       const adminSnap = await getDoc(adminRef);
       if (!adminSnap.exists()) {
@@ -939,6 +984,13 @@ export async function bootstrapOrJoinWorkspace(
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, `admins/${uid}`);
+    }
+  } else {
+    try {
+      const adminSnap = await getDoc(adminRef);
+      isPlatformAdmin = adminSnap.exists();
+    } catch {
+      isPlatformAdmin = false;
     }
   }
 
@@ -1071,6 +1123,7 @@ export async function bootstrapOrJoinWorkspace(
       adminUids: [uid],
       invitedEmails,
       isWsAdmin: true,
+      isPlatformAdmin,
       roleId: 'owner',
       assignedStoreIds: [],
       staffId: ownerStaffId,
@@ -1122,18 +1175,48 @@ export async function bootstrapOrJoinWorkspace(
   try {
     const mSnap = await getDoc(memberRef);
     if (!mSnap.exists()) {
-      const matchedRole: RoleId = isOwner ? 'owner' : 'cashier';
+      let matchedRole: RoleId = isOwner ? 'owner' : 'cashier';
+      let inviteStoreIds: string[] = [];
+      let invitePerms: string[] | null = null;
       staffId = isOwner ? 'usr-owner' : sanitizeId(`staff-${uid.slice(0, 12)}`);
-      const defaultPerms = mapAppPermissionsToRuleTokens(
-        isOwner ? [] : ['use_pos', 'view_catalog', 'view_customers', 'manage_customers'],
-        matchedRole
-      );
+
+      if (!isOwner && email) {
+        try {
+          const emailHash = await sha256Hex(email);
+          const inviteSnap = await getDoc(
+            doc(firestoreDb, 'workspaces', PRIMARY_WORKSPACE_ID, 'staffInvites', emailHash)
+          );
+          if (inviteSnap.exists()) {
+            const inv = inviteSnap.data();
+            if (inv.staffId) staffId = sanitizeId(String(inv.staffId));
+            if (inv.roleId && inv.roleId !== 'owner') {
+              matchedRole = String(inv.roleId) as RoleId;
+            }
+            if (Array.isArray(inv.assignedStoreIds)) {
+              inviteStoreIds = inv.assignedStoreIds.slice(0, 20).map(String);
+            }
+            if (Array.isArray(inv.permissions)) {
+              invitePerms = inv.permissions.slice(0, 30).map(String);
+            }
+          }
+        } catch {
+          // fallback if staffInvites doc does not exist yet
+        }
+      }
+
+      const defaultPerms =
+        invitePerms ??
+        mapAppPermissionsToRuleTokens(
+          isOwner ? [] : ['use_pos', 'view_catalog', 'view_customers', 'manage_customers'],
+          matchedRole
+        );
+
       await setDoc(memberRef, {
         uid,
         staffId,
         displayName,
         roleId: matchedRole,
-        assignedStoreIds: [],
+        assignedStoreIds: inviteStoreIds,
         permissions: defaultPerms,
         isActive: true,
         ownerUid,
@@ -1142,6 +1225,7 @@ export async function bootstrapOrJoinWorkspace(
         updatedAt: serverTimestamp(),
       });
       roleId = matchedRole;
+      assignedStoreIds = inviteStoreIds;
     } else {
       const md = mSnap.data();
       if (md.isActive === false) {
@@ -1158,6 +1242,16 @@ export async function bootstrapOrJoinWorkspace(
 
   const finalIsAdmin = isAdminMember || roleId === 'owner' || roleId === 'admin';
 
+  // Ensure adminUids stays synchronized if member holds admin/owner role
+  if (finalIsAdmin && !adminUids.includes(uid)) {
+    adminUids = Array.from(new Set([...adminUids, uid]));
+    try {
+      await updateDoc(wsRef, { adminUids, updatedAt: serverTimestamp() });
+    } catch {
+      // non-fatal
+    }
+  }
+
   return {
     workspaceId: PRIMARY_WORKSPACE_ID,
     uid,
@@ -1168,6 +1262,7 @@ export async function bootstrapOrJoinWorkspace(
     adminUids,
     invitedEmails,
     isWsAdmin: finalIsAdmin,
+    isPlatformAdmin,
     roleId,
     assignedStoreIds,
     staffId,
@@ -1264,9 +1359,11 @@ export async function migrateSnapshotToWorkspace(
     writer.add((b) => b.set(doc(firestoreDb, wsPath, 'promoCodes', sanitizeId(pr.id)), serializePromoCode(pr, ctx)));
   });
 
-  // Staff split: directory (non-PII) + credentials (admin-only PII)
+  // Staff split: directory (non-PII) + credentials (admin-only PII) + invites (zero-PII role bindings)
   const seenStaffUserIds = new Set<string>();
-  snapshot.employees.forEach((emp) => {
+  const inviteEntries: { emailHash: string; data: ReturnType<typeof serializeStaffInvite> }[] = [];
+
+  for (const emp of snapshot.employees) {
     seenStaffUserIds.add(emp.userId);
     const linkedUser = snapshot.users.find((u) => u.id === emp.userId);
     const userObj: User = linkedUser || {
@@ -1287,13 +1384,35 @@ export async function migrateSnapshotToWorkspace(
     const staffId = sanitizeId(emp.id);
     writer.add((b) => b.set(doc(firestoreDb, wsPath, 'staffDirectory', staffId), serializeStaffDirectoryEntry(userObj, emp, ctx)));
     writer.add((b) => b.set(doc(firestoreDb, wsPath, 'staffCredentials', staffId), serializeStaffCredential(userObj, emp, ctx)));
-  });
-  snapshot.users.forEach((u) => {
-    if (seenStaffUserIds.has(u.id)) return;
+    const cleanEmail = (emp.googleEmail || userObj.googleEmail || '').trim().toLowerCase();
+    if (cleanEmail) {
+      const emailHash = await sha256Hex(cleanEmail);
+      inviteEntries.push({
+        emailHash,
+        data: serializeStaffInvite(userObj, emp, snapshot.roles, ctx, emailHash),
+      });
+    }
+  }
+  for (const u of snapshot.users) {
+    if (seenStaffUserIds.has(u.id)) continue;
     const staffId = sanitizeId(u.id);
     writer.add((b) => b.set(doc(firestoreDb, wsPath, 'staffDirectory', staffId), serializeStaffDirectoryEntry(u, undefined, ctx)));
     writer.add((b) => b.set(doc(firestoreDb, wsPath, 'staffCredentials', staffId), serializeStaffCredential(u, undefined, ctx)));
-  });
+    const cleanEmail = (u.googleEmail || '').trim().toLowerCase();
+    if (cleanEmail) {
+      const emailHash = await sha256Hex(cleanEmail);
+      inviteEntries.push({
+        emailHash,
+        data: serializeStaffInvite(u, undefined, snapshot.roles, ctx, emailHash),
+      });
+    }
+  }
+  const seenInviteHashes = new Set<string>();
+  for (const inv of inviteEntries) {
+    if (seenInviteHashes.has(inv.emailHash)) continue;
+    seenInviteHashes.add(inv.emailHash);
+    writer.add((b) => b.set(doc(firestoreDb, wsPath, 'staffInvites', inv.emailHash), inv.data));
+  }
 
   snapshot.targets.forEach((tg) => {
     writer.add((b) => b.set(doc(firestoreDb, wsPath, 'targets', sanitizeId(tg.id)), serializeTarget(tg, ctx)));
@@ -1306,6 +1425,338 @@ export async function migrateSnapshotToWorkspace(
   });
 
   await writer.commitAll(wsPath);
+}
+
+const PRE_CLOUD_BACKUP_KEY = 'shu_brend_pre_cloud_backup_v1';
+
+const SEED_RECORD_ID_EXACT = new Set([
+  'store-chilonzor',
+  'store-samdarvoza',
+  'wh-chilonzor',
+  'wh-samdarvoza',
+  'cat-shirts',
+  'cat-pants',
+  'cat-suits',
+  'cat-tshirts',
+  'cat-knitwear',
+  'cat-outerwear',
+  'cat-shoes',
+  'cat-accessories',
+  'acc-cash',
+  'acc-card',
+  'acc-bank',
+  'usr-owner',
+  'usr-admin',
+  'usr-cashier1',
+  'usr-cashier2',
+  'emp-owner',
+  'emp-admin',
+  'emp-cashier1',
+  'emp-cashier2',
+]);
+
+const SEED_RECORD_ID_REGEX =
+  /^(?:br-\d+|prod-\d{2}|sup-\d+|si-\d+|mov-\d+|pr-\d+|po-\d+|sale-\d+|shift-\d+|cop-\d+|trx-\d+|exp-\d+|cust-\d+|la-\d+|lt-\d+|debt-\d+|promo-\d+|tg-\d+|ord-\d+|aud-\d+|(?:wh-chilonzor|wh-samdarvoza)__prod-\d{2}(?:-v\d+)?)$/;
+
+export function isUntouchedSeedRecord(
+  id: string,
+  createdAt?: string,
+  updatedAt?: string
+): boolean {
+  const cleanId = id.trim();
+  const matchesSeedId = SEED_RECORD_ID_EXACT.has(cleanId) || SEED_RECORD_ID_REGEX.test(cleanId);
+  if (!matchesSeedId) return false;
+  if (createdAt && updatedAt && createdAt !== updatedAt) {
+    return false;
+  }
+  return true;
+}
+
+export function hasCustomLocalMigrationCandidates(snapshot: DatabaseSnapshot): boolean {
+  const checkList = <T extends { id: string; createdAt?: string; updatedAt?: string }>(
+    items: T[]
+  ) => items.some((item) => !isUntouchedSeedRecord(item.id, item.createdAt, item.updatedAt));
+
+  return (
+    checkList(snapshot.products) ||
+    checkList(snapshot.categories) ||
+    checkList(snapshot.brands) ||
+    checkList(snapshot.suppliers) ||
+    checkList(snapshot.customers) ||
+    checkList(snapshot.sales) ||
+    checkList(snapshot.purchaseReceipts) ||
+    checkList(snapshot.purchaseOrders) ||
+    checkList(snapshot.transfers) ||
+    checkList(snapshot.writeOffs) ||
+    checkList(snapshot.stocktakes) ||
+    checkList(snapshot.expenses) ||
+    checkList(snapshot.debts) ||
+    checkList(snapshot.promoCodes) ||
+    checkList(snapshot.onlineOrders) ||
+    checkList(snapshot.targets) ||
+    checkList(snapshot.employees) ||
+    checkList(snapshot.stores)
+  );
+}
+
+export function savePreCloudSafetyBackup(snapshot: DatabaseSnapshot, forceOverwrite = false): boolean {
+  if (typeof localStorage === 'undefined') return false;
+  try {
+    if (!forceOverwrite && localStorage.getItem(PRE_CLOUD_BACKUP_KEY)) {
+      return false;
+    }
+    localStorage.setItem(
+      PRE_CLOUD_BACKUP_KEY,
+      JSON.stringify({
+        savedAt: new Date().toISOString(),
+        snapshot,
+      })
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface LocalToCloudMigrationResult {
+  uploadedCount: number;
+  skippedDuplicates: number;
+  backedUpLocally: boolean;
+}
+
+export async function migrateLocalAdditionsToWorkspace(
+  ctx: WorkspaceContext,
+  snapshot: DatabaseSnapshot,
+  options?: { includeSeedLike?: boolean }
+): Promise<LocalToCloudMigrationResult> {
+  if (!ctx.isWsAdmin) {
+    throw new Error("Faqat administrator lokal ma'lumotlarni bulutga ko'chira oladi.");
+  }
+
+  const includeSeedLike = Boolean(options?.includeSeedLike);
+  const backedUpLocally = savePreCloudSafetyBackup(snapshot, includeSeedLike);
+  const wsPath = `workspaces/${ctx.workspaceId}`;
+  const writer = new ChunkedBatchWriter();
+  let uploadedCount = 0;
+  let skippedDuplicates = 0;
+
+  const shouldConsider = (item: { id: string; createdAt?: string; updatedAt?: string }) =>
+    includeSeedLike || !isUntouchedSeedRecord(item.id, item.createdAt, item.updatedAt);
+
+  const fetchExistingIds = async (colName: string): Promise<Set<string>> => {
+    const snap = await getDocs(collection(firestoreDb, wsPath, colName));
+    return new Set(snap.docs.map((d) => d.id));
+  };
+
+  // 1. Fetch existing products & build duplicate guards (id, name, sku, barcode)
+  const existingProductSnap = await getDocs(collection(firestoreDb, wsPath, 'products'));
+  const existingProductIds = new Set<string>();
+  const existingProductNames = new Set<string>();
+  const existingSkus = new Set<string>();
+  const existingBarcodes = new Set<string>();
+  const validVariantIds = new Set<string>();
+
+  existingProductSnap.docs.forEach((d) => {
+    existingProductIds.add(d.id);
+    const pData = d.data();
+    const pName = String(pData.name || '').trim().toLowerCase();
+    if (pName) existingProductNames.add(pName);
+    if (Array.isArray(pData.variants)) {
+      pData.variants.forEach((v: Record<string, unknown>) => {
+        const vid = String(v.id || '').trim();
+        if (vid) validVariantIds.add(vid);
+        const sku = String(v.sku || '').trim().toLowerCase();
+        if (sku) existingSkus.add(sku);
+        if (Array.isArray(v.barcodes)) {
+          v.barcodes.forEach((b) => {
+            const cleanB = String(b || '').trim();
+            if (cleanB) existingBarcodes.add(cleanB);
+          });
+        }
+      });
+    }
+  });
+
+  // Upload missing non-duplicate products
+  for (const p of snapshot.products) {
+    if (!shouldConsider(p)) continue;
+    const docId = sanitizeId(p.id);
+    const normName = p.name.trim().toLowerCase();
+    const variantSkus = (p.variants || []).map((v) => v.sku.trim().toLowerCase()).filter(Boolean);
+    const variantBarcodes = (p.variants || [])
+      .flatMap((v) => v.barcodes || [])
+      .map((b) => b.trim())
+      .filter(Boolean);
+
+    const isDuplicate =
+      existingProductIds.has(docId) ||
+      (normName.length > 0 && existingProductNames.has(normName)) ||
+      variantSkus.some((s) => existingSkus.has(s)) ||
+      variantBarcodes.some((b) => existingBarcodes.has(b));
+
+    if (isDuplicate) {
+      skippedDuplicates += 1;
+      continue;
+    }
+
+    existingProductIds.add(docId);
+    if (normName) existingProductNames.add(normName);
+    variantSkus.forEach((s) => existingSkus.add(s));
+    variantBarcodes.forEach((b) => existingBarcodes.add(b));
+    (p.variants || []).forEach((v) => {
+      if (v.id) validVariantIds.add(v.id);
+    });
+
+    writer.add((b) => b.set(doc(firestoreDb, wsPath, 'products', docId), serializeProduct(p, ctx)));
+    uploadedCount += 1;
+  }
+
+  // Helper for standard collections (skip existing docs, never overwrite remote)
+  const migrateMissingCollection = async <T extends { id: string; createdAt?: string; updatedAt?: string }>(
+    colName: string,
+    items: T[],
+    serialize: (item: T) => Record<string, unknown>
+  ) => {
+    const candidates = items.filter(shouldConsider);
+    if (candidates.length === 0) return;
+    const existing = await fetchExistingIds(colName);
+    for (const item of candidates) {
+      const docId = sanitizeId(item.id);
+      if (existing.has(docId)) continue;
+      existing.add(docId);
+      writer.add((b) => b.set(doc(firestoreDb, wsPath, colName, docId), serialize(item)));
+      uploadedCount += 1;
+    }
+  };
+
+  await migrateMissingCollection('stores', snapshot.stores, (s) => serializeStore(s, ctx));
+  await migrateMissingCollection('warehouses', snapshot.warehouses, (w) => serializeWarehouse(w, ctx));
+  await migrateMissingCollection('categories', snapshot.categories, (c) => serializeCategory(c, ctx));
+  await migrateMissingCollection('brands', snapshot.brands, (br) => serializeBrand(br, ctx));
+  await migrateMissingCollection('suppliers', snapshot.suppliers, (sup) => serializeSupplier(sup, ctx));
+  await migrateMissingCollection('accounts', snapshot.accounts, (acc) => serializeAccount(acc, ctx));
+
+  // Stock items: only migrate missing warehouseId__variantId docs linked to active/migrated variants
+  const stockCandidates = snapshot.stockItems.filter((si) => {
+    if (!shouldConsider(si)) return false;
+    return validVariantIds.size === 0 || validVariantIds.has(si.variantId);
+  });
+  if (stockCandidates.length > 0) {
+    const existingStock = await fetchExistingIds('stockItems');
+    for (const si of stockCandidates) {
+      const docId = stockItemDocId(si.warehouseId, si.variantId);
+      if (existingStock.has(docId)) continue;
+      existingStock.add(docId);
+      writer.add((b) => b.set(doc(firestoreDb, wsPath, 'stockItems', docId), serializeStockItem(si, ctx)));
+      uploadedCount += 1;
+    }
+  }
+
+  await migrateMissingCollection('stockMovements', snapshot.stockMovements.slice(0, 300), (m) =>
+    serializeStockMovement(m, ctx)
+  );
+  await migrateMissingCollection('purchaseReceipts', snapshot.purchaseReceipts, (pr) =>
+    serializePurchaseReceipt(pr, ctx)
+  );
+  await migrateMissingCollection('purchaseOrders', snapshot.purchaseOrders, (po) =>
+    serializePurchaseOrder(po, ctx)
+  );
+  await migrateMissingCollection('transfers', snapshot.transfers, (tr) => serializeTransfer(tr, ctx));
+  await migrateMissingCollection('writeOffs', snapshot.writeOffs, (wo) => serializeWriteOff(wo, ctx));
+  await migrateMissingCollection('stocktakes', snapshot.stocktakes, (st) => serializeStocktake(st, ctx));
+  await migrateMissingCollection('sales', snapshot.sales, (s) => serializeSale(s, ctx));
+  await migrateMissingCollection('returns', snapshot.returns, (r) => serializeReturnDoc(r, ctx));
+  await migrateMissingCollection('cashShifts', snapshot.cashShifts, (sh) => serializeCashShift(sh, ctx));
+  await migrateMissingCollection('cashOperations', snapshot.cashOperations, (cop) =>
+    serializeCashOperation(cop, ctx)
+  );
+  await migrateMissingCollection('transactions', snapshot.transactions, (trx) =>
+    serializeFinanceTransaction(trx, ctx)
+  );
+  await migrateMissingCollection('expenses', snapshot.expenses, (exp) => serializeExpense(exp, ctx));
+  await migrateMissingCollection('customers', snapshot.customers, (c) => serializeCustomer(c, ctx));
+  await migrateMissingCollection('loyaltyAccounts', snapshot.loyaltyAccounts, (la) =>
+    serializeLoyaltyAccount(la, ctx)
+  );
+  await migrateMissingCollection('loyaltyTransactions', snapshot.loyaltyTransactions, (lt) =>
+    serializeLoyaltyTransaction(lt, ctx)
+  );
+  await migrateMissingCollection('debts', snapshot.debts, (d) => serializeDebt(d, ctx));
+  await migrateMissingCollection('promoCodes', snapshot.promoCodes, (pr) => serializePromoCode(pr, ctx));
+  await migrateMissingCollection('targets', snapshot.targets, (tg) => serializeTarget(tg, ctx));
+  await migrateMissingCollection('onlineOrders', snapshot.onlineOrders, (ord) =>
+    serializeOnlineOrder(ord, ctx)
+  );
+  await migrateMissingCollection('auditLogs', snapshot.auditLogs.slice(0, 200), (aud) =>
+    serializeAuditLog(aud, ctx)
+  );
+
+  // Staff records (non-seed or explicit includeSeedLike)
+  const staffCandidates = snapshot.employees.filter(shouldConsider);
+  if (staffCandidates.length > 0) {
+    const existingStaffIds = await fetchExistingIds('staffDirectory');
+    const existingInviteIds = await fetchExistingIds('staffInvites');
+    const newInviteEmails: string[] = [];
+
+    for (const emp of staffCandidates) {
+      const staffId = sanitizeId(emp.id);
+      if (existingStaffIds.has(staffId)) continue;
+      existingStaffIds.add(staffId);
+      const linkedUser = snapshot.users.find((u) => u.id === emp.userId);
+      const userObj: User = linkedUser || {
+        id: emp.userId,
+        name: emp.name,
+        phone: emp.phone,
+        password: '123456',
+        pin: '4444',
+        googleEmail: emp.googleEmail,
+        roleId: emp.roleId,
+        assignedStoreIds: [emp.storeId],
+        isActive: true,
+        storeId: emp.storeId,
+        createdAt: emp.createdAt,
+        updatedAt: emp.updatedAt,
+        createdBy: emp.createdBy,
+      };
+      writer.add((b) =>
+        b.set(doc(firestoreDb, wsPath, 'staffDirectory', staffId), serializeStaffDirectoryEntry(userObj, emp, ctx))
+      );
+      writer.add((b) =>
+        b.set(doc(firestoreDb, wsPath, 'staffCredentials', staffId), serializeStaffCredential(userObj, emp, ctx))
+      );
+      uploadedCount += 1;
+      const cleanEmail = (emp.googleEmail || userObj.googleEmail || '').trim().toLowerCase();
+      if (cleanEmail) {
+        const emailHash = await sha256Hex(cleanEmail);
+        if (!existingInviteIds.has(emailHash)) {
+          existingInviteIds.add(emailHash);
+          newInviteEmails.push(cleanEmail);
+          writer.add((b) =>
+            b.set(
+              doc(firestoreDb, wsPath, 'staffInvites', emailHash),
+              serializeStaffInvite(userObj, emp, snapshot.roles, ctx, emailHash)
+            )
+          );
+        }
+      }
+    }
+
+    if (newInviteEmails.length > 0) {
+      const mergedInvites = Array.from(new Set([...ctx.invitedEmails, ...newInviteEmails]));
+      writer.add((b) =>
+        b.update(doc(firestoreDb, wsPath), {
+          invitedEmails: mergedInvites,
+          updatedAt: serverTimestamp(),
+        })
+      );
+    }
+  }
+
+  if (uploadedCount > 0) {
+    await writer.commitAll(wsPath);
+  }
+
+  return { uploadedCount, skippedDuplicates, backedUpLocally };
 }
 
 // --- Real-time Subscriptions ---
@@ -1437,9 +1888,12 @@ interface PendingQueueGuards {
   upsertCategories: Set<string>;
   deleteCategories: Set<string>;
   resetCategories: boolean;
+  upsertBrands: Set<string>;
   upsertCustomers: Set<string>;
+  upsertLoyaltyAccounts: Set<string>;
   upsertSales: Set<string>;
   deleteSales: Set<string>;
+  upsertReturns: Set<string>;
   upsertStores: Set<string>;
   deleteStores: Set<string>;
   upsertWarehouses: Set<string>;
@@ -1457,7 +1911,12 @@ interface PendingQueueGuards {
   upsertPromoCodes: Set<string>;
   upsertTargets: Set<string>;
   upsertOnlineOrders: Set<string>;
+  upsertAuditLogs: Set<string>;
+  upsertEmployees: Set<string>;
+  deleteEmployees: Set<string>;
   hasPendingStockChanges: boolean;
+  hasPendingTransactions: boolean;
+  hasPendingLoyaltyTx: boolean;
   hasPendingSettings: boolean;
   hasPendingRoles: boolean;
 }
@@ -1469,9 +1928,12 @@ function extractPendingQueueGuards(queue: OfflineSyncItem[]): PendingQueueGuards
     upsertCategories: new Set(),
     deleteCategories: new Set(),
     resetCategories: false,
+    upsertBrands: new Set(),
     upsertCustomers: new Set(),
+    upsertLoyaltyAccounts: new Set(),
     upsertSales: new Set(),
     deleteSales: new Set(),
+    upsertReturns: new Set(),
     upsertStores: new Set(),
     deleteStores: new Set(),
     upsertWarehouses: new Set(),
@@ -1489,13 +1951,20 @@ function extractPendingQueueGuards(queue: OfflineSyncItem[]): PendingQueueGuards
     upsertPromoCodes: new Set(),
     upsertTargets: new Set(),
     upsertOnlineOrders: new Set(),
+    upsertAuditLogs: new Set(),
+    upsertEmployees: new Set(),
+    deleteEmployees: new Set(),
     hasPendingStockChanges: false,
+    hasPendingTransactions: false,
+    hasPendingLoyaltyTx: false,
     hasPendingSettings: false,
     hasPendingRoles: false,
   };
 
   for (const item of queue) {
     const p = (item.payload || {}) as Record<string, unknown>;
+    if (p.auditId) g.upsertAuditLogs.add(String(p.auditId));
+    if (p.transactionId) g.hasPendingTransactions = true;
     switch (item.type) {
       case 'product':
         if (p.productId) g.upsertProducts.add(String(p.productId));
@@ -1525,11 +1994,17 @@ function extractPendingQueueGuards(queue: OfflineSyncItem[]): PendingQueueGuards
         break;
       case 'customer':
         if (p.customerId) g.upsertCustomers.add(String(p.customerId));
+        if (p.loyaltyAccountId) g.upsertLoyaltyAccounts.add(String(p.loyaltyAccountId));
         break;
       case 'sale':
       case 'sale_pay_deferred':
         if (p.saleId) g.upsertSales.add(String(p.saleId));
+        if (p.customerId) {
+          g.upsertCustomers.add(String(p.customerId));
+          g.hasPendingLoyaltyTx = true;
+        }
         if (p.debtId) g.upsertDebts.add(String(p.debtId));
+        if (Array.isArray(p.loyaltyTxIds) && p.loyaltyTxIds.length > 0) g.hasPendingLoyaltyTx = true;
         if (Array.isArray(p.accountIds)) {
           p.accountIds.forEach((id) => g.upsertAccounts.add(String(id)));
         }
@@ -1542,7 +2017,9 @@ function extractPendingQueueGuards(queue: OfflineSyncItem[]): PendingQueueGuards
         if (p.saleId) g.deleteSales.add(String(p.saleId));
         break;
       case 'return':
+        if (p.returnId) g.upsertReturns.add(String(p.returnId));
         if (p.saleId) g.upsertSales.add(String(p.saleId));
+        if (p.shiftId) g.upsertCashShifts.add(String(p.shiftId));
         if (p.accountId) g.upsertAccounts.add(String(p.accountId));
         g.hasPendingStockChanges = true;
         break;
@@ -1583,10 +2060,12 @@ function extractPendingQueueGuards(queue: OfflineSyncItem[]): PendingQueueGuards
       case 'supplier_debt_pay':
         if (p.supplierId) g.upsertSuppliers.add(String(p.supplierId));
         if (p.accountId) g.upsertAccounts.add(String(p.accountId));
+        g.hasPendingTransactions = true;
         break;
       case 'debt_pay':
         if (p.debtId) g.upsertDebts.add(String(p.debtId));
         if (p.accountId) g.upsertAccounts.add(String(p.accountId));
+        g.hasPendingTransactions = true;
         break;
       case 'promo':
         if (p.promoId) g.upsertPromoCodes.add(String(p.promoId));
@@ -1594,13 +2073,21 @@ function extractPendingQueueGuards(queue: OfflineSyncItem[]): PendingQueueGuards
       case 'expense':
         if (p.expenseId) g.upsertExpenses.add(String(p.expenseId));
         if (p.accountId) g.upsertAccounts.add(String(p.accountId));
+        g.hasPendingTransactions = true;
         break;
       case 'finance_transfer':
         if (p.fromAccountId) g.upsertAccounts.add(String(p.fromAccountId));
         if (p.toAccountId) g.upsertAccounts.add(String(p.toAccountId));
+        g.hasPendingTransactions = true;
         break;
       case 'account':
         if (p.accountId) g.upsertAccounts.add(String(p.accountId));
+        break;
+      case 'employee':
+        if (p.empId) g.upsertEmployees.add(String(p.empId));
+        break;
+      case 'employee_delete':
+        if (p.empId) g.deleteEmployees.add(String(p.empId));
         break;
       case 'target':
         if (p.targetId) g.upsertTargets.add(String(p.targetId));
@@ -1725,7 +2212,7 @@ export function subscribeWorkspaceRealtime(
         categories: guards.resetCategories
           ? base.categories
           : mergeCollectionWithPending(bucket.categories, base.categories, guards.upsertCategories, guards.deleteCategories),
-        brands: bucket.brands ?? base.brands,
+        brands: mergeCollectionWithPending(bucket.brands, base.brands, guards.upsertBrands),
         products: mergeCollectionWithPending(bucket.products, base.products, guards.upsertProducts, guards.deleteProducts),
         suppliers: mergeCollectionWithPending(bucket.suppliers, base.suppliers, guards.upsertSuppliers),
         stockItems: guards.hasPendingStockChanges ? base.stockItems : (bucket.stockItems ?? base.stockItems),
@@ -1738,20 +2225,22 @@ export function subscribeWorkspaceRealtime(
         writeOffs: mergeCollectionWithPending(bucket.writeOffs, base.writeOffs, guards.upsertWriteOffs),
         stocktakes: mergeCollectionWithPending(bucket.stocktakes, base.stocktakes, guards.upsertStocktakes),
         sales: mergeCollectionWithPending(bucket.sales, base.sales, guards.upsertSales, guards.deleteSales),
-        returns: bucket.returns ?? base.returns,
+        returns: mergeCollectionWithPending(bucket.returns, base.returns, guards.upsertReturns),
         cashShifts: mergeCollectionWithPending(bucket.cashShifts, base.cashShifts, guards.upsertCashShifts),
         cashOperations: mergeCollectionWithPending(bucket.cashOperations, base.cashOperations, guards.upsertCashOperations),
         accounts: mergeCollectionWithPending(bucket.accounts, base.accounts, guards.upsertAccounts),
-        transactions: bucket.transactions ?? base.transactions,
+        transactions: guards.hasPendingTransactions ? base.transactions : (bucket.transactions ?? base.transactions),
         expenses: mergeCollectionWithPending(bucket.expenses, base.expenses, guards.upsertExpenses),
         customers: mergeCollectionWithPending(bucket.customers, base.customers, guards.upsertCustomers),
-        loyaltyAccounts: bucket.loyaltyAccounts ?? base.loyaltyAccounts,
-        loyaltyTransactions: bucket.loyaltyTransactions ?? base.loyaltyTransactions,
+        loyaltyAccounts: mergeCollectionWithPending(bucket.loyaltyAccounts, base.loyaltyAccounts, guards.upsertLoyaltyAccounts),
+        loyaltyTransactions: guards.hasPendingLoyaltyTx
+          ? base.loyaltyTransactions
+          : (bucket.loyaltyTransactions ?? base.loyaltyTransactions),
         debts: mergeCollectionWithPending(bucket.debts, base.debts, guards.upsertDebts),
         promoCodes: mergeCollectionWithPending(bucket.promoCodes, base.promoCodes, guards.upsertPromoCodes),
         targets: mergeCollectionWithPending(bucket.targets, base.targets, guards.upsertTargets),
         onlineOrders: mergeCollectionWithPending(bucket.onlineOrders, base.onlineOrders, guards.upsertOnlineOrders),
-        auditLogs: bucket.auditLogs ?? base.auditLogs,
+        auditLogs: mergeCollectionWithPending(bucket.auditLogs, base.auditLogs, guards.upsertAuditLogs),
         offlineQueue: base.offlineQueue,
       };
 
@@ -1762,11 +2251,22 @@ export function subscribeWorkspaceRealtime(
 
         const nextUsers: User[] = [];
         const nextEmployees: Employee[] = [];
+        const seenEmpIds = new Set<string>();
+        const seenUserIds = new Set<string>();
 
         bucket.staffDirectory.forEach((dir) => {
+          if (guards.deleteEmployees.has(dir.id)) return;
           const cred = credById.get(dir.id);
           const existingLocalUser = base.users.find((u) => u.id === dir.userId);
           const existingLocalEmp = base.employees.find((e) => e.id === dir.id || e.userId === dir.userId);
+
+          if (guards.upsertEmployees.has(dir.id) && existingLocalEmp && existingLocalUser) {
+            seenEmpIds.add(existingLocalEmp.id);
+            seenUserIds.add(existingLocalUser.id);
+            nextEmployees.push(existingLocalEmp);
+            nextUsers.push(existingLocalUser);
+            return;
+          }
 
           const userId = String(dir.userId || dir.id);
           const roleId = String(dir.roleId || 'cashier') as RoleId;
@@ -1798,6 +2298,7 @@ export function subscribeWorkspaceRealtime(
             createdBy: String(dir.createdBy || ctx.ownerUid),
           };
           nextUsers.push(mergedUser);
+          seenUserIds.add(userId);
 
           const mergedEmp: Employee = {
             id: dir.id,
@@ -1818,7 +2319,20 @@ export function subscribeWorkspaceRealtime(
             createdBy: String(dir.createdBy || ctx.ownerUid),
           };
           nextEmployees.push(mergedEmp);
+          seenEmpIds.add(dir.id);
         });
+
+        for (const empId of guards.upsertEmployees) {
+          if (guards.deleteEmployees.has(empId) || seenEmpIds.has(empId)) continue;
+          const locEmp = base.employees.find((e) => e.id === empId);
+          if (locEmp) {
+            nextEmployees.push(locEmp);
+            const locUsr = base.users.find((u) => u.id === locEmp.userId);
+            if (locUsr && !seenUserIds.has(locUsr.id)) {
+              nextUsers.push(locUsr);
+            }
+          }
+        }
 
         if (nextUsers.length > 0) {
           next.users = nextUsers;
@@ -1884,6 +2398,10 @@ export function subscribeWorkspaceRealtime(
       (snap) => {
         if (!snap.exists()) return;
         const md = snap.data({ serverTimestamps: 'estimate' });
+        if (md.isActive === false) {
+          onFatalError(new Error("Sizning xodim hisobingiz faolsizlantirilgan. Administrator bilan bog'laning."));
+          return;
+        }
         const roleId = (md.roleId as RoleId) || ctx.roleId;
         const assignedStoreIds = Array.isArray(md.assignedStoreIds) ? md.assignedStoreIds : [];
         const isWsAdmin =
@@ -1891,7 +2409,15 @@ export function subscribeWorkspaceRealtime(
           isBootstrappedAdminEmail(ctx.email) ||
           roleId === 'owner' ||
           roleId === 'admin';
-        onHydrate(getBaseSnapshot()!, { roleId, assignedStoreIds, isWsAdmin });
+        const baseSnap = getBaseSnapshot();
+        if (baseSnap) {
+          onHydrate(baseSnap, {
+            roleId,
+            assignedStoreIds,
+            isWsAdmin,
+            ...(md.staffId ? { staffId: String(md.staffId) } : {}),
+          });
+        }
       },
       (err) => {
         try {
@@ -1911,7 +2437,7 @@ export function subscribeWorkspaceRealtime(
   ) => {
     const colPath = `${wsPath}/${colName}`;
     const colRef = collection(firestoreDb, 'workspaces', ctx.workspaceId, colName);
-    const q = ctx.isWsAdmin
+    const q = ctx.isPlatformAdmin
       ? colRef
       : options?.adminOnly
       ? query(colRef, where('adminUids', 'array-contains', ctx.uid))
@@ -2136,34 +2662,49 @@ export async function pushSyncItemToFirestore(
       storeId: string;
       qtyDelta: number;
       movement?: StockMovement;
-    }[]
+    }[],
+    options?: { skipSyncMarker?: boolean }
   ) => {
     try {
       await runTransaction(firestoreDb, async (tx) => {
         const opSnap = await tx.get(syncedOpRef);
         if (opSnap.exists()) return;
 
-        // Read all affected stockItems first (Firestore transactions require all reads before writes)
+        // Read all affected stockItems and movements first (Firestore transactions require all reads before writes)
         const reads: {
           entry: (typeof entries)[number];
           ref: ReturnType<typeof doc>;
           exists: boolean;
           currentQty: number;
+          movRef: ReturnType<typeof doc> | null;
+          movExists: boolean;
         }[] = [];
 
         for (const entry of entries) {
           const stkId = stockItemDocId(entry.warehouseId, entry.variantId);
           const ref = doc(firestoreDb, wsPath, 'stockItems', stkId);
           const snap = await tx.get(ref);
+          let movRef: ReturnType<typeof doc> | null = null;
+          let movExists = false;
+          if (entry.movement) {
+            movRef = doc(firestoreDb, wsPath, 'stockMovements', sanitizeId(entry.movement.id));
+            const movSnap = await tx.get(movRef);
+            movExists = movSnap.exists();
+          }
           reads.push({
             entry,
             ref,
             exists: snap.exists(),
             currentQty: snap.exists() ? Number(snap.data().qty || 0) : 0,
+            movRef,
+            movExists,
           });
         }
 
         for (const r of reads) {
+          // Idempotency guard: if this movement was already committed in an earlier attempt, skip double-applying delta
+          if (r.movExists) continue;
+
           const nextQty = Number((r.currentQty + r.entry.qtyDelta).toFixed(3));
           const stkId = stockItemDocId(r.entry.warehouseId, r.entry.variantId);
           if (r.exists) {
@@ -2188,26 +2729,25 @@ export async function pushSyncItemToFirestore(
             );
           }
 
-          if (r.entry.movement) {
+          if (r.entry.movement && r.movRef) {
             const mov = { ...r.entry.movement, qtyAfter: nextQty };
-            tx.set(
-              doc(firestoreDb, wsPath, 'stockMovements', sanitizeId(mov.id)),
-              serializeStockMovement(mov, tenantCtx)
-            );
+            tx.set(r.movRef, serializeStockMovement(mov, tenantCtx));
           }
         }
 
-        tx.set(syncedOpRef, {
-          id: opId,
-          opType: clampStr(item.type, 80),
-          actorUid: ctx.uid,
-          storeId: storeIdForOp,
-          ownerUid: ctx.ownerUid,
-          memberUids: Array.from(new Set([ctx.ownerUid, ...ctx.memberUids])).slice(0, 50),
-          createdBy: ctx.uid,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        if (!options?.skipSyncMarker) {
+          tx.set(syncedOpRef, {
+            id: opId,
+            opType: clampStr(item.type, 80),
+            actorUid: ctx.uid,
+            storeId: storeIdForOp,
+            ownerUid: ctx.ownerUid,
+            memberUids: Array.from(new Set([ctx.ownerUid, ...ctx.memberUids])).slice(0, 50),
+            createdBy: ctx.uid,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
       });
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, `${wsPath}/stockItems`);
@@ -2227,6 +2767,7 @@ export async function pushSyncItemToFirestore(
           batch.update(ref, {
             nameUz: nonEmptyStr(cat.nameUz, 120, 'Kategoriya'),
             nameRu: nonEmptyStr(cat.nameRu, 120, cat.nameUz),
+            ...(cat.parentId ? { parentId: clampStr(cat.parentId, 128) } : {}),
             sortOrder: Number(cat.sortOrder) || 0,
             updatedAt: serverTimestamp(),
           });
@@ -2262,6 +2803,7 @@ export async function pushSyncItemToFirestore(
       case 'categories_reset': {
         const writer = new ChunkedBatchWriter();
         const existingSnap = await getDocs(collection(firestoreDb, wsPath, 'categories'));
+        const existingIds = new Set(existingSnap.docs.map((d) => d.id));
         const newIds = new Set(snapshot.categories.map((c) => sanitizeId(c.id)));
         existingSnap.docs.forEach((d) => {
           if (!newIds.has(d.id)) {
@@ -2269,9 +2811,21 @@ export async function pushSyncItemToFirestore(
           }
         });
         snapshot.categories.forEach((c) => {
-          writer.add((b) =>
-            b.set(doc(firestoreDb, wsPath, 'categories', sanitizeId(c.id)), serializeCategory(c, tenantCtx))
-          );
+          const cid = sanitizeId(c.id);
+          const ref = doc(firestoreDb, wsPath, 'categories', cid);
+          if (existingIds.has(cid)) {
+            writer.add((b) =>
+              b.update(ref, {
+                nameUz: nonEmptyStr(c.nameUz, 120, 'Kategoriya'),
+                nameRu: nonEmptyStr(c.nameRu, 120, c.nameUz),
+                ...(c.parentId ? { parentId: clampStr(c.parentId, 128) } : {}),
+                sortOrder: Number(c.sortOrder) || 0,
+                updatedAt: serverTimestamp(),
+              })
+            );
+          } else {
+            writer.add((b) => b.set(ref, serializeCategory(c, tenantCtx)));
+          }
         });
         snapshot.products.forEach((p) => {
           writer.add((b) =>
@@ -2427,7 +2981,7 @@ export async function pushSyncItemToFirestore(
           .map((id) => snapshot.stockMovements.find((m) => m.id === id))
           .filter(Boolean) as StockMovement[];
 
-        // Update stock atomically first
+        // Update stock atomically first (keep syncedOp for final batch)
         if (movements.length > 0) {
           await applyStockDeltasInTx(
             movements.map((m) => ({
@@ -2437,7 +2991,8 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            }))
+            })),
+            { skipSyncMarker: true }
           );
         }
 
@@ -2473,9 +3028,7 @@ export async function pushSyncItemToFirestore(
             });
           }
         }
-        if (movements.length === 0) {
-          markSyncedInBatch(batch);
-        }
+        markSyncedInBatch(batch);
         await batch.commit();
         return;
       }
@@ -2523,12 +3076,13 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            }))
+            })),
+            { skipSyncMarker: true }
           );
         }
         const batch = writeBatch(firestoreDb);
         batch.set(doc(firestoreDb, wsPath, 'transfers', sanitizeId(tr.id)), serializeTransfer(tr, tenantCtx));
-        if (movements.length === 0) markSyncedInBatch(batch);
+        markSyncedInBatch(batch);
         await batch.commit();
         return;
       }
@@ -2551,7 +3105,8 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            }))
+            })),
+            { skipSyncMarker: true }
           );
         }
         const batch = writeBatch(firestoreDb);
@@ -2560,7 +3115,7 @@ export async function pushSyncItemToFirestore(
           items: tr.items,
           updatedAt: serverTimestamp(),
         });
-        if (movements.length === 0) markSyncedInBatch(batch);
+        markSyncedInBatch(batch);
         await batch.commit();
         return;
       }
@@ -2583,7 +3138,8 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            }))
+            })),
+            { skipSyncMarker: true }
           );
         }
         const batch = writeBatch(firestoreDb);
@@ -2594,7 +3150,7 @@ export async function pushSyncItemToFirestore(
             batch.set(doc(firestoreDb, wsPath, 'auditLogs', sanitizeId(aud.id)), serializeAuditLog(aud, tenantCtx));
           }
         }
-        if (movements.length === 0) markSyncedInBatch(batch);
+        markSyncedInBatch(batch);
         await batch.commit();
         return;
       }
@@ -2640,7 +3196,8 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            }))
+            })),
+            { skipSyncMarker: true }
           );
         }
         const batch = writeBatch(firestoreDb);
@@ -2656,7 +3213,7 @@ export async function pushSyncItemToFirestore(
             batch.set(doc(firestoreDb, wsPath, 'auditLogs', sanitizeId(aud.id)), serializeAuditLog(aud, tenantCtx));
           }
         }
-        if (movements.length === 0) markSyncedInBatch(batch);
+        markSyncedInBatch(batch);
         await batch.commit();
         return;
       }
@@ -2731,7 +3288,8 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            }))
+            })),
+            { skipSyncMarker: true }
           );
         }
 
@@ -2838,7 +3396,7 @@ export async function pushSyncItemToFirestore(
           }
         }
 
-        if (movements.length === 0) markSyncedInBatch(batch);
+        markSyncedInBatch(batch);
         await batch.commit();
         return;
       }
@@ -2879,7 +3437,8 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            }))
+            })),
+            { skipSyncMarker: true }
           );
         }
 
@@ -2917,7 +3476,7 @@ export async function pushSyncItemToFirestore(
             batch.set(doc(firestoreDb, wsPath, 'auditLogs', sanitizeId(aud.id)), serializeAuditLog(aud, tenantCtx));
           }
         }
-        if (movements.length === 0) markSyncedInBatch(batch);
+        markSyncedInBatch(batch);
         await batch.commit();
         return;
       }
@@ -3190,20 +3749,70 @@ export async function pushSyncItemToFirestore(
             batch.set(credRef, credSer);
           }
 
-          // Update workspace invitedEmails if googleEmail present (merge with live workspace doc)
           const cleanEmail = (emp?.googleEmail || user.googleEmail || '').trim().toLowerCase();
+          const prevEmail =
+            typeof payload.previousGoogleEmail === 'string'
+              ? payload.previousGoogleEmail.trim().toLowerCase()
+              : '';
+
+          // Maintain zero-PII staffInvites/{emailHash} so employee role/stores/permissions apply on Google sign-in
           if (cleanEmail) {
-            const wsSnap = await getDoc(doc(firestoreDb, 'workspaces', ctx.workspaceId));
-            const liveInvited = Array.isArray(wsSnap.data()?.invitedEmails)
-              ? (wsSnap.data()?.invitedEmails as string[]).map((e) => String(e).toLowerCase())
-              : ctx.invitedEmails;
-            if (!liveInvited.includes(cleanEmail)) {
-              const nextInvited = Array.from(new Set([...liveInvited, cleanEmail])).slice(0, 50);
-              batch.update(doc(firestoreDb, 'workspaces', ctx.workspaceId), {
-                invitedEmails: nextInvited,
+            const emailHash = await sha256Hex(cleanEmail);
+            const invRef = doc(firestoreDb, wsPath, 'staffInvites', emailHash);
+            const invSnap = await getDoc(invRef);
+            const invSer = serializeStaffInvite(
+              user,
+              emp,
+              snapshot.roles,
+              { ownerUid: ctx.ownerUid, adminUids: ctx.adminUids, uid: ctx.uid },
+              emailHash
+            );
+            if (invSnap.exists()) {
+              batch.update(invRef, {
+                staffId: invSer.staffId,
+                userId: invSer.userId,
+                roleId: invSer.roleId,
+                assignedStoreIds: invSer.assignedStoreIds,
+                permissions: invSer.permissions,
+                adminUids: invSer.adminUids,
                 updatedAt: serverTimestamp(),
               });
+            } else {
+              batch.set(invRef, invSer);
             }
+          }
+
+          if (prevEmail && prevEmail !== cleanEmail) {
+            const oldHash = await sha256Hex(prevEmail);
+            batch.delete(doc(firestoreDb, wsPath, 'staffInvites', oldHash));
+          }
+
+          // Update workspace invitedEmails & adminUids cleanly
+          const wsRef = doc(firestoreDb, 'workspaces', ctx.workspaceId);
+          const wsSnap = await getDoc(wsRef);
+          const wsData = wsSnap.data();
+          const liveInvited = Array.isArray(wsData?.invitedEmails)
+            ? (wsData.invitedEmails as string[]).map((e) => String(e).toLowerCase())
+            : ctx.invitedEmails;
+          const liveAdmins = Array.isArray(wsData?.adminUids)
+            ? (wsData.adminUids as string[]).map((u) => String(u))
+            : ctx.adminUids;
+
+          let nextInvited = [...liveInvited];
+          let invitedChanged = false;
+
+          if (prevEmail && prevEmail !== cleanEmail && !isBootstrappedAdminEmail(prevEmail)) {
+            const stillUsed =
+              snapshot.users.some((u) => u.isActive && u.googleEmail?.trim().toLowerCase() === prevEmail) ||
+              snapshot.employees.some((e) => e.googleEmail?.trim().toLowerCase() === prevEmail);
+            if (!stillUsed && nextInvited.includes(prevEmail)) {
+              nextInvited = nextInvited.filter((e) => e !== prevEmail);
+              invitedChanged = true;
+            }
+          }
+          if (cleanEmail && !nextInvited.includes(cleanEmail)) {
+            nextInvited = Array.from(new Set([...nextInvited, cleanEmail])).slice(0, 50);
+            invitedChanged = true;
           }
 
           // Also sync matching workspace member doc if they have already claimed a Google seat
@@ -3213,6 +3822,9 @@ export async function pushSyncItemToFirestore(
             snapshot.roles.find((r) => r.id === user.roleId)?.permissions ??
             [];
           const rulePerms = mapAppPermissionsToRuleTokens(rolePerms, user.roleId);
+          let nextAdmins = [...liveAdmins];
+          let adminsChanged = false;
+
           membersSnap.docs.forEach((mDoc) => {
             const md = mDoc.data();
             if (md.staffId === staffId) {
@@ -3224,8 +3836,24 @@ export async function pushSyncItemToFirestore(
                 isActive: Boolean(user.isActive),
                 updatedAt: serverTimestamp(),
               });
+              const shouldBeAdmin = Boolean(user.isActive) && (user.roleId === 'owner' || user.roleId === 'admin');
+              if (shouldBeAdmin && !nextAdmins.includes(mDoc.id)) {
+                nextAdmins = Array.from(new Set([...nextAdmins, mDoc.id])).slice(0, 20);
+                adminsChanged = true;
+              } else if (!shouldBeAdmin && mDoc.id !== ctx.ownerUid && nextAdmins.includes(mDoc.id)) {
+                nextAdmins = nextAdmins.filter((uid) => uid !== mDoc.id);
+                adminsChanged = true;
+              }
             }
           });
+
+          if (invitedChanged || adminsChanged) {
+            batch.update(wsRef, {
+              ...(invitedChanged ? { invitedEmails: nextInvited } : {}),
+              ...(adminsChanged ? { adminUids: nextAdmins } : {}),
+              updatedAt: serverTimestamp(),
+            });
+          }
         }
         markSyncedInBatch(batch);
         await batch.commit();
@@ -3237,13 +3865,64 @@ export async function pushSyncItemToFirestore(
         const batch = writeBatch(firestoreDb);
         batch.delete(doc(firestoreDb, wsPath, 'staffDirectory', staffId));
         if (ctx.isWsAdmin) {
-          batch.delete(doc(firestoreDb, wsPath, 'staffCredentials', staffId));
+          const credRef = doc(firestoreDb, wsPath, 'staffCredentials', staffId);
+          let deletedEmail =
+            typeof payload.deletedGoogleEmail === 'string'
+              ? payload.deletedGoogleEmail.trim().toLowerCase()
+              : '';
+          if (!deletedEmail) {
+            try {
+              const credSnap = await getDoc(credRef);
+              if (credSnap.exists() && credSnap.data().googleEmail) {
+                deletedEmail = String(credSnap.data().googleEmail).trim().toLowerCase();
+              }
+            } catch {
+              // ignore if credential doc does not exist
+            }
+          }
+          batch.delete(credRef);
+
+          if (deletedEmail) {
+            const emailHash = await sha256Hex(deletedEmail);
+            batch.delete(doc(firestoreDb, wsPath, 'staffInvites', emailHash));
+          }
+
+          const removedUids = new Set<string>();
           const membersSnap = await getDocs(collection(firestoreDb, wsPath, 'members'));
           membersSnap.docs.forEach((mDoc) => {
             if (mDoc.data().staffId === staffId && mDoc.id !== ctx.ownerUid) {
+              removedUids.add(mDoc.id);
               batch.delete(mDoc.ref);
             }
           });
+
+          const wsRef = doc(firestoreDb, 'workspaces', ctx.workspaceId);
+          const wsSnap = await getDoc(wsRef);
+          const wsData = wsSnap.data();
+          if (wsData) {
+            const wsPatch: Record<string, unknown> = {};
+            if (deletedEmail && !isBootstrappedAdminEmail(deletedEmail) && Array.isArray(wsData.invitedEmails)) {
+              const stillUsed =
+                snapshot.users.some((u) => u.isActive && u.googleEmail?.trim().toLowerCase() === deletedEmail) ||
+                snapshot.employees.some((e) => e.googleEmail?.trim().toLowerCase() === deletedEmail);
+              if (!stillUsed) {
+                wsPatch.invitedEmails = (wsData.invitedEmails as string[]).filter(
+                  (e) => String(e).toLowerCase() !== deletedEmail
+                );
+              }
+            }
+            if (removedUids.size > 0) {
+              if (Array.isArray(wsData.memberUids)) {
+                wsPatch.memberUids = (wsData.memberUids as string[]).filter((u) => !removedUids.has(String(u)));
+              }
+              if (Array.isArray(wsData.adminUids)) {
+                wsPatch.adminUids = (wsData.adminUids as string[]).filter((u) => !removedUids.has(String(u)));
+              }
+            }
+            if (Object.keys(wsPatch).length > 0) {
+              batch.update(wsRef, { ...wsPatch, updatedAt: serverTimestamp() });
+            }
+          }
         }
         markSyncedInBatch(batch);
         await batch.commit();
@@ -3301,7 +3980,8 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            }))
+            })),
+            { skipSyncMarker: true }
           );
         }
         const batch = writeBatch(firestoreDb);
@@ -3309,7 +3989,7 @@ export async function pushSyncItemToFirestore(
           status: ord.status,
           updatedAt: serverTimestamp(),
         });
-        if (movements.length === 0) markSyncedInBatch(batch);
+        markSyncedInBatch(batch);
         await batch.commit();
         return;
       }
@@ -3421,7 +4101,7 @@ export async function pushSyncItemToFirestore(
           roles: sanitizeRolesForWorkspace(snapshot.roles),
           updatedAt: serverTimestamp(),
         });
-        // Also update members whose roleId is NOT using customPermissions
+        // Also update members and staffInvites whose roleId is NOT using customPermissions
         if (ctx.isWsAdmin) {
           const membersSnap = await getDocs(collection(firestoreDb, wsPath, 'members'));
           membersSnap.docs.forEach((mDoc) => {
@@ -3431,6 +4111,20 @@ export async function pushSyncItemToFirestore(
             const rObj = snapshot.roles.find((r) => r.id === md.roleId);
             if (rObj && (!matchedUser || !Array.isArray(matchedUser.customPermissions))) {
               batch.update(mDoc.ref, {
+                permissions: mapAppPermissionsToRuleTokens(rObj.permissions, rObj.id),
+                updatedAt: serverTimestamp(),
+              });
+            }
+          });
+
+          const invitesSnap = await getDocs(collection(firestoreDb, wsPath, 'staffInvites'));
+          invitesSnap.docs.forEach((iDoc) => {
+            const idata = iDoc.data();
+            const matchedEmp = snapshot.employees.find((e) => e.id === idata.staffId);
+            const matchedUser = snapshot.users.find((u) => u.id === (matchedEmp?.userId || idata.userId));
+            const rObj = snapshot.roles.find((r) => r.id === idata.roleId);
+            if (rObj && (!matchedUser || !Array.isArray(matchedUser.customPermissions))) {
+              batch.update(iDoc.ref, {
                 permissions: mapAppPermissionsToRuleTokens(rObj.permissions, rObj.id),
                 updatedAt: serverTimestamp(),
               });
@@ -3464,6 +4158,7 @@ export async function clearWorkspaceOperationalData(
     'transfers',
     'stocktakes',
     'sales',
+    'cashShifts',
     'expenses',
     'customers',
     'loyaltyAccounts',

@@ -196,14 +196,42 @@ export async function ensureFirestoreNetwork(): Promise<void> {
   }
 }
 
-let connectionTested = false;
+let testedForUid: string | null | undefined = undefined;
+let lastConnectionOk = false;
+
+function isConnectionFailure(error: unknown): boolean {
+  const raw = error instanceof Error ? error.message : String(error || '');
+  const low = raw.toLowerCase();
+  return (
+    low.includes('permission-denied') ||
+    low.includes('missing or insufficient permissions') ||
+    low.includes('permission') ||
+    low.includes('the client is offline') ||
+    low.includes('client is offline') ||
+    low.includes('unavailable') ||
+    low.includes('failed-precondition') ||
+    low.includes('not-found') ||
+    low.includes('unauthenticated')
+  );
+}
 
 export async function testConnection(): Promise<boolean> {
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    lastConnectionOk = false;
     return false;
   }
-  if (connectionTested) return true;
-  connectionTested = true;
+
+  const currentUid = auth.currentUser?.uid ?? null;
+  if (lastConnectionOk && testedForUid === currentUid) {
+    return true;
+  }
+
+  // /test/connection rule requires isSignedIn() — without an authenticated user it cannot pass Firestore checks
+  if (!auth.currentUser) {
+    lastConnectionOk = false;
+    testedForUid = null;
+    return false;
+  }
 
   const probe = async () => {
     await ensureFirestoreNetwork();
@@ -212,29 +240,43 @@ export async function testConnection(): Promise<boolean> {
 
   try {
     await probe();
+    testedForUid = currentUid;
+    lastConnectionOk = true;
     return true;
   } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
+    const msg = error instanceof Error ? error.message : String(error || '');
+    if (msg.toLowerCase().includes('the client is offline')) {
       await new Promise((r) => setTimeout(r, 1200));
       try {
         await probe();
+        testedForUid = currentUid;
+        lastConnectionOk = true;
         return true;
       } catch (retryErr) {
-        connectionTested = false;
-        if (retryErr instanceof Error && retryErr.message.includes('the client is offline')) {
-          console.error('Please check your Firebase configuration or network connection.');
-          return false;
-        }
-        return true;
+        lastConnectionOk = false;
+        testedForUid = currentUid;
+        console.error('Firestore connection test failed:', retryErr);
+        return false;
       }
     }
-    // Permission-denied when unauthenticated still proves reachability to Firestore server
-    return true;
+    if (isConnectionFailure(error)) {
+      lastConnectionOk = false;
+      testedForUid = currentUid;
+      console.warn('Firestore connection check rejected:', msg);
+      return false;
+    }
+    lastConnectionOk = false;
+    testedForUid = currentUid;
+    console.warn('Firestore connection check error:', msg);
+    return false;
   }
 }
 
 export async function probeFirestoreConnection(workspaceId?: string): Promise<boolean> {
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return false;
+  }
+  if (!auth.currentUser) {
     return false;
   }
   try {
@@ -245,12 +287,9 @@ export async function probeFirestoreConnection(workspaceId?: string): Promise<bo
     await getDocFromServer(targetRef);
     return true;
   } catch (error) {
-    const msg = error instanceof Error ? error.message.toLowerCase() : '';
-    if (msg.includes('client is offline') || msg.includes('unavailable') || msg.includes('failed to get document because the client is offline')) {
-      return false;
-    }
-    // Non-offline errors (like unauthenticated permission-denied on test doc) mean server responded
-    return true;
+    const msg = error instanceof Error ? error.message : String(error || '');
+    console.warn('Firestore server probe failed:', msg);
+    return false;
   }
 }
 

@@ -46,7 +46,7 @@ export class LocalIndexedDBRepository implements IRepository {
           getReq.onsuccess = () => resolve(getReq.result as DatabaseSnapshot | undefined);
           getReq.onerror = () => resolve(undefined);
         });
-        if (data && Array.isArray(data.products) && data.products.length > 0) {
+        if (data && Array.isArray(data.stores) && data.stores.length > 0 && Array.isArray(data.products)) {
           return data;
         }
       } catch {
@@ -58,7 +58,7 @@ export class LocalIndexedDBRepository implements IRepository {
       const raw = localStorage.getItem(LS_FALLBACK_KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as DatabaseSnapshot;
-        if (parsed && Array.isArray(parsed.products) && parsed.products.length > 0) {
+        if (parsed && Array.isArray(parsed.stores) && parsed.stores.length > 0 && Array.isArray(parsed.products)) {
           return parsed;
         }
       }

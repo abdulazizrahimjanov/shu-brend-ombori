@@ -122,8 +122,10 @@ export const PWAInstallButton: React.FC = () => {
 export const OfflineIndicator: React.FC = () => {
   const isOnline = useAppStore((s) => s.isOnline);
   const syncStatus = useAppStore((s) => s.syncStatus);
+  const cloudConnected = useAppStore((s) => s.cloudConnected);
   const pendingCount = useAppStore((s) => s.db?.offlineQueue.length ?? 0);
   const syncOfflineQueue = useAppStore((s) => s.syncOfflineQueue);
+  const loginWithGoogle = useAppStore((s) => s.loginWithGoogle);
   const notify = useAppStore((s) => s.notify);
   const t = useT();
 
@@ -141,6 +143,25 @@ export const OfflineIndicator: React.FC = () => {
           <RefreshCw className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 animate-spin shrink-0" />
           <span>{t.common.syncing}</span>
         </>
+      ) : !cloudConnected ? (
+        <>
+          <span>
+            {t.common.syncPending}: {pendingCount}
+          </span>
+          <button
+            type="button"
+            onClick={async () => {
+              const res = await loginWithGoogle();
+              if (!res.ok && res.error) {
+                notify(res.error, 'error');
+              }
+            }}
+            className="inline-flex items-center gap-1 rounded bg-amber-600 px-2 py-1 text-[11px] text-white hover:bg-amber-700"
+          >
+            <RefreshCw className="w-3 h-3" />
+            {t.auth.googleSignIn}
+          </button>
+        </>
       ) : (
         <>
           <span>
@@ -150,7 +171,12 @@ export const OfflineIndicator: React.FC = () => {
             type="button"
             onClick={async () => {
               const count = await syncOfflineQueue();
-              notify(`${count} ta yozuv sinxronlandi`, 'success');
+              if (count > 0) {
+                notify(`${count} ta yozuv sinxronlandi`, 'success');
+              } else {
+                const err = useAppStore.getState().cloudError;
+                notify(err || "Sinxronlash amalga oshmadi", 'error');
+              }
             }}
             className="inline-flex items-center gap-1 rounded bg-amber-600 px-2 py-1 text-[11px] text-white hover:bg-amber-700"
           >
