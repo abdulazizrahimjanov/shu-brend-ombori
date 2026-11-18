@@ -9,6 +9,23 @@ if (import.meta.env.PROD && !Capacitor.isNativePlatform() && typeof window !== '
   registerSW({ immediate: true });
 }
 
+if (typeof document !== 'undefined') {
+  const preventGestureZoom = (e: Event) => {
+    e.preventDefault();
+  };
+  const preventMultiTouchZoom = (e: TouchEvent) => {
+    if (e.touches.length > 1) {
+      e.preventDefault();
+    }
+  };
+
+  document.addEventListener('gesturestart', preventGestureZoom, { passive: false });
+  document.addEventListener('gesturechange', preventGestureZoom, { passive: false });
+  document.addEventListener('gestureend', preventGestureZoom, { passive: false });
+  document.addEventListener('touchstart', preventMultiTouchZoom, { passive: false });
+  document.addEventListener('touchmove', preventMultiTouchZoom, { passive: false });
+}
+
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <App />
