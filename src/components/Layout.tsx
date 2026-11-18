@@ -73,6 +73,10 @@ export const Layout: React.FC = () => {
   const isOnline = useAppStore((s) => s.isOnline);
   const syncStatus = useAppStore((s) => s.syncStatus);
   const cloudConnected = useAppStore((s) => s.cloudConnected);
+  const cloudError = useAppStore((s) => s.cloudError);
+  const lastSyncAt = useAppStore((s) => s.lastSyncAt);
+  const checkAndSyncNow = useAppStore((s) => s.checkAndSyncNow);
+  const clearCloudError = useAppStore((s) => s.clearCloudError);
   const activeStoreId = useAppStore((s) => s.activeStoreId);
   const setActiveStoreId = useAppStore((s) => s.setActiveStoreId);
   const language = useAppStore((s) => s.language);
@@ -297,10 +301,19 @@ export const Layout: React.FC = () => {
             </div>
 
             <div className="flex items-center gap-2 shrink-0">
-              <div
-                className={`hidden sm:inline-flex items-center gap-1.5 px-2.5 h-8 rounded-lg border text-[11px] font-medium whitespace-nowrap ${
+              <button
+                type="button"
+                onClick={() => void checkAndSyncNow()}
+                title={
+                  lastSyncAt
+                    ? `Oxirgi tekshiruv: ${new Date(lastSyncAt).toLocaleTimeString()}`
+                    : 'Sinxronlash holatini tekshirish'
+                }
+                className={`hidden sm:inline-flex items-center gap-1.5 px-2.5 h-8 rounded-lg border text-[11px] font-medium whitespace-nowrap transition-opacity hover:opacity-80 ${
                   !isOnline
                     ? 'border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300'
+                    : cloudError
+                    ? 'border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/50 text-red-700 dark:text-red-300'
                     : syncStatus === 'syncing'
                     ? 'border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300'
                     : 'border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300'
@@ -310,6 +323,8 @@ export const Layout: React.FC = () => {
                   className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                     !isOnline
                       ? 'bg-amber-500'
+                      : cloudError
+                      ? 'bg-red-500'
                       : syncStatus === 'syncing'
                       ? 'bg-blue-500 animate-pulse'
                       : 'bg-emerald-500'
@@ -324,7 +339,7 @@ export const Layout: React.FC = () => {
                     ? t.common.cloudSynced
                     : t.common.internetAvailable}
                 </span>
-              </div>
+              </button>
 
               {accessibleStores.length > 0 && (
                 <div className="hidden md:flex items-center gap-1.5 border border-slate-200 dark:border-slate-700 rounded-xl px-2.5 h-9 bg-slate-50 dark:bg-slate-950">
@@ -417,6 +432,33 @@ export const Layout: React.FC = () => {
               </button>
             </div>
           </header>
+        )}
+
+        {/* Firebase Cloud Error Banner (shown only if Firebase encounters an error) */}
+        {cloudError && (
+          <div className="no-print mx-3 sm:mx-4 lg:mx-6 mt-3 flex items-center justify-between gap-3 rounded-xl border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/40 px-3.5 py-2.5 text-xs text-red-700 dark:text-red-300">
+            <div className="flex items-center gap-2 min-w-0">
+              <AlertCircle className="w-4 h-4 shrink-0 text-red-600 dark:text-red-400" />
+              <span className="truncate">{cloudError}</span>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => void checkAndSyncNow()}
+                className="px-2.5 py-1 rounded-lg bg-red-600 text-white font-semibold hover:bg-red-700"
+              >
+                {t.common.syncNow}
+              </button>
+              <button
+                type="button"
+                onClick={clearCloudError}
+                aria-label={t.common.close}
+                className="p-1 rounded-lg hover:bg-red-100 dark:hover:bg-red-900/40"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
         )}
 
         {/* Page Content */}

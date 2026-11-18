@@ -334,7 +334,11 @@ export const CatalogPage: React.FC = () => {
   const handleSaveProduct = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingProduct || !editingProduct.name.trim()) return;
-    await upsertProduct(editingProduct);
+    const res = await upsertProduct(editingProduct);
+    if (!res.ok) {
+      notify(res.error || 'Mahsulot saqlashda xatolik', 'error');
+      return;
+    }
 
     const whId = getWarehouseForStore(editingProduct.storeId);
     for (const v of editingProduct.variants) {
@@ -476,8 +480,12 @@ export const CatalogPage: React.FC = () => {
         }
       });
 
-      await importProducts(newProducts, stocks);
-      notify(`${newProducts.length} ta mahsulot import qilindi`, 'success');
+      const { imported, skipped } = await importProducts(newProducts, stocks);
+      if (skipped > 0) {
+        notify(`${imported} ta mahsulot import qilindi, ${skipped} ta takroriy o'tkazib yuborildi`, imported > 0 ? 'success' : 'info');
+      } else {
+        notify(`${imported} ta mahsulot import qilindi`, 'success');
+      }
     } catch {
       notify("Import faylini o'qishda xatolik", 'error');
     } finally {

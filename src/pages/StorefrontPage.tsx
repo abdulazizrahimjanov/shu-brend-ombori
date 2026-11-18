@@ -208,7 +208,9 @@ export const StorefrontPage: React.FC<{ publicStandalone?: boolean; onBackToLogi
               className="w-full h-full object-cover"
             />
             <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/35 to-transparent flex flex-col justify-end p-5 sm:p-7">
-              <div className="text-xs font-medium text-teal-300">Toshkent · Chilonzor & Samarqand Darvoza</div>
+              <div className="text-xs font-medium text-teal-300">
+                {db.stores.filter((s) => s.isActive).map((s) => s.name).join(' · ') || 'SHU BREND OMBOR'}
+              </div>
               <h2 className="font-display text-xl sm:text-3xl font-bold text-white mt-1">
                 {db.settings.brandName}
               </h2>

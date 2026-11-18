@@ -1689,7 +1689,7 @@ export const InventoryPage: React.FC = () => {
               const buyPrice = Math.max(0, Number(prodPurchasePrice) || 0);
               const sellPrice = Math.max(0, Number(prodRetailPrice) || buyPrice);
 
-              await upsertProduct({
+              const res = await upsertProduct({
                 id: newProdId,
                 name: cleanName,
                 categoryId: targetCatId,
@@ -1720,6 +1720,10 @@ export const InventoryPage: React.FC = () => {
                 updatedAt: nowIso,
                 createdBy: currentUser?.id ?? 'system',
               });
+              if (!res.ok) {
+                setProdError(res.error || 'Mahsulot saqlashda xatolik');
+                return;
+              }
 
               if (recCategoryId !== 'all' && recCategoryId !== targetCatId) {
                 setRecCategoryId(targetCatId);

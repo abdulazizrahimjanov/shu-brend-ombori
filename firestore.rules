@@ -29,7 +29,7 @@ service cloud.firestore {
     }
 
     function isBootstrappedAdmin() {
-      return isVerified() && request.auth.token.email == 'a1sanjar73@gmail.com';
+      return isVerified() && request.auth.token.email in ['assdsh993@gmail.com', 'a1sanjar73@gmail.com'];
     }
 
     function isPlatformAdmin() {

@@ -139,8 +139,8 @@ export function createSeedDatabase(): DatabaseSnapshot {
   const warehouses: Warehouse[] = [
     {
       id: wh1Id,
-      name: 'Asosiy Ombor (Chilonzor)',
-      address: 'Toshkent, Chilonzor 9-kvartal, 14-uy',
+      name: 'Ombor — SHU BREND TORAQORGON',
+      address: "To'raqo'rg'on",
       isMain: true,
       storeId: store1Id,
       createdAt: ts,
@@ -149,8 +149,8 @@ export function createSeedDatabase(): DatabaseSnapshot {
     },
     {
       id: wh2Id,
-      name: 'Filial Ombor (SamDarvoza)',
-      address: "Toshkent, Qoratosh ko'chasi, 5A",
+      name: 'Ombor — SHU BREND MINGBULOQ',
+      address: 'Mingbuloq',
       isMain: false,
       storeId: store2Id,
       createdAt: ts,
@@ -162,8 +162,8 @@ export function createSeedDatabase(): DatabaseSnapshot {
   const stores: Store[] = [
     {
       id: store1Id,
-      name: 'Chilonzor Flagman',
-      address: "Toshkent, Bunyodkor shoh ko'chasi, 42",
+      name: 'SHU BREND TORAQORGON',
+      address: "To'raqo'rg'on",
       phone: '+998 71 200 11 22',
       isActive: true,
       defaultWarehouseId: wh1Id,
@@ -176,8 +176,8 @@ export function createSeedDatabase(): DatabaseSnapshot {
     },
     {
       id: store2Id,
-      name: 'Samarqand Darvoza',
-      address: "Toshkent, Qoratosh ko'chasi, 5A",
+      name: 'SHU BREND MINGBULOQ',
+      address: 'Mingbuloq',
       phone: '+998 71 200 33 44',
       isActive: true,
       defaultWarehouseId: wh2Id,
@@ -193,11 +193,11 @@ export function createSeedDatabase(): DatabaseSnapshot {
   const users: User[] = [
     {
       id: 'usr-owner',
-      name: 'Sardorbek Karimov',
+      name: 'ISLOMBEK',
       phone: '+998889260404',
       password: '51111',
       pin: '51111',
-      googleEmail: 'a1sanjar73@gmail.com',
+      googleEmail: 'assdsh993@gmail.com',
       roleId: 'owner',
       assignedStoreIds: [store1Id, store2Id],
       isActive: true,
@@ -674,13 +674,13 @@ export function createSeedDatabase(): DatabaseSnapshot {
   ];
 
   const expenses: Expense[] = [
-    { id: 'exp-1', accountId: 'acc-bank-1', category: 'rent', amount: 8500000, description: 'Chilonzor do\'koni oylik ijarasi', isRecurring: true, recurringDay: 5, date: daysAgo(8), storeId: store1Id, createdAt: daysAgo(8), updatedAt: daysAgo(8), createdBy: 'usr-owner' },
+    { id: 'exp-1', accountId: 'acc-bank-1', category: 'rent', amount: 8500000, description: "SHU BREND TORAQORGON do'koni oylik ijarasi", isRecurring: true, recurringDay: 5, date: daysAgo(8), storeId: store1Id, createdAt: daysAgo(8), updatedAt: daysAgo(8), createdBy: 'usr-owner' },
     { id: 'exp-2', accountId: 'acc-cash-1', category: 'utilities', amount: 940000, description: 'Elektr energiya va internet', isRecurring: true, recurringDay: 10, date: daysAgo(4), storeId: store1Id, createdAt: daysAgo(4), updatedAt: daysAgo(4), createdBy: 'usr-admin' },
     { id: 'exp-3', accountId: 'acc-cash-1', category: 'delivery', amount: 380000, description: 'Tovar tashish va kuryerlik', isRecurring: false, date: daysAgo(2), storeId: store2Id, createdAt: daysAgo(2), updatedAt: daysAgo(2), createdBy: 'usr-manager' },
   ];
 
   const transactions: Transaction[] = [
-    { id: 'trx-1', accountId: 'acc-bank-1', type: 'expense', category: 'rent', amount: 8500000, description: 'Chilonzor do\'koni ijarasi', storeId: store1Id, createdAt: daysAgo(8), updatedAt: daysAgo(8), createdBy: 'usr-owner' },
+    { id: 'trx-1', accountId: 'acc-bank-1', type: 'expense', category: 'rent', amount: 8500000, description: "SHU BREND TORAQORGON do'koni ijarasi", storeId: store1Id, createdAt: daysAgo(8), updatedAt: daysAgo(8), createdBy: 'usr-owner' },
     { id: 'trx-2', accountId: 'acc-cash-1', type: 'expense', category: 'utilities', amount: 940000, description: 'Kommunal to\'lovlar', storeId: store1Id, createdAt: daysAgo(4), updatedAt: daysAgo(4), createdBy: 'usr-admin' },
   ];
 
@@ -766,7 +766,7 @@ export function createSeedDatabase(): DatabaseSnapshot {
     {
       id: 'aud-1',
       userId: 'usr-owner',
-      userName: 'Sardorbek Karimov',
+      userName: 'ISLOMBEK',
       action: 'price_change',
       entityType: 'Product',
       entityId: 'prod-01',
@@ -789,7 +789,7 @@ export function createSeedDatabase(): DatabaseSnapshot {
     allowNegativeStock: false,
     discountApprovalThresholdPercent: 15,
     receiptWidth: '80mm',
-    receiptHeader: 'SHU BREND OMBOR\nChilonzor Flagman do\'koni\nTel: +998 71 200 11 22',
+    receiptHeader: 'SHU BREND OMBOR\nSHU BREND TORAQORGON\nTel: +998 71 200 11 22',
     receiptFooter: "Xaridingiz uchun rahmat!\n14 kun ichida chek bilan almashtirish mumkin.",
     showReceiptQr: true,
     labelTemplate: '40x30',

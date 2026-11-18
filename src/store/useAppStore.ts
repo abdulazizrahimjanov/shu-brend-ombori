@@ -44,15 +44,19 @@ import { getMensClothingCategories } from '../data/seed';
 import { Language } from '../i18n';
 import {
   ensureFirestoreNetwork,
+  formatFirebaseErrorMessage,
+  probeFirestoreConnection,
   signInWithGooglePopup,
   signOutFirebase,
   testConnection,
   watchAuthState,
 } from '../firebase';
 import {
-  ADMIN_BOOTSTRAPPED_EMAIL,
+  ADMIN_BOOTSTRAPPED_EMAILS,
   bootstrapOrJoinWorkspace,
+  checkWorkspaceSyncHealth,
   clearWorkspaceOperationalData,
+  isBootstrappedAdminEmail,
   pushSyncItemToFirestore,
   stockItemDocId,
   subscribeWorkspaceRealtime,
@@ -66,6 +70,7 @@ const HELD_CARTS_KEY = 'shu_brend_held_carts_v1';
 
 let unsubscribeRealtime: (() => void) | null = null;
 let unsubscribeAuth: (() => void) | null = null;
+let syncWatchdogTimer: ReturnType<typeof setInterval> | null = null;
 let activeConnectPromise: Promise<WorkspaceContext | null> | null = null;
 
 export function uid(prefix: string): string {
@@ -94,11 +99,14 @@ interface AppState {
   cloudConnected: boolean;
   cloudConnecting: boolean;
   cloudError: string | null;
+  lastSyncAt: string | null;
   firebaseUid: string | null;
   firebaseEmail: string | null;
   workspaceContext: WorkspaceContext | null;
   syncStatus: 'online' | 'offline' | 'syncing';
   fatalSyncError: Error | null;
+  checkAndSyncNow: () => Promise<void>;
+  clearCloudError: () => void;
 
   // Shared Savatcha Cart state
   cartItems: SaleItem[];
@@ -146,7 +154,7 @@ interface AppState {
   getWarehouseForStore: (storeId?: string) => string;
 
   // Mutations
-  upsertProduct: (product: Product) => Promise<void>;
+  upsertProduct: (product: Product) => Promise<{ ok: boolean; error?: string }>;
   deleteProduct: (productId: string) => Promise<void>;
   bulkUpdatePrices: (
     productIds: string[],
@@ -163,7 +171,7 @@ interface AppState {
   importProducts: (
     products: Product[],
     initialStocks: { productId: string; variantId: string; warehouseId: string; qty: number; unitCost: number }[]
-  ) => Promise<void>;
+  ) => Promise<{ imported: number; skipped: number }>;
 
   // POS & Cash Shifts
   openShift: (startingCash: number, storeId: string) => Promise<CashShift>;
@@ -397,6 +405,7 @@ function phonesMatch(a: string, b: string): boolean {
 }
 
 let migratedOwnerCloudOnce = false;
+let migratedNamesCloudOnce = false;
 
 export const useAppStore = create<AppState>((set, get) => {
   const syncOrEnqueue = async (
@@ -426,14 +435,19 @@ export const useAppStore = create<AppState>((set, get) => {
       set({ syncStatus: 'syncing' });
       try {
         await pushSyncItemToFirestore(workspaceContext, op, nextDb);
-        set({ syncStatus: get().isOnline ? 'online' : 'offline' });
+        set({
+          syncStatus: get().isOnline ? 'online' : 'offline',
+          cloudError: null,
+          lastSyncAt: new Date().toISOString(),
+        });
       } catch (err) {
+        const friendlyMsg = formatFirebaseErrorMessage(err, get().language);
         if (isPermissionError(err)) {
-          const msg = get().language === 'ru'
-            ? 'У вас недостаточно прав для этой операции'
-            : "Ushbu amalni bulutga yozish uchun ruxsatingiz yetarli emas";
-          get().notify(msg, 'error');
-          set({ syncStatus: get().isOnline ? 'online' : 'offline' });
+          get().notify(friendlyMsg, 'error');
+          set({
+            syncStatus: get().isOnline ? 'online' : 'offline',
+            cloudError: friendlyMsg,
+          });
         } else {
           // Transient / network issue -> queue for auto-sync when connection stabilizes
           const latestDb = structuredClone(get().db ?? nextDb);
@@ -441,7 +455,11 @@ export const useAppStore = create<AppState>((set, get) => {
             latestDb.offlineQueue.push({ ...op, attempts: (op.attempts || 0) + 1 });
           }
           await repository.save(latestDb);
-          set({ db: latestDb, syncStatus: get().isOnline ? 'online' : 'offline' });
+          set({
+            db: latestDb,
+            syncStatus: get().isOnline ? 'online' : 'offline',
+            cloudError: friendlyMsg,
+          });
         }
       }
     }
@@ -458,9 +476,9 @@ export const useAppStore = create<AppState>((set, get) => {
       snapshot.users.find((u) => u.isActive && u.googleEmail?.trim().toLowerCase() === email) ??
       (ctx.staffId ? snapshot.users.find((u) => u.id === ctx.staffId || snapshot.employees.some((e) => e.id === ctx.staffId && e.userId === u.id)) : undefined);
 
-    if (!matched && email === ADMIN_BOOTSTRAPPED_EMAIL) {
+    if (!matched && isBootstrappedAdminEmail(email)) {
       matched = snapshot.users.find((u) => u.isActive && u.roleId === 'owner') ?? snapshot.users[0];
-      if (matched && !matched.googleEmail) {
+      if (matched && (!matched.googleEmail || matched.googleEmail !== email)) {
         matched.googleEmail = email;
         const emp = snapshot.employees.find((e) => e.userId === matched!.id);
         if (emp) emp.googleEmail = email;
@@ -568,7 +586,7 @@ export const useAppStore = create<AppState>((set, get) => {
               const email = fbUser.email.trim().toLowerCase();
               resolvedUser =
                 hydratedDb.users.find((u) => u.isActive && u.googleEmail?.trim().toLowerCase() === email) ??
-                (email === ADMIN_BOOTSTRAPPED_EMAIL
+                (isBootstrappedAdminEmail(email)
                   ? hydratedDb.users.find((u) => u.isActive && u.roleId === 'owner') ?? null
                   : null);
               if (resolvedUser) {
@@ -591,7 +609,7 @@ export const useAppStore = create<AppState>((set, get) => {
                 ownerUser.phone = '+998889260404';
                 ownerUser.password = '51111';
                 ownerUser.pin = '51111';
-                if (!ownerUser.googleEmail) ownerUser.googleEmail = 'a1sanjar73@gmail.com';
+                if (!ownerUser.googleEmail) ownerUser.googleEmail = ADMIN_BOOTSTRAPPED_EMAILS[0];
                 ownerUser.updatedAt = new Date().toISOString();
                 const ownerEmp = hydratedDb.employees.find((e) => e.userId === ownerUser.id);
                 if (ownerEmp) {
@@ -616,16 +634,122 @@ export const useAppStore = create<AppState>((set, get) => {
               }
             }
 
+            if (!migratedNamesCloudOnce && ctx.isWsAdmin) {
+              migratedNamesCloudOnce = true;
+              const nowIso = new Date().toISOString();
+              const ownerUser = hydratedDb.users.find((u) => u.id === 'usr-owner' || u.roleId === 'owner');
+              if (ownerUser && ownerUser.name === 'Sardorbek Karimov') {
+                ownerUser.name = 'ISLOMBEK';
+                ownerUser.updatedAt = nowIso;
+                const ownerEmp = hydratedDb.employees.find((e) => e.userId === ownerUser.id);
+                if (ownerEmp) {
+                  ownerEmp.name = 'ISLOMBEK';
+                  ownerEmp.updatedAt = nowIso;
+                }
+                void pushSyncItemToFirestore(
+                  ctx,
+                  {
+                    id: uid('sync'),
+                    idempotencyKey: `migrate-owner-name-v5-${ownerUser.id}`,
+                    type: 'employee',
+                    payload: { empId: ownerEmp?.id ?? ownerUser.id, userId: ownerUser.id, storeId: ownerUser.storeId },
+                    createdAt: nowIso,
+                    attempts: 0,
+                  },
+                  hydratedDb
+                ).catch(() => {});
+              }
+
+              const st1 = hydratedDb.stores.find((s) => s.id === 'store-chilonzor');
+              if (st1 && st1.name === 'Chilonzor Flagman') {
+                st1.name = 'SHU BREND TORAQORGON';
+                st1.address = "To'raqo'rg'on";
+                st1.updatedAt = nowIso;
+                void pushSyncItemToFirestore(
+                  ctx,
+                  {
+                    id: uid('sync'),
+                    idempotencyKey: 'migrate-store-v5-chilonzor',
+                    type: 'store',
+                    payload: { storeId: st1.id },
+                    createdAt: nowIso,
+                    attempts: 0,
+                  },
+                  hydratedDb
+                ).catch(() => {});
+              }
+
+              const st2 = hydratedDb.stores.find((s) => s.id === 'store-samdarvoza');
+              if (st2 && st2.name === 'Samarqand Darvoza') {
+                st2.name = 'SHU BREND MINGBULOQ';
+                st2.address = 'Mingbuloq';
+                st2.updatedAt = nowIso;
+                void pushSyncItemToFirestore(
+                  ctx,
+                  {
+                    id: uid('sync'),
+                    idempotencyKey: 'migrate-store-v5-samdarvoza',
+                    type: 'store',
+                    payload: { storeId: st2.id },
+                    createdAt: nowIso,
+                    attempts: 0,
+                  },
+                  hydratedDb
+                ).catch(() => {});
+              }
+
+              const wh1 = hydratedDb.warehouses.find((w) => w.id === 'wh-chilonzor');
+              if (wh1 && wh1.name.includes('Chilonzor')) {
+                wh1.name = 'Ombor — SHU BREND TORAQORGON';
+                wh1.address = "To'raqo'rg'on";
+                wh1.updatedAt = nowIso;
+                void pushSyncItemToFirestore(
+                  ctx,
+                  {
+                    id: uid('sync'),
+                    idempotencyKey: 'migrate-wh-v5-chilonzor',
+                    type: 'warehouse',
+                    payload: { warehouseId: wh1.id, storeId: wh1.storeId },
+                    createdAt: nowIso,
+                    attempts: 0,
+                  },
+                  hydratedDb
+                ).catch(() => {});
+              }
+
+              const wh2 = hydratedDb.warehouses.find((w) => w.id === 'wh-samdarvoza');
+              if (wh2 && wh2.name.includes('SamDarvoza')) {
+                wh2.name = 'Ombor — SHU BREND MINGBULOQ';
+                wh2.address = 'Mingbuloq';
+                wh2.updatedAt = nowIso;
+                void pushSyncItemToFirestore(
+                  ctx,
+                  {
+                    id: uid('sync'),
+                    idempotencyKey: 'migrate-wh-v5-samdarvoza',
+                    type: 'warehouse',
+                    payload: { warehouseId: wh2.id, storeId: wh2.storeId },
+                    createdAt: nowIso,
+                    attempts: 0,
+                  },
+                  hydratedDb
+                ).catch(() => {});
+              }
+            }
+
             void repository.save(hydratedDb);
             set({
               db: hydratedDb,
               workspaceContext: nextCtx,
               ...(resolvedUser ? { currentUserId: resolvedUser.id } : {}),
               activeStoreId: nextStoreId,
+              cloudError: null,
+              lastSyncAt: new Date().toISOString(),
             });
           },
           (fatalErr) => {
-            set({ fatalSyncError: fatalErr, syncStatus: 'offline' });
+            const friendlyMsg = formatFirebaseErrorMessage(fatalErr, get().language);
+            set({ fatalSyncError: fatalErr, cloudError: friendlyMsg, syncStatus: 'offline' });
           }
         );
 
@@ -636,7 +760,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
         return ctx;
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = formatFirebaseErrorMessage(err, get().language);
         set({
           cloudConnected: false,
           cloudConnecting: false,
@@ -644,7 +768,7 @@ export const useAppStore = create<AppState>((set, get) => {
           syncStatus: get().isOnline ? 'online' : 'offline',
         });
         if (options?.forceInteractiveLogin) {
-          throw err;
+          throw new Error(msg);
         }
         return null;
       } finally {
@@ -678,11 +802,44 @@ export const useAppStore = create<AppState>((set, get) => {
     cloudConnected: false,
     cloudConnecting: false,
     cloudError: null,
+    lastSyncAt: null,
     firebaseUid: null,
     firebaseEmail: null,
     workspaceContext: null,
     syncStatus: typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'online',
     fatalSyncError: null,
+    clearCloudError: () => set({ cloudError: null }),
+    checkAndSyncNow: async () => {
+      const online = typeof navigator !== 'undefined' ? navigator.onLine !== false : true;
+      if (!online) {
+        set({ isOnline: false, syncStatus: 'offline' });
+        return;
+      }
+      if (!get().isOnline) {
+        set({ isOnline: true });
+      }
+      const { cloudConnected, workspaceContext, db } = get();
+      if (cloudConnected && workspaceContext) {
+        const health = await checkWorkspaceSyncHealth(workspaceContext);
+        if (!health.ok) {
+          set({ cloudError: health.error ?? null });
+          return;
+        }
+        if (db && db.offlineQueue.length > 0) {
+          await get().syncOfflineQueue();
+        }
+        set({
+          cloudError: null,
+          lastSyncAt: new Date().toISOString(),
+          syncStatus: get().isOnline ? 'online' : 'offline',
+        });
+      } else {
+        const reachable = await probeFirestoreConnection();
+        if (reachable) {
+          set({ lastSyncAt: new Date().toISOString() });
+        }
+      }
+    },
 
     cartItems: [],
     cartCustomerId: '',
@@ -768,7 +925,7 @@ export const useAppStore = create<AppState>((set, get) => {
             ownerUser.pin = '51111';
           }
           if (!ownerUser.googleEmail) {
-            ownerUser.googleEmail = 'a1sanjar73@gmail.com';
+            ownerUser.googleEmail = ADMIN_BOOTSTRAPPED_EMAILS[0];
           }
           const ownerEmp = db.employees.find((e) => e.userId === ownerUser.id);
           if (ownerEmp && ownerEmp.phone === '+998901112233') {
@@ -777,6 +934,58 @@ export const useAppStore = create<AppState>((set, get) => {
           }
         }
         db.version = 4;
+        changed = true;
+      }
+      if ((db.version ?? 1) < 5) {
+        const nowIso = new Date().toISOString();
+        const ownerUser = db.users.find((u) => u.id === 'usr-owner' || u.roleId === 'owner');
+        if (ownerUser) {
+          if (ownerUser.name === 'Sardorbek Karimov') {
+            ownerUser.name = 'ISLOMBEK';
+            ownerUser.updatedAt = nowIso;
+          }
+          const ownerEmp = db.employees.find((e) => e.userId === ownerUser.id);
+          if (ownerEmp && ownerEmp.name === 'Sardorbek Karimov') {
+            ownerEmp.name = 'ISLOMBEK';
+            ownerEmp.updatedAt = nowIso;
+          }
+        }
+        db.auditLogs.forEach((a) => {
+          if (a.userId === 'usr-owner' && a.userName === 'Sardorbek Karimov') {
+            a.userName = 'ISLOMBEK';
+          }
+        });
+        const st1 = db.stores.find((s) => s.id === 'store-chilonzor');
+        if (st1 && st1.name === 'Chilonzor Flagman') {
+          st1.name = 'SHU BREND TORAQORGON';
+          st1.address = "To'raqo'rg'on";
+          st1.updatedAt = nowIso;
+        }
+        const st2 = db.stores.find((s) => s.id === 'store-samdarvoza');
+        if (st2 && st2.name === 'Samarqand Darvoza') {
+          st2.name = 'SHU BREND MINGBULOQ';
+          st2.address = 'Mingbuloq';
+          st2.updatedAt = nowIso;
+        }
+        const wh1 = db.warehouses.find((w) => w.id === 'wh-chilonzor');
+        if (wh1 && wh1.name.includes('Chilonzor')) {
+          wh1.name = 'Ombor — SHU BREND TORAQORGON';
+          wh1.address = "To'raqo'rg'on";
+          wh1.updatedAt = nowIso;
+        }
+        const wh2 = db.warehouses.find((w) => w.id === 'wh-samdarvoza');
+        if (wh2 && wh2.name.includes('SamDarvoza')) {
+          wh2.name = 'Ombor — SHU BREND MINGBULOQ';
+          wh2.address = 'Mingbuloq';
+          wh2.updatedAt = nowIso;
+        }
+        if (db.settings.receiptHeader.includes('Chilonzor Flagman')) {
+          db.settings.receiptHeader = db.settings.receiptHeader.replace(
+            /Chilonzor Flagman( do'koni)?/g,
+            'SHU BREND TORAQORGON'
+          );
+        }
+        db.version = 5;
         changed = true;
       }
       if (changed) {
@@ -809,6 +1018,13 @@ export const useAppStore = create<AppState>((set, get) => {
             });
           }
         });
+      }
+
+      // 15-second periodic sync status & offline queue watchdog
+      if (!syncWatchdogTimer && typeof window !== 'undefined') {
+        syncWatchdogTimer = setInterval(() => {
+          void get().checkAndSyncNow();
+        }, 15000);
       }
     },
 
@@ -916,7 +1132,7 @@ export const useAppStore = create<AppState>((set, get) => {
         await connectFirebaseUser(fbUser, { forceInteractiveLogin: true });
         return { ok: true };
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Google orqali kirishda xatolik yuz berdi";
+        const msg = formatFirebaseErrorMessage(err, get().language);
         set({ cloudConnecting: false, cloudError: msg });
         return { ok: false, error: msg };
       }
@@ -1003,39 +1219,94 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     upsertProduct: async (product) => {
-      const { db } = get();
-      if (!db || (!get().can('edit_catalog') && !get().can('manage_inventory'))) return;
+      const { db, language } = get();
+      if (!db) return { ok: false, error: 'DB not loaded' };
+      if (!get().can('edit_catalog') && !get().can('manage_inventory')) {
+        return { ok: false, error: language === 'ru' ? 'Недостаточно прав' : "Ruxsat yo'q" };
+      }
+      const cleanName = product.name.trim();
+      if (!cleanName) {
+        return { ok: false, error: language === 'ru' ? 'Введите название товара' : 'Mahsulot nomini kiriting' };
+      }
+
+      // Duplicate product protection (name, SKU, barcode)
+      const incomingSkus = new Set(
+        (product.variants || []).map((v) => v.sku.trim().toLowerCase()).filter(Boolean)
+      );
+      const incomingBarcodes = new Set(
+        (product.variants || []).flatMap((v) => v.barcodes || []).map((b) => b.trim()).filter(Boolean)
+      );
+
+      for (const existing of db.products) {
+        if (existing.id === product.id) continue;
+        if (existing.name.trim().toLowerCase() === cleanName.toLowerCase()) {
+          return {
+            ok: false,
+            error:
+              language === 'ru'
+                ? `Товар «${cleanName}» уже существует в каталоге`
+                : `"${cleanName}" nomli mahsulot katalogda allaqachon mavjud`,
+          };
+        }
+        for (const ev of existing.variants || []) {
+          const eSku = ev.sku.trim().toLowerCase();
+          if (eSku && incomingSkus.has(eSku)) {
+            return {
+              ok: false,
+              error:
+                language === 'ru'
+                  ? `SKU «${ev.sku}» уже используется другим товаром`
+                  : `"${ev.sku}" SKU kodi boshqa mahsulotda band`,
+            };
+          }
+          for (const eb of ev.barcodes || []) {
+            const cleanB = eb.trim();
+            if (cleanB && incomingBarcodes.has(cleanB)) {
+              return {
+                ok: false,
+                error:
+                  language === 'ru'
+                    ? `Штрих-код «${cleanB}» уже используется другим товаром`
+                    : `"${cleanB}" shtrix-kodi boshqa mahsulotda band`,
+              };
+            }
+          }
+        }
+      }
+
       const user = get().getCurrentUser();
       const nextDb: DatabaseSnapshot = structuredClone(db);
       const nowIso = new Date().toISOString();
-      const idx = nextDb.products.findIndex((p) => p.id === product.id);
+      const normalizedProduct: Product = { ...product, name: cleanName };
+      const idx = nextDb.products.findIndex((p) => p.id === normalizedProduct.id);
       let auditId: string | undefined;
       if (idx >= 0) {
         const prev = nextDb.products[idx];
         const prevPrice = prev.variants[0]?.retailPrice;
-        const newPrice = product.variants[0]?.retailPrice;
+        const newPrice = normalizedProduct.variants[0]?.retailPrice;
         if (prevPrice !== undefined && newPrice !== undefined && prevPrice !== newPrice) {
           auditId = appendAudit(
             nextDb,
             user,
             'price_change',
             'Product',
-            product.id,
-            `${product.name} narxi o'zgartirildi: ${prevPrice} -> ${newPrice}`,
-            product.storeId
+            normalizedProduct.id,
+            `${normalizedProduct.name} narxi o'zgartirildi: ${prevPrice} -> ${newPrice}`,
+            normalizedProduct.storeId
           );
         }
-        nextDb.products[idx] = { ...product, updatedAt: nowIso };
+        nextDb.products[idx] = { ...normalizedProduct, updatedAt: nowIso };
       } else {
-        nextDb.products.unshift(product);
+        nextDb.products.unshift(normalizedProduct);
       }
       await syncOrEnqueue(nextDb, {
         id: uid('sync'),
         type: 'product',
-        payload: { productId: product.id, auditId, storeId: product.storeId },
+        payload: { productId: normalizedProduct.id, auditId, storeId: normalizedProduct.storeId },
         createdAt: nowIso,
         attempts: 0,
       });
+      return { ok: true };
     },
 
     deleteProduct: async (productId) => {
@@ -1147,14 +1418,49 @@ export const useAppStore = create<AppState>((set, get) => {
 
     importProducts: async (products, initialStocks) => {
       const { db } = get();
-      if (!db || !get().can('edit_catalog')) return;
+      if (!db || !get().can('edit_catalog')) return { imported: 0, skipped: products.length };
       const user = get().getCurrentUser();
       const nextDb: DatabaseSnapshot = structuredClone(db);
       const nowIso = new Date().toISOString();
-      nextDb.products.unshift(...products);
+
+      const seenNames = new Set(nextDb.products.map((p) => p.name.trim().toLowerCase()));
+      const seenSkus = new Set(
+        nextDb.products.flatMap((p) => p.variants.map((v) => v.sku.trim().toLowerCase()).filter(Boolean))
+      );
+      const seenBarcodes = new Set(
+        nextDb.products.flatMap((p) => p.variants.flatMap((v) => v.barcodes || []).map((b) => b.trim()).filter(Boolean))
+      );
+
+      const accepted: Product[] = [];
+      let skipped = 0;
+
+      for (const p of products) {
+        const normName = p.name.trim().toLowerCase();
+        if (!normName || seenNames.has(normName)) {
+          skipped += 1;
+          continue;
+        }
+        const pSkus = p.variants.map((v) => v.sku.trim().toLowerCase()).filter(Boolean);
+        const pBarcodes = p.variants.flatMap((v) => v.barcodes || []).map((b) => b.trim()).filter(Boolean);
+        if (pSkus.some((s) => seenSkus.has(s)) || pBarcodes.some((b) => seenBarcodes.has(b))) {
+          skipped += 1;
+          continue;
+        }
+        seenNames.add(normName);
+        pSkus.forEach((s) => seenSkus.add(s));
+        pBarcodes.forEach((b) => seenBarcodes.add(b));
+        accepted.push({ ...p, name: p.name.trim() });
+      }
+
+      if (accepted.length === 0) {
+        return { imported: 0, skipped };
+      }
+
+      const acceptedIds = new Set(accepted.map((p) => p.id));
+      nextDb.products.unshift(...accepted);
       const movementIds: string[] = [];
       initialStocks.forEach((st) => {
-        if (st.qty > 0) {
+        if (st.qty > 0 && acceptedIds.has(st.productId)) {
           const wh = nextDb.warehouses.find((w) => w.id === st.warehouseId);
           const mov = mutateStock(nextDb, {
             productId: st.productId,
@@ -1174,13 +1480,14 @@ export const useAppStore = create<AppState>((set, get) => {
         id: uid('sync'),
         type: 'import_products',
         payload: {
-          productIds: products.map((p) => p.id),
+          productIds: accepted.map((p) => p.id),
           movementIds,
-          storeId: products[0]?.storeId ?? nextDb.stores[0]?.id ?? 'store-chilonzor',
+          storeId: accepted[0]?.storeId ?? nextDb.stores[0]?.id ?? 'store-chilonzor',
         },
         createdAt: nowIso,
         attempts: 0,
       });
+      return { imported: accepted.length, skipped };
     },
 
     openShift: async (startingCash, storeId) => {
@@ -1999,6 +2306,7 @@ export const useAppStore = create<AppState>((set, get) => {
       const workingDb: DatabaseSnapshot = structuredClone(db);
       const nowIso = new Date().toISOString();
 
+      let lastErrMsg: string | null = null;
       for (const item of workingDb.offlineQueue) {
         try {
           await pushSyncItemToFirestore(workspaceContext, item, workingDb);
@@ -2011,8 +2319,10 @@ export const useAppStore = create<AppState>((set, get) => {
         } catch (err) {
           if (isPermissionError(err)) {
             // Drop operations rejected by rules so queue doesn't spin forever
+            lastErrMsg = formatFirebaseErrorMessage(err, get().language);
             continue;
           }
+          lastErrMsg = formatFirebaseErrorMessage(err, get().language);
           remaining.push({ ...item, attempts: (item.attempts || 0) + 1 });
         }
       }
@@ -2022,6 +2332,8 @@ export const useAppStore = create<AppState>((set, get) => {
       set({
         db: workingDb,
         syncStatus: get().isOnline ? 'online' : 'offline',
+        cloudError: remaining.length > 0 ? lastErrMsg : null,
+        ...(syncedCount > 0 && remaining.length === 0 ? { lastSyncAt: nowIso } : {}),
       });
       return syncedCount;
     },

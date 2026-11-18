@@ -8,6 +8,7 @@ export const AuthScreen: React.FC<{ onOpenCatalog?: () => void }> = ({ onOpenCat
   const loginWithPhone = useAppStore((s) => s.loginWithPhone);
   const loginWithGoogle = useAppStore((s) => s.loginWithGoogle);
   const cloudConnecting = useAppStore((s) => s.cloudConnecting);
+  const cloudError = useAppStore((s) => s.cloudError);
   const language = useAppStore((s) => s.language);
   const setLanguage = useAppStore((s) => s.setLanguage);
   const theme = useAppStore((s) => s.theme);
@@ -183,6 +184,11 @@ export const AuthScreen: React.FC<{ onOpenCatalog?: () => void }> = ({ onOpenCat
               )}
               <span>{t.auth.googleSignIn}</span>
             </button>
+            {(cloudError && !error) && (
+              <p className="text-xs font-medium text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900 rounded-lg px-3 py-2">
+                {cloudError}
+              </p>
+            )}
             <p className="text-[11px] text-center text-slate-500 dark:text-slate-400">
               {t.auth.googleSignInDesc} · {t.auth.cloudSyncHint}
             </p>

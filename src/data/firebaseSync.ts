@@ -9,6 +9,7 @@ import {
   deleteDoc,
   doc,
   getDoc,
+  getDocFromServer,
   getDocs,
   onSnapshot,
   query,
@@ -19,7 +20,7 @@ import {
   where,
   writeBatch,
 } from 'firebase/firestore';
-import { firestoreDb, handleFirestoreError, OperationType } from '../firebase';
+import { firestoreDb, formatFirebaseErrorMessage, handleFirestoreError, OperationType } from '../firebase';
 import {
   Account,
   AppSettings,
@@ -60,7 +61,13 @@ import {
 } from '../types/models';
 
 export const PRIMARY_WORKSPACE_ID = 'ws-shubrend-main';
-export const ADMIN_BOOTSTRAPPED_EMAIL = 'a1sanjar73@gmail.com';
+export const ADMIN_BOOTSTRAPPED_EMAILS = ['assdsh993@gmail.com', 'a1sanjar73@gmail.com'] as const;
+export const ADMIN_BOOTSTRAPPED_EMAIL = ADMIN_BOOTSTRAPPED_EMAILS[0];
+
+export function isBootstrappedAdminEmail(email?: string | null): boolean {
+  const clean = String(email || '').trim().toLowerCase();
+  return (ADMIN_BOOTSTRAPPED_EMAILS as readonly string[]).includes(clean);
+}
 
 const SECRET_INTEGRATION_KEYS = [
   'ofdApiKey',
@@ -890,7 +897,7 @@ class ChunkedBatchWriter {
 }
 
 function buildInvitedEmailsFromSnapshot(snapshot: DatabaseSnapshot): string[] {
-  const emails = new Set<string>([ADMIN_BOOTSTRAPPED_EMAIL]);
+  const emails = new Set<string>(ADMIN_BOOTSTRAPPED_EMAILS);
   snapshot.users.forEach((u) => {
     if (u.googleEmail && u.googleEmail.trim()) {
       emails.add(u.googleEmail.trim().toLowerCase());
@@ -919,7 +926,7 @@ export async function bootstrapOrJoinWorkspace(
   const displayName = nonEmptyStr(fbUser.displayName || email.split('@')[0] || 'Xodim', 120, 'Xodim');
 
   // 1. Bootstrap platform admin record if bootstrapped owner email
-  if (email === ADMIN_BOOTSTRAPPED_EMAIL) {
+  if (isBootstrappedAdminEmail(email)) {
     const adminRef = doc(firestoreDb, 'admins', uid);
     try {
       const adminSnap = await getDoc(adminRef);
@@ -987,9 +994,9 @@ export async function bootstrapOrJoinWorkspace(
 
   // Case A: Workspace does not exist yet -> only owner initializes & migrates snapshot
   if (!wsSnap.exists()) {
-    if (email !== ADMIN_BOOTSTRAPPED_EMAIL) {
+    if (!isBootstrappedAdminEmail(email)) {
       throw new Error(
-        `Umumiy baza hali yaratilmagan. Avval do'kon egasi (${ADMIN_BOOTSTRAPPED_EMAIL}) Google orqali kirishi kerak.`
+        `Umumiy baza hali yaratilmagan. Avval do'kon egasi (${ADMIN_BOOTSTRAPPED_EMAILS[0]}) Google orqali kirishi kerak.`
       );
     }
 
@@ -1079,7 +1086,7 @@ export async function bootstrapOrJoinWorkspace(
     ? wsData.invitedEmails.map((e: string) => String(e).toLowerCase())
     : [];
 
-  const isOwner = ownerUid === uid || email === ADMIN_BOOTSTRAPPED_EMAIL;
+  const isOwner = ownerUid === uid || isBootstrappedAdminEmail(email);
   const isAdminMember = isOwner || adminUids.includes(uid);
   const isInvited = invitedEmails.includes(email);
 
@@ -1424,6 +1431,258 @@ async function propagateMembersIfNeeded(
   }
 }
 
+interface PendingQueueGuards {
+  upsertProducts: Set<string>;
+  deleteProducts: Set<string>;
+  upsertCategories: Set<string>;
+  deleteCategories: Set<string>;
+  resetCategories: boolean;
+  upsertCustomers: Set<string>;
+  upsertSales: Set<string>;
+  deleteSales: Set<string>;
+  upsertStores: Set<string>;
+  deleteStores: Set<string>;
+  upsertWarehouses: Set<string>;
+  upsertSuppliers: Set<string>;
+  upsertDebts: Set<string>;
+  upsertExpenses: Set<string>;
+  upsertAccounts: Set<string>;
+  upsertPurchaseReceipts: Set<string>;
+  upsertPurchaseOrders: Set<string>;
+  upsertTransfers: Set<string>;
+  upsertWriteOffs: Set<string>;
+  upsertStocktakes: Set<string>;
+  upsertCashShifts: Set<string>;
+  upsertCashOperations: Set<string>;
+  upsertPromoCodes: Set<string>;
+  upsertTargets: Set<string>;
+  upsertOnlineOrders: Set<string>;
+  hasPendingStockChanges: boolean;
+  hasPendingSettings: boolean;
+  hasPendingRoles: boolean;
+}
+
+function extractPendingQueueGuards(queue: OfflineSyncItem[]): PendingQueueGuards {
+  const g: PendingQueueGuards = {
+    upsertProducts: new Set(),
+    deleteProducts: new Set(),
+    upsertCategories: new Set(),
+    deleteCategories: new Set(),
+    resetCategories: false,
+    upsertCustomers: new Set(),
+    upsertSales: new Set(),
+    deleteSales: new Set(),
+    upsertStores: new Set(),
+    deleteStores: new Set(),
+    upsertWarehouses: new Set(),
+    upsertSuppliers: new Set(),
+    upsertDebts: new Set(),
+    upsertExpenses: new Set(),
+    upsertAccounts: new Set(),
+    upsertPurchaseReceipts: new Set(),
+    upsertPurchaseOrders: new Set(),
+    upsertTransfers: new Set(),
+    upsertWriteOffs: new Set(),
+    upsertStocktakes: new Set(),
+    upsertCashShifts: new Set(),
+    upsertCashOperations: new Set(),
+    upsertPromoCodes: new Set(),
+    upsertTargets: new Set(),
+    upsertOnlineOrders: new Set(),
+    hasPendingStockChanges: false,
+    hasPendingSettings: false,
+    hasPendingRoles: false,
+  };
+
+  for (const item of queue) {
+    const p = (item.payload || {}) as Record<string, unknown>;
+    switch (item.type) {
+      case 'product':
+        if (p.productId) g.upsertProducts.add(String(p.productId));
+        break;
+      case 'product_delete':
+        if (p.productId) g.deleteProducts.add(String(p.productId));
+        g.hasPendingStockChanges = true;
+        break;
+      case 'bulk_prices':
+      case 'import_products':
+        if (Array.isArray(p.productIds)) {
+          p.productIds.forEach((id) => g.upsertProducts.add(String(id)));
+        }
+        if (item.type === 'import_products') g.hasPendingStockChanges = true;
+        break;
+      case 'quick_stock':
+        g.hasPendingStockChanges = true;
+        break;
+      case 'category':
+        if (p.categoryId) g.upsertCategories.add(String(p.categoryId));
+        break;
+      case 'category_delete':
+        if (p.categoryId) g.deleteCategories.add(String(p.categoryId));
+        break;
+      case 'categories_reset':
+        g.resetCategories = true;
+        break;
+      case 'customer':
+        if (p.customerId) g.upsertCustomers.add(String(p.customerId));
+        break;
+      case 'sale':
+      case 'sale_pay_deferred':
+        if (p.saleId) g.upsertSales.add(String(p.saleId));
+        if (p.debtId) g.upsertDebts.add(String(p.debtId));
+        if (Array.isArray(p.accountIds)) {
+          p.accountIds.forEach((id) => g.upsertAccounts.add(String(id)));
+        }
+        g.hasPendingStockChanges = true;
+        break;
+      case 'sale_deferred':
+        if (p.saleId) g.upsertSales.add(String(p.saleId));
+        break;
+      case 'sale_delete_deferred':
+        if (p.saleId) g.deleteSales.add(String(p.saleId));
+        break;
+      case 'return':
+        if (p.saleId) g.upsertSales.add(String(p.saleId));
+        if (p.accountId) g.upsertAccounts.add(String(p.accountId));
+        g.hasPendingStockChanges = true;
+        break;
+      case 'shift_open':
+      case 'shift_close':
+        if (p.shiftId) g.upsertCashShifts.add(String(p.shiftId));
+        break;
+      case 'cash_op':
+        if (p.opId) g.upsertCashOperations.add(String(p.opId));
+        if (p.shiftId) g.upsertCashShifts.add(String(p.shiftId));
+        break;
+      case 'purchase_receipt':
+        if (p.receiptId) g.upsertPurchaseReceipts.add(String(p.receiptId));
+        if (p.accountId) g.upsertAccounts.add(String(p.accountId));
+        g.hasPendingStockChanges = true;
+        break;
+      case 'purchase_order':
+      case 'purchase_order_status':
+        if (p.poId) g.upsertPurchaseOrders.add(String(p.poId));
+        break;
+      case 'transfer':
+      case 'transfer_receive':
+        if (p.transferId) g.upsertTransfers.add(String(p.transferId));
+        g.hasPendingStockChanges = true;
+        break;
+      case 'write_off':
+        if (p.writeOffId) g.upsertWriteOffs.add(String(p.writeOffId));
+        g.hasPendingStockChanges = true;
+        break;
+      case 'stocktake':
+      case 'stocktake_apply':
+        if (p.stocktakeId) g.upsertStocktakes.add(String(p.stocktakeId));
+        if (item.type === 'stocktake_apply') g.hasPendingStockChanges = true;
+        break;
+      case 'supplier':
+        if (p.supplierId) g.upsertSuppliers.add(String(p.supplierId));
+        break;
+      case 'supplier_debt_pay':
+        if (p.supplierId) g.upsertSuppliers.add(String(p.supplierId));
+        if (p.accountId) g.upsertAccounts.add(String(p.accountId));
+        break;
+      case 'debt_pay':
+        if (p.debtId) g.upsertDebts.add(String(p.debtId));
+        if (p.accountId) g.upsertAccounts.add(String(p.accountId));
+        break;
+      case 'promo':
+        if (p.promoId) g.upsertPromoCodes.add(String(p.promoId));
+        break;
+      case 'expense':
+        if (p.expenseId) g.upsertExpenses.add(String(p.expenseId));
+        if (p.accountId) g.upsertAccounts.add(String(p.accountId));
+        break;
+      case 'finance_transfer':
+        if (p.fromAccountId) g.upsertAccounts.add(String(p.fromAccountId));
+        if (p.toAccountId) g.upsertAccounts.add(String(p.toAccountId));
+        break;
+      case 'account':
+        if (p.accountId) g.upsertAccounts.add(String(p.accountId));
+        break;
+      case 'target':
+        if (p.targetId) g.upsertTargets.add(String(p.targetId));
+        break;
+      case 'online_order':
+      case 'online_order_status':
+        if (p.orderId) g.upsertOnlineOrders.add(String(p.orderId));
+        if (item.type === 'online_order_status') g.hasPendingStockChanges = true;
+        break;
+      case 'store':
+        if (p.storeId) g.upsertStores.add(String(p.storeId));
+        break;
+      case 'store_delete':
+        if (p.storeId) g.deleteStores.add(String(p.storeId));
+        break;
+      case 'warehouse':
+        if (p.warehouseId) g.upsertWarehouses.add(String(p.warehouseId));
+        break;
+      case 'settings':
+        g.hasPendingSettings = true;
+        break;
+      case 'roles':
+        g.hasPendingRoles = true;
+        break;
+    }
+  }
+  return g;
+}
+
+function mergeCollectionWithPending<T extends { id: string; updatedAt?: string }>(
+  remote: T[] | undefined,
+  local: T[],
+  pendingUpserts: Set<string>,
+  pendingDeletes?: Set<string>
+): T[] {
+  if (!remote) return local;
+  if (pendingUpserts.size === 0 && (!pendingDeletes || pendingDeletes.size === 0)) {
+    return remote;
+  }
+  const localById = new Map(local.map((it) => [it.id, it]));
+  const merged = new Map<string, T>();
+  for (const r of remote) {
+    if (pendingDeletes?.has(r.id)) continue;
+    const loc = localById.get(r.id);
+    if (loc && pendingUpserts.has(r.id)) {
+      const locTs = loc.updatedAt ? Date.parse(loc.updatedAt) : 0;
+      const remTs = r.updatedAt ? Date.parse(r.updatedAt) : 0;
+      merged.set(r.id, locTs >= remTs ? loc : r);
+    } else {
+      merged.set(r.id, r);
+    }
+  }
+  for (const id of pendingUpserts) {
+    if (pendingDeletes?.has(id)) continue;
+    if (!merged.has(id)) {
+      const loc = localById.get(id);
+      if (loc) merged.set(id, loc);
+    }
+  }
+  return Array.from(merged.values());
+}
+
+export async function checkWorkspaceSyncHealth(
+  ctx: WorkspaceContext
+): Promise<{ ok: boolean; error?: string }> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return {
+      ok: false,
+      error: formatFirebaseErrorMessage(new Error('client is offline')),
+    };
+  }
+  try {
+    await getDocFromServer(doc(firestoreDb, 'workspaces', ctx.workspaceId));
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: formatFirebaseErrorMessage(err),
+    };
+  }
+}
+
 export function subscribeWorkspaceRealtime(
   ctx: WorkspaceContext,
   getBaseSnapshot: () => DatabaseSnapshot | null,
@@ -1443,44 +1702,55 @@ export function subscribeWorkspaceRealtime(
       const base = getBaseSnapshot();
       if (!base || disposed) return;
 
+      const guards = extractPendingQueueGuards(base.offlineQueue);
+
       const next: DatabaseSnapshot = {
         ...base,
         version: bucket.workspaceMeta?.version ?? base.version,
-        roles: bucket.workspaceMeta?.roles?.length ? bucket.workspaceMeta.roles : base.roles,
-        settings: {
-          ...(bucket.workspaceMeta?.settings ?? base.settings),
-          integrations: {
-            ...(bucket.workspaceMeta?.settings?.integrations ?? base.settings.integrations),
-            ...(bucket.privateIntegrations ?? {}),
-          },
-        },
-        stores: bucket.stores ?? base.stores,
-        warehouses: bucket.warehouses ?? base.warehouses,
-        categories: bucket.categories ?? base.categories,
+        roles:
+          !guards.hasPendingRoles && bucket.workspaceMeta?.roles?.length
+            ? bucket.workspaceMeta.roles
+            : base.roles,
+        settings: guards.hasPendingSettings
+          ? base.settings
+          : {
+              ...(bucket.workspaceMeta?.settings ?? base.settings),
+              integrations: {
+                ...(bucket.workspaceMeta?.settings?.integrations ?? base.settings.integrations),
+                ...(bucket.privateIntegrations ?? {}),
+              },
+            },
+        stores: mergeCollectionWithPending(bucket.stores, base.stores, guards.upsertStores, guards.deleteStores),
+        warehouses: mergeCollectionWithPending(bucket.warehouses, base.warehouses, guards.upsertWarehouses),
+        categories: guards.resetCategories
+          ? base.categories
+          : mergeCollectionWithPending(bucket.categories, base.categories, guards.upsertCategories, guards.deleteCategories),
         brands: bucket.brands ?? base.brands,
-        products: bucket.products ?? base.products,
-        suppliers: bucket.suppliers ?? base.suppliers,
-        stockItems: bucket.stockItems ?? base.stockItems,
-        stockMovements: bucket.stockMovements ?? base.stockMovements,
-        purchaseReceipts: bucket.purchaseReceipts ?? base.purchaseReceipts,
-        purchaseOrders: bucket.purchaseOrders ?? base.purchaseOrders,
-        transfers: bucket.transfers ?? base.transfers,
-        writeOffs: bucket.writeOffs ?? base.writeOffs,
-        stocktakes: bucket.stocktakes ?? base.stocktakes,
-        sales: bucket.sales ?? base.sales,
+        products: mergeCollectionWithPending(bucket.products, base.products, guards.upsertProducts, guards.deleteProducts),
+        suppliers: mergeCollectionWithPending(bucket.suppliers, base.suppliers, guards.upsertSuppliers),
+        stockItems: guards.hasPendingStockChanges ? base.stockItems : (bucket.stockItems ?? base.stockItems),
+        stockMovements: guards.hasPendingStockChanges
+          ? base.stockMovements
+          : (bucket.stockMovements ?? base.stockMovements),
+        purchaseReceipts: mergeCollectionWithPending(bucket.purchaseReceipts, base.purchaseReceipts, guards.upsertPurchaseReceipts),
+        purchaseOrders: mergeCollectionWithPending(bucket.purchaseOrders, base.purchaseOrders, guards.upsertPurchaseOrders),
+        transfers: mergeCollectionWithPending(bucket.transfers, base.transfers, guards.upsertTransfers),
+        writeOffs: mergeCollectionWithPending(bucket.writeOffs, base.writeOffs, guards.upsertWriteOffs),
+        stocktakes: mergeCollectionWithPending(bucket.stocktakes, base.stocktakes, guards.upsertStocktakes),
+        sales: mergeCollectionWithPending(bucket.sales, base.sales, guards.upsertSales, guards.deleteSales),
         returns: bucket.returns ?? base.returns,
-        cashShifts: bucket.cashShifts ?? base.cashShifts,
-        cashOperations: bucket.cashOperations ?? base.cashOperations,
-        accounts: bucket.accounts ?? base.accounts,
+        cashShifts: mergeCollectionWithPending(bucket.cashShifts, base.cashShifts, guards.upsertCashShifts),
+        cashOperations: mergeCollectionWithPending(bucket.cashOperations, base.cashOperations, guards.upsertCashOperations),
+        accounts: mergeCollectionWithPending(bucket.accounts, base.accounts, guards.upsertAccounts),
         transactions: bucket.transactions ?? base.transactions,
-        expenses: bucket.expenses ?? base.expenses,
-        customers: bucket.customers ?? base.customers,
+        expenses: mergeCollectionWithPending(bucket.expenses, base.expenses, guards.upsertExpenses),
+        customers: mergeCollectionWithPending(bucket.customers, base.customers, guards.upsertCustomers),
         loyaltyAccounts: bucket.loyaltyAccounts ?? base.loyaltyAccounts,
         loyaltyTransactions: bucket.loyaltyTransactions ?? base.loyaltyTransactions,
-        debts: bucket.debts ?? base.debts,
-        promoCodes: bucket.promoCodes ?? base.promoCodes,
-        targets: bucket.targets ?? base.targets,
-        onlineOrders: bucket.onlineOrders ?? base.onlineOrders,
+        debts: mergeCollectionWithPending(bucket.debts, base.debts, guards.upsertDebts),
+        promoCodes: mergeCollectionWithPending(bucket.promoCodes, base.promoCodes, guards.upsertPromoCodes),
+        targets: mergeCollectionWithPending(bucket.targets, base.targets, guards.upsertTargets),
+        onlineOrders: mergeCollectionWithPending(bucket.onlineOrders, base.onlineOrders, guards.upsertOnlineOrders),
         auditLogs: bucket.auditLogs ?? base.auditLogs,
         offlineQueue: base.offlineQueue,
       };
@@ -1618,7 +1888,7 @@ export function subscribeWorkspaceRealtime(
         const assignedStoreIds = Array.isArray(md.assignedStoreIds) ? md.assignedStoreIds : [];
         const isWsAdmin =
           ctx.ownerUid === ctx.uid ||
-          ctx.email === ADMIN_BOOTSTRAPPED_EMAIL ||
+          isBootstrappedAdminEmail(ctx.email) ||
           roleId === 'owner' ||
           roleId === 'admin';
         onHydrate(getBaseSnapshot()!, { roleId, assignedStoreIds, isWsAdmin });

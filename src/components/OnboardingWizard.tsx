@@ -68,7 +68,7 @@ export const OnboardingWizard: React.FC<{ onGoToPos: () => void }> = ({ onGoToPo
     const vId = uid('var');
     const storeId = db.stores[0]?.id ?? 'store-chilonzor';
     const whId = db.stores[0]?.defaultWarehouseId ?? 'wh-chilonzor';
-    await upsertProduct({
+    const res = await upsertProduct({
       id: pId,
       name: prodName,
       categoryId: db.categories[0]?.id ?? 'cat-shirts',
@@ -98,6 +98,10 @@ export const OnboardingWizard: React.FC<{ onGoToPos: () => void }> = ({ onGoToPo
       updatedAt: nowIso,
       createdBy: 'usr-owner',
     });
+    if (!res.ok) {
+      notify(res.error || 'Mahsulot saqlashda xatolik', 'error');
+      return;
+    }
     await quickAddStock(pId, vId, whId, prodQty, 'Usta orqali boshlang\'ich qoldiq');
     notify("Mahsulot qo'shildi", 'success');
     setStep(3);

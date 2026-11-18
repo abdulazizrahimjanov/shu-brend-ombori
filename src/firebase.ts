@@ -64,34 +64,101 @@ const baseFirestoreSettings: FirestoreSettings = {
     : {}),
 };
 
+const configuredDbId =
+  firebaseConfig.firestoreDatabaseId && firebaseConfig.firestoreDatabaseId !== '(default)'
+    ? firebaseConfig.firestoreDatabaseId
+    : undefined;
+
 let firestoreInstance: Firestore;
 try {
-  firestoreInstance = initializeFirestore(
-    app,
-    {
-      ...baseFirestoreSettings,
-      localCache: persistentLocalCache({
-        tabManager: persistentMultipleTabManager(),
-      }),
-    },
-    firebaseConfig.firestoreDatabaseId
-  );
+  firestoreInstance = configuredDbId
+    ? initializeFirestore(
+        app,
+        {
+          ...baseFirestoreSettings,
+          localCache: persistentLocalCache({
+            tabManager: persistentMultipleTabManager(),
+          }),
+        },
+        configuredDbId
+      )
+    : initializeFirestore(app, {
+        ...baseFirestoreSettings,
+        localCache: persistentLocalCache({
+          tabManager: persistentMultipleTabManager(),
+        }),
+      });
 } catch {
   try {
-    firestoreInstance = initializeFirestore(
-      app,
-      {
-        ...baseFirestoreSettings,
-        localCache: memoryLocalCache(),
-      },
-      firebaseConfig.firestoreDatabaseId
-    );
+    firestoreInstance = configuredDbId
+      ? initializeFirestore(
+          app,
+          {
+            ...baseFirestoreSettings,
+            localCache: memoryLocalCache(),
+          },
+          configuredDbId
+        )
+      : initializeFirestore(app, {
+          ...baseFirestoreSettings,
+          localCache: memoryLocalCache(),
+        });
   } catch {
-    firestoreInstance = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+    firestoreInstance = configuredDbId
+      ? getFirestore(app, configuredDbId)
+      : getFirestore(app);
   }
 }
 
 export const firestoreDb: Firestore = firestoreInstance;
+
+export function formatFirebaseErrorMessage(error: unknown, lang: 'uz' | 'ru' = 'uz'): string {
+  const raw = error instanceof Error ? error.message : String(error || '');
+  const low = raw.toLowerCase();
+
+  if (low.includes('auth/unauthorized-domain')) {
+    return lang === 'ru'
+      ? 'Этот домен не разрешен в Firebase Authentication (Authorized domains).'
+      : "Ushbu domen Firebase Authentication (Authorized domains) ro'yxatiga qo'shilmagan.";
+  }
+  if (low.includes('auth/operation-not-allowed')) {
+    return lang === 'ru'
+      ? 'Вход через Google не включен в Firebase Console.'
+      : 'Firebase Console da Google orqali kirish (Sign-in method) yoqilmagan.';
+  }
+  if (low.includes('auth/popup-blocked')) {
+    return lang === 'ru'
+      ? 'Браузер заблокировал всплывающее окно Google.'
+      : "Brauzer Google kirish oynasini blokladi. Qalqib chiquvchi oynalarga ruxsat bering.";
+  }
+  if (low.includes('auth/popup-closed-by-user')) {
+    return lang === 'ru'
+      ? 'Окно входа Google было закрыто.'
+      : 'Google kirish oynasi yopildi.';
+  }
+  if (low.includes('auth/network-request-failed') || low.includes('the client is offline') || low.includes('unavailable')) {
+    return lang === 'ru'
+      ? 'Нет связи с сервером Firebase. Изменения сохраняются локально и синхронизируются при восстановлении сети.'
+      : "Firebase serveri bilan aloqa uzildi. O'zgarishlar qurilmada saqlanmoqda va internet tiklanganda sinxronlanadi.";
+  }
+  if (low.includes('permission-denied') || low.includes('missing or insufficient permissions')) {
+    return lang === 'ru'
+      ? 'Нет прав доступа к Cloud Firestore. Проверьте правила безопасности или приглашение сотрудника.'
+      : "Cloud Firestore ruxsati yetarli emas. Xodimlar ro'yxatidagi Google emailingizni yoki Firestore Rules ni tekshiring.";
+  }
+  if (low.includes('resource-exhausted') || low.includes('quota')) {
+    return lang === 'ru'
+      ? 'Превышена квота Firebase. Попробуйте позже.'
+      : 'Firebase kvotasi tugadi. Keyinroq qayta urinib ko‘ring.';
+  }
+  if (low.includes('failed-precondition') || low.includes('database') && low.includes('not found')) {
+    return lang === 'ru'
+      ? 'База данных Cloud Firestore еще не создана или не настроена.'
+      : "Cloud Firestore ma'lumotlar bazasi hali yaratilmagan yoki sozlanmagan.";
+  }
+
+  return raw || (lang === 'ru' ? 'Ошибка подключения к Firebase' : 'Firebase bilan ishlashda xatolik yuz berdi');
+}
 
 export function handleFirestoreError(
   error: unknown,
@@ -162,6 +229,27 @@ export async function testConnection(): Promise<boolean> {
       }
     }
     // Permission-denied when unauthenticated still proves reachability to Firestore server
+    return true;
+  }
+}
+
+export async function probeFirestoreConnection(workspaceId?: string): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return false;
+  }
+  try {
+    await ensureFirestoreNetwork();
+    const targetRef = workspaceId
+      ? doc(firestoreDb, 'workspaces', workspaceId)
+      : doc(firestoreDb, 'test', 'connection');
+    await getDocFromServer(targetRef);
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message.toLowerCase() : '';
+    if (msg.includes('client is offline') || msg.includes('unavailable') || msg.includes('failed to get document because the client is offline')) {
+      return false;
+    }
+    // Non-offline errors (like unauthenticated permission-denied on test doc) mean server responded
     return true;
   }
 }

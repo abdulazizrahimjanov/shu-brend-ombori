@@ -556,7 +556,11 @@ export const POSPage: React.FC = () => {
       updatedAt: nowIso,
       createdBy: 'usr-cashier',
     };
-    await upsertProduct(product);
+    const res = await upsertProduct(product);
+    if (!res.ok) {
+      notify(res.error || 'Mahsulot saqlashda xatolik', 'error');
+      return;
+    }
     await quickAddStock(pId, vId, currentWarehouseId, Math.max(1, quickProdQty), 'Savatcha tezkor yaratish');
     addVariantToCart(product, product.variants[0]);
     setQuickCreateBarcode(null);
