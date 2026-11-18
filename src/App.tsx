@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { HashRouter, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 import { useAppStore } from './store/useAppStore';
 import { AuthScreen } from './components/AuthScreen';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { Layout } from './components/Layout';
 import { OnboardingWizard } from './components/OnboardingWizard';
 import { DashboardPage } from './pages/DashboardPage';
@@ -20,16 +21,25 @@ import { MenuPage } from './pages/MenuPage';
 
 function AppRoutes() {
   const initialized = useAppStore((s) => s.initialized);
+  const fatalSyncError = useAppStore((s) => s.fatalSyncError);
   const currentUser = useAppStore((s) => s.getCurrentUser());
   const can = useAppStore((s) => s.can);
   const [guestShop, setGuestShop] = useState(false);
   const navigate = useNavigate();
 
+  if (fatalSyncError) {
+    throw fatalSyncError;
+  }
+
   if (!initialized) {
     return (
       <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center">
         <div className="text-center space-y-2">
-          <img src="/icon.svg" alt="SHU BREND OMBOR" className="w-12 h-12 rounded-xl mx-auto" />
+          <img
+            src="/assets/aistudio/IMG_20261007_140535_653_64e97dff.jpg"
+            alt="SHU BREND OMBOR"
+            className="w-14 h-14 rounded-xl mx-auto object-cover border border-slate-200 dark:border-slate-800"
+          />
           <div className="font-display text-sm font-semibold text-slate-600 dark:text-slate-300">
             SHU BREND OMBOR yuklanmoqda...
           </div>
@@ -97,8 +107,10 @@ export default function App() {
   }, [init, setOnline]);
 
   return (
-    <HashRouter>
-      <AppRoutes />
-    </HashRouter>
+    <ErrorBoundary>
+      <HashRouter>
+        <AppRoutes />
+      </HashRouter>
+    </ErrorBoundary>
   );
 }

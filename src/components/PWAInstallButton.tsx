@@ -121,12 +121,13 @@ export const PWAInstallButton: React.FC = () => {
 
 export const OfflineIndicator: React.FC = () => {
   const isOnline = useAppStore((s) => s.isOnline);
+  const syncStatus = useAppStore((s) => s.syncStatus);
   const pendingCount = useAppStore((s) => s.db?.offlineQueue.length ?? 0);
   const syncOfflineQueue = useAppStore((s) => s.syncOfflineQueue);
   const notify = useAppStore((s) => s.notify);
   const t = useT();
 
-  if (isOnline && pendingCount === 0) return null;
+  if (isOnline && pendingCount === 0 && syncStatus !== 'syncing') return null;
 
   return (
     <div className="no-print fixed bottom-20 md:bottom-4 left-4 z-50 flex items-center gap-2.5 rounded-lg border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/95 px-3 py-2 text-xs font-medium text-amber-900 dark:text-amber-100 shadow-lg">
@@ -134,6 +135,11 @@ export const OfflineIndicator: React.FC = () => {
         <>
           <WifiOff className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
           <span>{t.common.offline}</span>
+        </>
+      ) : syncStatus === 'syncing' ? (
+        <>
+          <RefreshCw className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 animate-spin shrink-0" />
+          <span>{t.common.syncing}</span>
         </>
       ) : (
         <>

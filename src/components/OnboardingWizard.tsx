@@ -297,11 +297,12 @@ export const OnboardingWizard: React.FC<{ onGoToPos: () => void }> = ({ onGoToPo
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Tezkor PIN (4 raqam)</label>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Tezkor PIN (4–6 raqam)</label>
                 <input
                   value={cashierPin}
-                  maxLength={4}
-                  onChange={(e) => setCashierPin(e.target.value)}
+                  maxLength={6}
+                  inputMode="numeric"
+                  onChange={(e) => setCashierPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
                   className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-sm font-mono"
                 />
               </div>

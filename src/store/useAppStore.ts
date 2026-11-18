@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import type { User as FirebaseUser } from 'firebase/auth';
 import {
   Account,
   AppSettings,
@@ -12,6 +13,7 @@ import {
   Employee,
   Expense,
   HeldCart,
+  OfflineSyncItem,
   OnlineOrder,
   Payment,
   PaymentMethod,
@@ -40,11 +42,31 @@ import {
 import { repository } from '../data/repository';
 import { getMensClothingCategories } from '../data/seed';
 import { Language } from '../i18n';
+import {
+  ensureFirestoreNetwork,
+  signInWithGooglePopup,
+  signOutFirebase,
+  testConnection,
+  watchAuthState,
+} from '../firebase';
+import {
+  ADMIN_BOOTSTRAPPED_EMAIL,
+  bootstrapOrJoinWorkspace,
+  clearWorkspaceOperationalData,
+  pushSyncItemToFirestore,
+  stockItemDocId,
+  subscribeWorkspaceRealtime,
+  WorkspaceContext,
+} from '../data/firebaseSync';
 
 const SESSION_KEY = 'shu_brend_session_v1';
 const THEME_KEY = 'shu_brend_theme_v1';
 const LANG_KEY = 'shu_brend_lang_v1';
 const HELD_CARTS_KEY = 'shu_brend_held_carts_v1';
+
+let unsubscribeRealtime: (() => void) | null = null;
+let unsubscribeAuth: (() => void) | null = null;
+let activeConnectPromise: Promise<WorkspaceContext | null> | null = null;
 
 export function uid(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -67,6 +89,16 @@ interface AppState {
   heldCarts: HeldCart[];
   toasts: ToastMessage[];
   showOnboarding: boolean;
+
+  // Cloud / Firebase Sync State
+  cloudConnected: boolean;
+  cloudConnecting: boolean;
+  cloudError: string | null;
+  firebaseUid: string | null;
+  firebaseEmail: string | null;
+  workspaceContext: WorkspaceContext | null;
+  syncStatus: 'online' | 'offline' | 'syncing';
+  fatalSyncError: Error | null;
 
   // Shared Savatcha Cart state
   cartItems: SaleItem[];
@@ -98,8 +130,9 @@ interface AppState {
   // Auth & Permissions
   getCurrentUser: () => User | null;
   can: (perm: Permission) => boolean;
+  canAccessStore: (storeId: string) => boolean;
   loginWithPhone: (phone: string, password: string) => boolean;
-  loginAsDemoUser: (userId: string) => void;
+  loginWithGoogle: () => Promise<{ ok: boolean; error?: string }>;
   switchUserByPin: (pin: string) => User | null;
   verifyManagerPin: (pin: string) => User | null;
   logout: () => void;
@@ -115,9 +148,22 @@ interface AppState {
   // Mutations
   upsertProduct: (product: Product) => Promise<void>;
   deleteProduct: (productId: string) => Promise<void>;
-  bulkUpdatePrices: (productIds: string[], percentChange: number, field: 'retailPrice' | 'purchasePrice' | 'wholesalePrice') => Promise<void>;
-  quickAddStock: (productId: string, variantId: string, warehouseId: string, qty: number, note?: string) => Promise<void>;
-  importProducts: (products: Product[], initialStocks: { productId: string; variantId: string; warehouseId: string; qty: number; unitCost: number }[]) => Promise<void>;
+  bulkUpdatePrices: (
+    productIds: string[],
+    percentChange: number,
+    field: 'retailPrice' | 'purchasePrice' | 'wholesalePrice'
+  ) => Promise<void>;
+  quickAddStock: (
+    productId: string,
+    variantId: string,
+    warehouseId: string,
+    qty: number,
+    note?: string
+  ) => Promise<void>;
+  importProducts: (
+    products: Product[],
+    initialStocks: { productId: string; variantId: string; warehouseId: string; qty: number; unitCost: number }[]
+  ) => Promise<void>;
 
   // POS & Cash Shifts
   openShift: (startingCash: number, storeId: string) => Promise<CashShift>;
@@ -202,11 +248,14 @@ interface AppState {
   upsertTarget: (target: Target) => Promise<void>;
 
   // Online Orders
-  createOnlineOrder: (order: Omit<OnlineOrder, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt' | 'createdBy' | 'status'>) => Promise<OnlineOrder>;
+  createOnlineOrder: (
+    order: Omit<OnlineOrder, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt' | 'createdBy' | 'status'>
+  ) => Promise<OnlineOrder>;
   updateOnlineOrderStatus: (orderId: string, status: OnlineOrder['status']) => Promise<void>;
 
   // Categories CRUD
-  upsertCategory: (cat: Category) => Promise<void>;
+  isCategoryUsed: (catId: string) => boolean;
+  upsertCategory: (cat: Category) => Promise<{ ok: boolean; error?: string }>;
   deleteCategory: (catId: string) => Promise<{ ok: boolean; error?: string }>;
   resetCategoriesToMensClothing: () => Promise<void>;
 
@@ -216,7 +265,7 @@ interface AppState {
   upsertWarehouse: (wh: Warehouse) => Promise<void>;
   updateSettings: (partial: Partial<AppSettings>) => Promise<void>;
   updateRolePermissions: (roleId: RoleId, permissions: Permission[]) => Promise<void>;
-  upsertRole: (role: Role) => Promise<void>;
+  upsertRole: (role: Role) => Promise<{ ok: boolean; error?: string }>;
   deleteRole: (roleId: RoleId) => Promise<{ ok: boolean; error?: string }>;
   resetDemoData: () => Promise<void>;
   clearAllTestData: () => Promise<void>;
@@ -247,14 +296,14 @@ function mutateStock(
     referenceType?: string;
     note?: string;
   }
-) {
+): StockMovement {
   const nowIso = new Date().toISOString();
-  let item = db.stockItems.find(
+  let item: StockItem | undefined = db.stockItems.find(
     (s) => s.variantId === params.variantId && s.warehouseId === params.warehouseId
   );
   if (!item) {
     item = {
-      id: uid('stk'),
+      id: stockItemDocId(params.warehouseId, params.variantId),
       productId: params.productId,
       variantId: params.variantId,
       warehouseId: params.warehouseId,
@@ -287,6 +336,7 @@ function mutateStock(
     createdBy: params.userId,
   };
   db.stockMovements.unshift(movement);
+  return movement;
 }
 
 function appendAudit(
@@ -297,1978 +347,2896 @@ function appendAudit(
   entityId: string,
   summary: string,
   storeId: string
-) {
+): string {
   const nowIso = new Date().toISOString();
+  const auditId = uid('aud');
   db.auditLogs.unshift({
-    id: uid('aud'),
+    id: auditId,
     userId: user?.id ?? 'system',
     userName: user?.name ?? 'Tizim',
     action,
     entityType,
     entityId,
     summary,
+    details: summary,
     storeId,
     createdAt: nowIso,
     updatedAt: nowIso,
     createdBy: user?.id ?? 'system',
   });
+  return auditId;
 }
 
-export const useAppStore = create<AppState>((set, get) => ({
-  db: null,
-  initialized: false,
-  currentUserId: typeof localStorage !== 'undefined' ? localStorage.getItem(SESSION_KEY) : null,
-  activeStoreId: 'all',
-  language: (typeof localStorage !== 'undefined' && (localStorage.getItem(LANG_KEY) as Language)) || 'uz',
-  theme: (typeof localStorage !== 'undefined' && (localStorage.getItem(THEME_KEY) as 'light' | 'dark')) || 'light',
-  isOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
-  heldCarts: (() => {
-    try {
-      const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(HELD_CARTS_KEY) : null;
-      return raw ? (JSON.parse(raw) as HeldCart[]) : [];
-    } catch {
-      return [];
+function resolveDefaultStoreForUser(user: User, db: DatabaseSnapshot): string {
+  const isAdmin = user.roleId === 'owner' || user.roleId === 'admin';
+  if (isAdmin) {
+    return user.assignedStoreIds.length === 1 ? user.assignedStoreIds[0] : 'all';
+  }
+  const validAssigned = (user.assignedStoreIds || []).filter((id) =>
+    db.stores.some((s) => s.id === id)
+  );
+  if (validAssigned.length === 1) return validAssigned[0];
+  if (validAssigned.length > 1) return validAssigned[0];
+  return db.stores[0]?.id ?? 'all';
+}
+
+function isPermissionError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  const low = msg.toLowerCase();
+  return low.includes('permission') || low.includes('insufficient') || low.includes('authinfo');
+}
+
+function phonesMatch(a: string, b: string): boolean {
+  const d1 = String(a || '').replace(/\D/g, '');
+  const d2 = String(b || '').replace(/\D/g, '');
+  if (!d1 || !d2) return false;
+  if (d1 === d2) return true;
+  if (d1.length === 9 && d2 === `998${d1}`) return true;
+  if (d2.length === 9 && d1 === `998${d2}`) return true;
+  return false;
+}
+
+let migratedOwnerCloudOnce = false;
+
+export const useAppStore = create<AppState>((set, get) => {
+  const syncOrEnqueue = async (
+    nextDb: DatabaseSnapshot,
+    opInput: Omit<OfflineSyncItem, 'idempotencyKey'>
+  ) => {
+    const op: OfflineSyncItem = {
+      ...opInput,
+      idempotencyKey: opInput.id,
+    };
+    const { cloudConnected, workspaceContext, isOnline } = get();
+
+    // Always persist immediately on device first (offline-first PWA)
+    if (!isOnline) {
+      if (!nextDb.offlineQueue.some((q) => q.id === op.id)) {
+        nextDb.offlineQueue.push(op);
+      }
+      await repository.save(nextDb);
+      set({ db: nextDb, syncStatus: 'offline' });
+      return;
     }
-  })(),
-  toasts: [],
-  showOnboarding: false,
 
-  cartItems: [],
-  cartCustomerId: '',
-  cartDiscountPercent: 0,
-  cartDiscountFixed: 0,
-  cartPromoCode: '',
-  cartLoyaltySpent: 0,
-  savatchaMenuOpen: false,
+    await repository.save(nextDb);
+    set({ db: nextDb });
 
-  setCartItems: (itemsOrUpdater) =>
-    set((s) => ({
-      cartItems: typeof itemsOrUpdater === 'function' ? itemsOrUpdater(s.cartItems) : itemsOrUpdater,
-    })),
-  setCartCustomerId: (cartCustomerId) => set({ cartCustomerId }),
-  setCartDiscountPercent: (cartDiscountPercent) => set({ cartDiscountPercent }),
-  setCartDiscountFixed: (cartDiscountFixed) => set({ cartDiscountFixed }),
-  setCartPromoCode: (cartPromoCode) => set({ cartPromoCode }),
-  setCartLoyaltySpent: (cartLoyaltySpent) => set({ cartLoyaltySpent }),
-  setSavatchaMenuOpen: (savatchaMenuOpen) => set({ savatchaMenuOpen }),
-  clearCart: () =>
-    set({
-      cartItems: [],
-      cartCustomerId: '',
-      cartDiscountPercent: 0,
-      cartDiscountFixed: 0,
-      cartPromoCode: '',
-      cartLoyaltySpent: 0,
-    }),
-
-  init: async () => {
-    const theme = get().theme;
-    applyThemeToDOM(theme);
-    const db = await repository.load();
-    // Migrate older snapshots seamlessly without discarding user data
-    let changed = false;
-    const storeColors = ['#2563EB', '#16A34A', '#9333EA', '#EA580C'];
-    db.stores.forEach((st, idx) => {
-      if (!st.storeCode) {
-        st.storeCode = String(idx + 1).padStart(2, '0');
-        changed = true;
+    if (cloudConnected && workspaceContext) {
+      set({ syncStatus: 'syncing' });
+      try {
+        await pushSyncItemToFirestore(workspaceContext, op, nextDb);
+        set({ syncStatus: get().isOnline ? 'online' : 'offline' });
+      } catch (err) {
+        if (isPermissionError(err)) {
+          const msg = get().language === 'ru'
+            ? 'У вас недостаточно прав для этой операции'
+            : "Ushbu amalni bulutga yozish uchun ruxsatingiz yetarli emas";
+          get().notify(msg, 'error');
+          set({ syncStatus: get().isOnline ? 'online' : 'offline' });
+        } else {
+          // Transient / network issue -> queue for auto-sync when connection stabilizes
+          const latestDb = structuredClone(get().db ?? nextDb);
+          if (!latestDb.offlineQueue.some((q) => q.id === op.id)) {
+            latestDb.offlineQueue.push({ ...op, attempts: (op.attempts || 0) + 1 });
+          }
+          await repository.save(latestDb);
+          set({ db: latestDb, syncStatus: get().isOnline ? 'online' : 'offline' });
+        }
       }
-      if (!st.color) {
-        st.color = storeColors[idx % storeColors.length];
-        changed = true;
-      }
-    });
-    if ((db.version ?? 1) < 2) {
-      const m = db.settings.enabledPaymentMethods;
-      if (!m.includes('card')) m.splice(1, 0, 'card');
-      if (!m.includes('unionpay')) {
-        const mcIdx = m.indexOf('mastercard');
-        if (mcIdx >= 0) m.splice(mcIdx + 1, 0, 'unionpay');
-        else m.push('unionpay');
-      }
-      db.version = 2;
-      changed = true;
     }
-    if ((db.version ?? 1) < 3) {
-      const removedIds = new Set(['cat-clothing', 'cat-cosmetics', 'cat-electronics', 'cat-home', 'cat-stationery', 'cat-grocery']);
-      const customCats = db.categories.filter(
-        (c) => !removedIds.has(c.id) && c.id !== 'cat-shoes' && c.id !== 'cat-accessories'
-      );
-      const mensCats = getMensClothingCategories(db.stores[0]?.id ?? 'store-chilonzor');
-      // Merge: men's clothing categories + any user-added custom categories
-      const seen = new Set(mensCats.map((c) => c.id));
-      const merged = [...mensCats, ...customCats.filter((c) => !seen.has(c.id))];
-      db.categories = merged;
-      const validIds = new Set(merged.map((c) => c.id));
-      db.products.forEach((p) => {
-        if (!validIds.has(p.categoryId)) {
-          p.categoryId = p.categoryId === 'cat-clothing' ? 'cat-shirts' : merged[0]?.id ?? 'cat-shirts';
+  };
+
+  const matchOrBindUserFromFirebase = (
+    snapshot: DatabaseSnapshot,
+    fbUser: FirebaseUser,
+    ctx: WorkspaceContext
+  ): { user: User | null; mutatedSnapshot: boolean } => {
+    const email = (fbUser.email || '').trim().toLowerCase();
+    let mutated = false;
+    let matched =
+      snapshot.users.find((u) => u.isActive && u.googleEmail?.trim().toLowerCase() === email) ??
+      (ctx.staffId ? snapshot.users.find((u) => u.id === ctx.staffId || snapshot.employees.some((e) => e.id === ctx.staffId && e.userId === u.id)) : undefined);
+
+    if (!matched && email === ADMIN_BOOTSTRAPPED_EMAIL) {
+      matched = snapshot.users.find((u) => u.isActive && u.roleId === 'owner') ?? snapshot.users[0];
+      if (matched && !matched.googleEmail) {
+        matched.googleEmail = email;
+        const emp = snapshot.employees.find((e) => e.userId === matched!.id);
+        if (emp) emp.googleEmail = email;
+        mutated = true;
+      }
+    }
+
+    if (!matched && ctx.uid) {
+      const nowIso = new Date().toISOString();
+      const newUserId = ctx.staffId || `usr-${ctx.uid.slice(0, 10)}`;
+      const fallbackStoreId = ctx.assignedStoreIds[0] || snapshot.stores[0]?.id || 'store-chilonzor';
+      matched = {
+        id: newUserId,
+        name: fbUser.displayName || email.split('@')[0] || 'Xodim',
+        phone: '',
+        password: '',
+        pin: String(Math.floor(1000 + Math.random() * 8999)),
+        googleEmail: email,
+        roleId: ctx.roleId,
+        assignedStoreIds: ctx.assignedStoreIds.length ? ctx.assignedStoreIds : [fallbackStoreId],
+        isActive: true,
+        storeId: fallbackStoreId,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: ctx.ownerUid,
+      };
+      snapshot.users.push(matched);
+      mutated = true;
+    }
+
+    return { user: matched ?? null, mutatedSnapshot: mutated };
+  };
+
+  const connectFirebaseUser = async (
+    fbUser: FirebaseUser,
+    options?: { setSessionIfMissing?: boolean; forceInteractiveLogin?: boolean }
+  ): Promise<WorkspaceContext | null> => {
+    if (activeConnectPromise) return activeConnectPromise;
+
+    const run = async (): Promise<WorkspaceContext | null> => {
+      set({ cloudConnecting: true, cloudError: null });
+      let currentDb = get().db;
+      if (!currentDb) {
+        currentDb = await repository.load();
+        set({ db: currentDb });
+      }
+
+      try {
+        await ensureFirestoreNetwork();
+        const ctx = await bootstrapOrJoinWorkspace(fbUser, currentDb);
+        if (unsubscribeRealtime) {
+          unsubscribeRealtime();
+          unsubscribeRealtime = null;
+        }
+
+        const localCopy = structuredClone(get().db ?? currentDb);
+        const { user: matchedUser, mutatedSnapshot } = matchOrBindUserFromFirebase(localCopy, fbUser, ctx);
+        if (mutatedSnapshot) {
+          await repository.save(localCopy);
+          set({ db: localCopy });
+        }
+
+        const currentSession = get().currentUserId;
+        const nextSessionId =
+          options?.forceInteractiveLogin && matchedUser
+            ? matchedUser.id
+            : (!currentSession || options?.setSessionIfMissing) && matchedUser
+            ? matchedUser.id
+            : currentSession;
+
+        if (nextSessionId) {
+          localStorage.setItem(SESSION_KEY, nextSessionId);
+        }
+
+        const effectiveUser =
+          (nextSessionId ? localCopy.users.find((u) => u.id === nextSessionId) : null) ?? matchedUser;
+
+        set({
+          cloudConnected: true,
+          cloudConnecting: false,
+          cloudError: null,
+          firebaseUid: fbUser.uid,
+          firebaseEmail: ctx.email,
+          workspaceContext: ctx,
+          syncStatus: get().isOnline ? 'online' : 'offline',
+          ...(nextSessionId ? { currentUserId: nextSessionId } : {}),
+          ...(effectiveUser && (options?.forceInteractiveLogin || options?.setSessionIfMissing)
+            ? { activeStoreId: resolveDefaultStoreForUser(effectiveUser, localCopy) }
+            : {}),
+        });
+
+        unsubscribeRealtime = subscribeWorkspaceRealtime(
+          ctx,
+          () => get().db,
+          (hydratedDb, metaUpdate) => {
+            const prevCtx = get().workspaceContext;
+            const nextCtx = prevCtx && metaUpdate ? { ...prevCtx, ...metaUpdate } : prevCtx;
+
+            const activeUserId = get().currentUserId;
+            let resolvedUser = activeUserId
+              ? hydratedDb.users.find((u) => u.id === activeUserId && u.isActive) ?? null
+              : null;
+
+            if (!resolvedUser && fbUser.email) {
+              const email = fbUser.email.trim().toLowerCase();
+              resolvedUser =
+                hydratedDb.users.find((u) => u.isActive && u.googleEmail?.trim().toLowerCase() === email) ??
+                (email === ADMIN_BOOTSTRAPPED_EMAIL
+                  ? hydratedDb.users.find((u) => u.isActive && u.roleId === 'owner') ?? null
+                  : null);
+              if (resolvedUser) {
+                localStorage.setItem(SESSION_KEY, resolvedUser.id);
+              }
+            }
+
+            let nextStoreId = get().activeStoreId;
+            if (resolvedUser && resolvedUser.roleId !== 'owner' && resolvedUser.roleId !== 'admin') {
+              const allowed = resolvedUser.assignedStoreIds || [];
+              if (allowed.length > 0 && (nextStoreId === 'all' || !allowed.includes(nextStoreId))) {
+                nextStoreId = allowed[0];
+              }
+            }
+
+            if (!migratedOwnerCloudOnce && ctx.isWsAdmin) {
+              const ownerUser = hydratedDb.users.find((u) => u.id === 'usr-owner' || u.roleId === 'owner');
+              if (ownerUser && ownerUser.phone === '+998901112233' && ownerUser.pin === '1111') {
+                migratedOwnerCloudOnce = true;
+                ownerUser.phone = '+998889260404';
+                ownerUser.password = '51111';
+                ownerUser.pin = '51111';
+                if (!ownerUser.googleEmail) ownerUser.googleEmail = 'a1sanjar73@gmail.com';
+                ownerUser.updatedAt = new Date().toISOString();
+                const ownerEmp = hydratedDb.employees.find((e) => e.userId === ownerUser.id);
+                if (ownerEmp) {
+                  ownerEmp.phone = '+998889260404';
+                  if (!ownerEmp.googleEmail) ownerEmp.googleEmail = ownerUser.googleEmail;
+                  ownerEmp.updatedAt = ownerUser.updatedAt;
+                }
+                void pushSyncItemToFirestore(
+                  ctx,
+                  {
+                    id: uid('sync'),
+                    idempotencyKey: `migrate-owner-${ownerUser.id}`,
+                    type: 'employee',
+                    payload: { empId: ownerEmp?.id ?? ownerUser.id, userId: ownerUser.id, storeId: ownerUser.storeId },
+                    createdAt: ownerUser.updatedAt,
+                    attempts: 0,
+                  },
+                  hydratedDb
+                ).catch(() => {
+                  // ignore transient error
+                });
+              }
+            }
+
+            void repository.save(hydratedDb);
+            set({
+              db: hydratedDb,
+              workspaceContext: nextCtx,
+              ...(resolvedUser ? { currentUserId: resolvedUser.id } : {}),
+              activeStoreId: nextStoreId,
+            });
+          },
+          (fatalErr) => {
+            set({ fatalSyncError: fatalErr, syncStatus: 'offline' });
+          }
+        );
+
+        // Flush any queued offline operations now that we are connected
+        if (get().isOnline && (get().db?.offlineQueue.length ?? 0) > 0) {
+          void get().syncOfflineQueue();
+        }
+
+        return ctx;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        set({
+          cloudConnected: false,
+          cloudConnecting: false,
+          cloudError: msg,
+          syncStatus: get().isOnline ? 'online' : 'offline',
+        });
+        if (options?.forceInteractiveLogin) {
+          throw err;
+        }
+        return null;
+      } finally {
+        activeConnectPromise = null;
+      }
+    };
+
+    activeConnectPromise = run();
+    return activeConnectPromise;
+  };
+
+  return {
+    db: null,
+    initialized: false,
+    currentUserId: typeof localStorage !== 'undefined' ? localStorage.getItem(SESSION_KEY) : null,
+    activeStoreId: 'all',
+    language: (typeof localStorage !== 'undefined' && (localStorage.getItem(LANG_KEY) as Language)) || 'uz',
+    theme: (typeof localStorage !== 'undefined' && (localStorage.getItem(THEME_KEY) as 'light' | 'dark')) || 'light',
+    isOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
+    heldCarts: (() => {
+      try {
+        const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(HELD_CARTS_KEY) : null;
+        return raw ? (JSON.parse(raw) as HeldCart[]) : [];
+      } catch {
+        return [];
+      }
+    })(),
+    toasts: [],
+    showOnboarding: false,
+
+    cloudConnected: false,
+    cloudConnecting: false,
+    cloudError: null,
+    firebaseUid: null,
+    firebaseEmail: null,
+    workspaceContext: null,
+    syncStatus: typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'online',
+    fatalSyncError: null,
+
+    cartItems: [],
+    cartCustomerId: '',
+    cartDiscountPercent: 0,
+    cartDiscountFixed: 0,
+    cartPromoCode: '',
+    cartLoyaltySpent: 0,
+    savatchaMenuOpen: false,
+
+    setCartItems: (itemsOrUpdater) =>
+      set((s) => ({
+        cartItems: typeof itemsOrUpdater === 'function' ? itemsOrUpdater(s.cartItems) : itemsOrUpdater,
+      })),
+    setCartCustomerId: (cartCustomerId) => set({ cartCustomerId }),
+    setCartDiscountPercent: (cartDiscountPercent) => set({ cartDiscountPercent }),
+    setCartDiscountFixed: (cartDiscountFixed) => set({ cartDiscountFixed }),
+    setCartPromoCode: (cartPromoCode) => set({ cartPromoCode }),
+    setCartLoyaltySpent: (cartLoyaltySpent) => set({ cartLoyaltySpent }),
+    setSavatchaMenuOpen: (savatchaMenuOpen) => set({ savatchaMenuOpen }),
+    clearCart: () =>
+      set({
+        cartItems: [],
+        cartCustomerId: '',
+        cartDiscountPercent: 0,
+        cartDiscountFixed: 0,
+        cartPromoCode: '',
+        cartLoyaltySpent: 0,
+      }),
+
+    init: async () => {
+      const theme = get().theme;
+      applyThemeToDOM(theme);
+      void testConnection();
+
+      const db = await repository.load();
+      let changed = false;
+      const storeColors = ['#2563EB', '#16A34A', '#9333EA', '#EA580C'];
+      db.stores.forEach((st, idx) => {
+        if (!st.storeCode) {
+          st.storeCode = String(idx + 1).padStart(2, '0');
+          changed = true;
+        }
+        if (!st.color) {
+          st.color = storeColors[idx % storeColors.length];
+          changed = true;
         }
       });
-      db.version = 3;
-      changed = true;
-    }
-    if (changed) {
-      await repository.save(db);
-    }
-    set({ db, initialized: true });
-  },
+      if ((db.version ?? 1) < 2) {
+        const m = db.settings.enabledPaymentMethods;
+        if (!m.includes('card')) m.splice(1, 0, 'card');
+        if (!m.includes('unionpay')) {
+          const mcIdx = m.indexOf('mastercard');
+          if (mcIdx >= 0) m.splice(mcIdx + 1, 0, 'unionpay');
+          else m.push('unionpay');
+        }
+        db.version = 2;
+        changed = true;
+      }
+      if ((db.version ?? 1) < 3) {
+        const removedIds = new Set(['cat-clothing', 'cat-cosmetics', 'cat-electronics', 'cat-home', 'cat-stationery', 'cat-grocery']);
+        const customCats = db.categories.filter(
+          (c) => !removedIds.has(c.id) && c.id !== 'cat-shoes' && c.id !== 'cat-accessories'
+        );
+        const mensCats = getMensClothingCategories(db.stores[0]?.id ?? 'store-chilonzor');
+        const seen = new Set(mensCats.map((c) => c.id));
+        const merged = [...mensCats, ...customCats.filter((c) => !seen.has(c.id))];
+        db.categories = merged;
+        const validIds = new Set(merged.map((c) => c.id));
+        db.products.forEach((p) => {
+          if (!validIds.has(p.categoryId)) {
+            p.categoryId = p.categoryId === 'cat-clothing' ? 'cat-shirts' : merged[0]?.id ?? 'cat-shirts';
+          }
+        });
+        db.version = 3;
+        changed = true;
+      }
+      if ((db.version ?? 1) < 4) {
+        const ownerUser = db.users.find((u) => u.id === 'usr-owner' || u.roleId === 'owner');
+        if (ownerUser) {
+          if (ownerUser.phone === '+998901112233' || ownerUser.pin === '1111') {
+            ownerUser.phone = '+998889260404';
+            ownerUser.password = '51111';
+            ownerUser.pin = '51111';
+          }
+          if (!ownerUser.googleEmail) {
+            ownerUser.googleEmail = 'a1sanjar73@gmail.com';
+          }
+          const ownerEmp = db.employees.find((e) => e.userId === ownerUser.id);
+          if (ownerEmp && ownerEmp.phone === '+998901112233') {
+            ownerEmp.phone = '+998889260404';
+            if (!ownerEmp.googleEmail) ownerEmp.googleEmail = ownerUser.googleEmail;
+          }
+        }
+        db.version = 4;
+        changed = true;
+      }
+      if (changed) {
+        await repository.save(db);
+      }
 
-  setLanguage: (language) => {
-    localStorage.setItem(LANG_KEY, language);
-    set({ language });
-  },
+      const initialUserId = get().currentUserId;
+      const initialUser = initialUserId ? db.users.find((u) => u.id === initialUserId && u.isActive) : null;
+      set({
+        db,
+        initialized: true,
+        ...(initialUser ? { activeStoreId: resolveDefaultStoreForUser(initialUser, db) } : {}),
+      });
 
-  setTheme: (theme) => {
-    localStorage.setItem(THEME_KEY, theme);
-    applyThemeToDOM(theme);
-    set({ theme });
-  },
+      if (!unsubscribeAuth) {
+        unsubscribeAuth = watchAuthState((fbUser) => {
+          if (fbUser) {
+            void connectFirebaseUser(fbUser, { setSessionIfMissing: true });
+          } else {
+            if (unsubscribeRealtime) {
+              unsubscribeRealtime();
+              unsubscribeRealtime = null;
+            }
+            set({
+              cloudConnected: false,
+              cloudConnecting: false,
+              firebaseUid: null,
+              firebaseEmail: null,
+              workspaceContext: null,
+            });
+          }
+        });
+      }
+    },
 
-  setActiveStoreId: (activeStoreId) => set({ activeStoreId }),
+    setLanguage: (language) => {
+      localStorage.setItem(LANG_KEY, language);
+      set({ language });
+    },
 
-  setOnline: (isOnline) => set({ isOnline }),
+    setTheme: (theme) => {
+      localStorage.setItem(THEME_KEY, theme);
+      applyThemeToDOM(theme);
+      set({ theme });
+    },
 
-  setShowOnboarding: (showOnboarding) => set({ showOnboarding }),
+    setActiveStoreId: (storeId) => {
+      const user = get().getCurrentUser();
+      const db = get().db;
+      if (user && user.roleId !== 'owner' && user.roleId !== 'admin' && user.assignedStoreIds.length > 0) {
+        if (storeId === 'all' || !user.assignedStoreIds.includes(storeId)) {
+          set({ activeStoreId: user.assignedStoreIds[0] });
+          return;
+        }
+      }
+      if (storeId !== 'all' && db && !db.stores.some((s) => s.id === storeId)) {
+        return;
+      }
+      set({ activeStoreId: storeId });
+    },
 
-  notify: (text, type = 'info') => {
-    const id = uid('toast');
-    set((s) => ({ toasts: [...s.toasts, { id, text, type }] }));
-    setTimeout(() => {
-      set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
-    }, 3500);
-  },
+    setOnline: (isOnline) => {
+      set({
+        isOnline,
+        syncStatus: isOnline ? 'online' : 'offline',
+      });
+      if (isOnline) {
+        void ensureFirestoreNetwork().then(() => testConnection());
+        if (get().cloudConnected && (get().db?.offlineQueue.length ?? 0) > 0) {
+          void get().syncOfflineQueue();
+        }
+      }
+    },
 
-  dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
+    setShowOnboarding: (showOnboarding) => set({ showOnboarding }),
 
-  getCurrentUser: () => {
-    const { db, currentUserId } = get();
-    if (!db || !currentUserId) return null;
-    return db.users.find((u) => u.id === currentUserId && u.isActive) ?? null;
-  },
+    notify: (text, type = 'info') => {
+      const id = uid('toast');
+      set((s) => ({ toasts: [...s.toasts, { id, text, type }] }));
+      setTimeout(() => {
+        set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
+      }, 3500);
+    },
 
-  can: (perm) => {
-    const { db } = get();
-    const user = get().getCurrentUser();
-    if (!db || !user) return false;
-    if (Array.isArray(user.customPermissions)) {
-      return user.customPermissions.includes(perm);
-    }
-    const role = db.roles.find((r) => r.id === user.roleId);
-    return role ? role.permissions.includes(perm) : false;
-  },
+    dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
 
-  loginWithPhone: (phone, password) => {
-    const { db } = get();
-    if (!db) return false;
-    const clean = phone.replace(/\s+/g, '');
-    const user = db.users.find(
-      (u) => u.isActive && u.phone.replace(/\s+/g, '') === clean && u.password === password
-    );
-    if (!user) return false;
-    localStorage.setItem(SESSION_KEY, user.id);
-    set({
-      currentUserId: user.id,
-      activeStoreId: user.assignedStoreIds.length === 1 ? user.assignedStoreIds[0] : 'all',
-    });
-    return true;
-  },
+    getCurrentUser: () => {
+      const { db, currentUserId } = get();
+      if (!db || !currentUserId) return null;
+      return db.users.find((u) => u.id === currentUserId && u.isActive) ?? null;
+    },
 
-  loginAsDemoUser: (userId) => {
-    const { db } = get();
-    if (!db) return;
-    const user = db.users.find((u) => u.id === userId && u.isActive);
-    if (!user) return;
-    localStorage.setItem(SESSION_KEY, user.id);
-    set({
-      currentUserId: user.id,
-      activeStoreId: user.assignedStoreIds.length === 1 ? user.assignedStoreIds[0] : 'all',
-    });
-  },
+    can: (perm) => {
+      const { db } = get();
+      const user = get().getCurrentUser();
+      if (!db || !user) return false;
+      if (user.roleId === 'owner') return true;
+      if (Array.isArray(user.customPermissions)) {
+        return user.customPermissions.includes(perm);
+      }
+      const role = db.roles.find((r) => r.id === user.roleId);
+      return role ? role.permissions.includes(perm) : false;
+    },
 
-  switchUserByPin: (pin) => {
-    const { db } = get();
-    if (!db) return null;
-    const user = db.users.find((u) => u.isActive && u.pin === pin);
-    if (!user) return null;
-    localStorage.setItem(SESSION_KEY, user.id);
-    set({ currentUserId: user.id });
-    return user;
-  },
+    canAccessStore: (storeId) => {
+      const user = get().getCurrentUser();
+      if (!user) return false;
+      if (user.roleId === 'owner' || user.roleId === 'admin') return true;
+      if (!user.assignedStoreIds || user.assignedStoreIds.length === 0) return true;
+      return user.assignedStoreIds.includes(storeId);
+    },
 
-  verifyManagerPin: (pin) => {
-    const { db } = get();
-    if (!db) return null;
-    return (
-      db.users.find(
+    loginWithPhone: (phone, password) => {
+      const { db } = get();
+      if (!db) return false;
+      const secret = password.trim();
+      if (!secret) return false;
+      const user = db.users.find(
         (u) =>
           u.isActive &&
-          u.pin === pin &&
-          (u.roleId === 'owner' || u.roleId === 'admin' || u.roleId === 'manager')
-      ) ?? null
-    );
-  },
+          phonesMatch(u.phone, phone) &&
+          ((u.password && u.password === secret) || (u.pin && u.pin === secret))
+      );
+      if (!user) return false;
+      localStorage.setItem(SESSION_KEY, user.id);
+      set({
+        currentUserId: user.id,
+        activeStoreId: resolveDefaultStoreForUser(user, db),
+      });
+      return true;
+    },
 
-  logout: () => {
-    localStorage.removeItem(SESSION_KEY);
-    set({ currentUserId: null });
-  },
-
-  addHeldCart: (cart) => {
-    const next = [cart, ...get().heldCarts];
-    localStorage.setItem(HELD_CARTS_KEY, JSON.stringify(next));
-    set({ heldCarts: next });
-  },
-
-  removeHeldCart: (id) => {
-    const next = get().heldCarts.filter((c) => c.id !== id);
-    localStorage.setItem(HELD_CARTS_KEY, JSON.stringify(next));
-    set({ heldCarts: next });
-  },
-
-  getVariantStock: (variantId, warehouseId) => {
-    const { db, activeStoreId } = get();
-    if (!db) return 0;
-    if (warehouseId) {
-      return db.stockItems.find((s) => s.variantId === variantId && s.warehouseId === warehouseId)?.qty ?? 0;
-    }
-    if (activeStoreId !== 'all') {
-      const store = db.stores.find((st) => st.id === activeStoreId);
-      if (store) {
-        return db.stockItems.find((s) => s.variantId === variantId && s.warehouseId === store.defaultWarehouseId)?.qty ?? 0;
+    loginWithGoogle: async () => {
+      try {
+        set({ cloudConnecting: true, cloudError: null });
+        const fbUser = await signInWithGooglePopup();
+        await connectFirebaseUser(fbUser, { forceInteractiveLogin: true });
+        return { ok: true };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Google orqali kirishda xatolik yuz berdi";
+        set({ cloudConnecting: false, cloudError: msg });
+        return { ok: false, error: msg };
       }
-    }
-    return db.stockItems
-      .filter((s) => s.variantId === variantId)
-      .reduce((sum, s) => sum + s.qty, 0);
-  },
+    },
 
-  getWarehouseForStore: (storeId) => {
-    const { db, activeStoreId } = get();
-    if (!db) return 'wh-chilonzor';
-    const targetStoreId = storeId && storeId !== 'all' ? storeId : activeStoreId !== 'all' ? activeStoreId : db.stores[0]?.id;
-    const store = db.stores.find((s) => s.id === targetStoreId) ?? db.stores[0];
-    return store?.defaultWarehouseId ?? db.warehouses[0]?.id ?? 'wh-chilonzor';
-  },
+    switchUserByPin: (pin) => {
+      const { db } = get();
+      if (!db) return null;
+      const user = db.users.find((u) => u.isActive && u.pin === pin);
+      if (!user) return null;
+      localStorage.setItem(SESSION_KEY, user.id);
+      set({
+        currentUserId: user.id,
+        activeStoreId: resolveDefaultStoreForUser(user, db),
+      });
+      return user;
+    },
 
-  upsertProduct: async (product) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const idx = nextDb.products.findIndex((p) => p.id === product.id);
-    if (idx >= 0) {
-      const prev = nextDb.products[idx];
-      const prevPrice = prev.variants[0]?.retailPrice;
-      const newPrice = product.variants[0]?.retailPrice;
-      if (prevPrice !== undefined && newPrice !== undefined && prevPrice !== newPrice) {
-        appendAudit(
+    verifyManagerPin: (pin) => {
+      const { db } = get();
+      if (!db) return null;
+      return (
+        db.users.find(
+          (u) =>
+            u.isActive &&
+            u.pin === pin &&
+            (u.roleId === 'owner' || u.roleId === 'admin' || u.roleId === 'manager')
+        ) ?? null
+      );
+    },
+
+    logout: () => {
+      if (unsubscribeRealtime) {
+        unsubscribeRealtime();
+        unsubscribeRealtime = null;
+      }
+      void signOutFirebase();
+      localStorage.removeItem(SESSION_KEY);
+      set({
+        currentUserId: null,
+        cloudConnected: false,
+        cloudError: null,
+        firebaseUid: null,
+        firebaseEmail: null,
+        workspaceContext: null,
+      });
+    },
+
+    addHeldCart: (cart) => {
+      const next = [cart, ...get().heldCarts];
+      localStorage.setItem(HELD_CARTS_KEY, JSON.stringify(next));
+      set({ heldCarts: next });
+    },
+
+    removeHeldCart: (id) => {
+      const next = get().heldCarts.filter((c) => c.id !== id);
+      localStorage.setItem(HELD_CARTS_KEY, JSON.stringify(next));
+      set({ heldCarts: next });
+    },
+
+    getVariantStock: (variantId, warehouseId) => {
+      const { db, activeStoreId } = get();
+      if (!db) return 0;
+      if (warehouseId) {
+        return db.stockItems.find((s) => s.variantId === variantId && s.warehouseId === warehouseId)?.qty ?? 0;
+      }
+      if (activeStoreId !== 'all') {
+        const store = db.stores.find((st) => st.id === activeStoreId);
+        if (store) {
+          return db.stockItems.find((s) => s.variantId === variantId && s.warehouseId === store.defaultWarehouseId)?.qty ?? 0;
+        }
+      }
+      return db.stockItems
+        .filter((s) => s.variantId === variantId)
+        .reduce((sum, s) => sum + s.qty, 0);
+    },
+
+    getWarehouseForStore: (storeId) => {
+      const { db, activeStoreId } = get();
+      if (!db) return 'wh-chilonzor';
+      const targetStoreId = storeId && storeId !== 'all' ? storeId : activeStoreId !== 'all' ? activeStoreId : db.stores[0]?.id;
+      const store = db.stores.find((s) => s.id === targetStoreId) ?? db.stores[0];
+      return store?.defaultWarehouseId ?? db.warehouses[0]?.id ?? 'wh-chilonzor';
+    },
+
+    upsertProduct: async (product) => {
+      const { db } = get();
+      if (!db || (!get().can('edit_catalog') && !get().can('manage_inventory'))) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const idx = nextDb.products.findIndex((p) => p.id === product.id);
+      let auditId: string | undefined;
+      if (idx >= 0) {
+        const prev = nextDb.products[idx];
+        const prevPrice = prev.variants[0]?.retailPrice;
+        const newPrice = product.variants[0]?.retailPrice;
+        if (prevPrice !== undefined && newPrice !== undefined && prevPrice !== newPrice) {
+          auditId = appendAudit(
+            nextDb,
+            user,
+            'price_change',
+            'Product',
+            product.id,
+            `${product.name} narxi o'zgartirildi: ${prevPrice} -> ${newPrice}`,
+            product.storeId
+          );
+        }
+        nextDb.products[idx] = { ...product, updatedAt: nowIso };
+      } else {
+        nextDb.products.unshift(product);
+      }
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'product',
+        payload: { productId: product.id, auditId, storeId: product.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    deleteProduct: async (productId) => {
+      const { db } = get();
+      if (!db || !get().can('edit_catalog')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const target = nextDb.products.find((p) => p.id === productId);
+      let auditId: string | undefined;
+      if (target) {
+        auditId = appendAudit(
           nextDb,
           user,
-          'price_change',
+          'product_delete',
           'Product',
-          product.id,
-          `${product.name} narxi o'zgartirildi: ${prevPrice} -> ${newPrice}`,
-          product.storeId
+          productId,
+          `Mahsulot o'chirildi: ${target.name}`,
+          target.storeId
         );
       }
-      nextDb.products[idx] = { ...product, updatedAt: new Date().toISOString() };
-    } else {
-      nextDb.products.unshift(product);
-    }
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
+      const deletedStockIds = nextDb.stockItems
+        .filter((s) => s.productId === productId)
+        .map((s) => stockItemDocId(s.warehouseId, s.variantId));
+      nextDb.products = nextDb.products.filter((p) => p.id !== productId);
+      nextDb.stockItems = nextDb.stockItems.filter((s) => s.productId !== productId);
 
-  deleteProduct: async (productId) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const target = nextDb.products.find((p) => p.id === productId);
-    if (target) {
-      appendAudit(
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'product_delete',
+        payload: {
+          productId,
+          deletedStockIds,
+          auditId,
+          storeId: target?.storeId ?? nextDb.stores[0]?.id ?? 'store-chilonzor',
+        },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    bulkUpdatePrices: async (productIds, percentChange, field) => {
+      const { db } = get();
+      if (!db || !get().can('bulk_edit_prices')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const factor = 1 + percentChange / 100;
+      const step = nextDb.settings.roundingStep || 100;
+      nextDb.products.forEach((p) => {
+        if (productIds.includes(p.id)) {
+          p.variants.forEach((v) => {
+            const raw = v[field] * factor;
+            v[field] = Math.max(0, Math.round(raw / step) * step);
+            v.updatedAt = nowIso;
+          });
+          p.updatedAt = nowIso;
+        }
+      });
+      const storeId = nextDb.stores[0]?.id ?? 'store-chilonzor';
+      const auditId = appendAudit(
         nextDb,
         user,
-        'product_delete',
+        'price_change',
         'Product',
+        productIds.join(','),
+        `${productIds.length} ta mahsulot (${field}) narxi ${percentChange > 0 ? '+' : ''}${percentChange}% ga o'zgartirildi`,
+        storeId
+      );
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'bulk_prices',
+        payload: { productIds, auditId, storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    quickAddStock: async (productId, variantId, warehouseId, qty, note) => {
+      const { db } = get();
+      if (!db || qty <= 0) return;
+      if (!get().can('edit_catalog') && !get().can('manage_inventory')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const prod = nextDb.products.find((p) => p.id === productId);
+      const variant = prod?.variants.find((v) => v.id === variantId);
+      const wh = nextDb.warehouses.find((w) => w.id === warehouseId);
+      const storeId = wh?.storeId ?? nextDb.stores[0]?.id ?? 'store-chilonzor';
+      const mov = mutateStock(nextDb, {
         productId,
-        `Mahsulot o'chirildi: ${target.name}`,
-        target.storeId
-      );
-    }
-    nextDb.products = nextDb.products.filter((p) => p.id !== productId);
-    nextDb.stockItems = nextDb.stockItems.filter((s) => s.productId !== productId);
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  bulkUpdatePrices: async (productIds, percentChange, field) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const factor = 1 + percentChange / 100;
-    const step = nextDb.settings.roundingStep || 100;
-    nextDb.products.forEach((p) => {
-      if (productIds.includes(p.id)) {
-        p.variants.forEach((v) => {
-          const raw = v[field] * factor;
-          v[field] = Math.max(0, Math.round(raw / step) * step);
-          v.updatedAt = new Date().toISOString();
-        });
-        p.updatedAt = new Date().toISOString();
-      }
-    });
-    appendAudit(
-      nextDb,
-      user,
-      'price_change',
-      'Product',
-      productIds.join(','),
-      `${productIds.length} ta mahsulot (${field}) narxi ${percentChange > 0 ? '+' : ''}${percentChange}% ga o'zgartirildi`,
-      nextDb.stores[0]?.id ?? 'store-chilonzor'
-    );
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  quickAddStock: async (productId, variantId, warehouseId, qty, note) => {
-    const { db } = get();
-    if (!db || qty <= 0) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const prod = nextDb.products.find((p) => p.id === productId);
-    const variant = prod?.variants.find((v) => v.id === variantId);
-    const wh = nextDb.warehouses.find((w) => w.id === warehouseId);
-    mutateStock(nextDb, {
-      productId,
-      variantId,
-      warehouseId,
-      storeId: wh?.storeId ?? nextDb.stores[0]?.id ?? 'store-chilonzor',
-      qtyDelta: qty,
-      type: 'kirim',
-      unitCost: variant?.purchasePrice ?? 0,
-      userId: user?.id ?? 'usr-owner',
-      note: note ?? "Mahsulot kartasidan tezkor kirim",
-    });
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  importProducts: async (products, initialStocks) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    nextDb.products.unshift(...products);
-    initialStocks.forEach((st) => {
-      if (st.qty > 0) {
-        const wh = nextDb.warehouses.find((w) => w.id === st.warehouseId);
-        mutateStock(nextDb, {
-          productId: st.productId,
-          variantId: st.variantId,
-          warehouseId: st.warehouseId,
-          storeId: wh?.storeId ?? nextDb.stores[0]?.id ?? 'store-chilonzor',
-          qtyDelta: st.qty,
-          type: 'kirim',
-          unitCost: st.unitCost,
-          userId: user?.id ?? 'usr-owner',
-          note: 'Excel/CSV import qoldig\'i',
-        });
-      }
-    });
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  openShift: async (startingCash, storeId) => {
-    const { db } = get();
-    if (!db) throw new Error('DB not loaded');
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const nowIso = new Date().toISOString();
-    const shift: CashShift = {
-      id: uid('shift'),
-      number: `SM-${String(nextDb.cashShifts.length + 43).padStart(3, '0')}`,
-      cashierId: user?.id ?? 'usr-cashier',
-      cashierName: user?.name ?? 'Kassir',
-      openedAt: nowIso,
-      startingCash,
-      cashSalesTotal: 0,
-      cardSalesTotal: 0,
-      otherSalesTotal: 0,
-      cashRefundsTotal: 0,
-      cashInTotal: 0,
-      cashOutTotal: 0,
-      expectedCash: startingCash,
-      status: 'open',
-      storeId,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      createdBy: user?.id ?? 'usr-cashier',
-    };
-    nextDb.cashShifts.unshift(shift);
-    await repository.save(nextDb);
-    set({ db: nextDb });
-    return shift;
-  },
-
-  recordCashOp: async (shiftId, type, amount, reason) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const shift = nextDb.cashShifts.find((s) => s.id === shiftId);
-    if (!shift) return;
-    const nowIso = new Date().toISOString();
-    const op: CashOperation = {
-      id: uid('cop'),
-      shiftId,
-      type,
-      amount,
-      reason,
-      storeId: shift.storeId,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      createdBy: user?.id ?? 'usr-cashier',
-    };
-    nextDb.cashOperations.unshift(op);
-    if (type === 'in') {
-      shift.cashInTotal += amount;
-      shift.expectedCash += amount;
-    } else {
-      shift.cashOutTotal += amount;
-      shift.expectedCash -= amount;
-    }
-    shift.updatedAt = nowIso;
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  closeShift: async (shiftId, actualCash, notes) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const shift = nextDb.cashShifts.find((s) => s.id === shiftId);
-    if (!shift) return;
-    const nowIso = new Date().toISOString();
-    shift.closedAt = nowIso;
-    shift.actualCash = actualCash;
-    shift.discrepancy = actualCash - shift.expectedCash;
-    shift.status = 'closed';
-    shift.notes = notes;
-    shift.updatedAt = nowIso;
-    appendAudit(
-      nextDb,
-      user,
-      'shift_close',
-      'CashShift',
-      shift.id,
-      `Smena ${shift.number} yopildi. Kutilgan: ${shift.expectedCash}, Haqiqiy: ${actualCash}`,
-      shift.storeId
-    );
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  createDeferredTransaction: async (input) => {
-    const { db, isOnline } = get();
-    if (!db) throw new Error('DB not loaded');
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const nowIso = new Date().toISOString();
-    const saleId = uid('sale');
-
-    const storeIdx = Math.max(0, nextDb.stores.findIndex((s) => s.id === input.storeId));
-    const store = nextDb.stores[storeIdx];
-    const storeCode = store?.storeCode || String(storeIdx + 1).padStart(2, '0');
-    const seqNum = 286 + nextDb.sales.length;
-    const receiptNumber = `#${storeCode}010104${String(seqNum).padStart(4, '0')}`;
-
-    const subtotal = input.items.reduce((s, it) => s + it.lineTotal, 0);
-    const costTotal = input.items.reduce((s, it) => s + it.purchasePrice * it.qty, 0);
-    const afterDiscount = Math.max(0, subtotal - input.checkDiscountAmount - input.loyaltyPointsSpent);
-    const vatAmount = nextDb.settings.vatEnabled
-      ? Math.round((afterDiscount * nextDb.settings.vatRate) / (100 + nextDb.settings.vatRate))
-      : 0;
-    const totalAmount = afterDiscount;
-    const customer = input.customerId ? nextDb.customers.find((c) => c.id === input.customerId) : undefined;
-
-    const sale: Sale = {
-      id: saleId,
-      receiptNumber,
-      warehouseId: input.warehouseId,
-      cashierId: user?.id ?? 'usr-cashier',
-      cashierName: user?.name ?? 'Kassir',
-      customerId: customer?.id,
-      customerName: customer?.name,
-      items: input.items,
-      subtotal,
-      checkDiscountAmount: input.checkDiscountAmount,
-      checkDiscountPercent: input.checkDiscountPercent,
-      loyaltyPointsSpent: input.loyaltyPointsSpent,
-      loyaltyPointsEarned: 0,
-      promoCode: input.promoCode,
-      vatAmount,
-      totalAmount,
-      costTotal,
-      payments: [],
-      paidAmount: 0,
-      debtAmount: 0,
-      status: 'deferred',
-      offlineCreated: !isOnline,
-      fiscalStatus: 'not_configured',
-      note: input.note,
-      storeId: input.storeId,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      createdBy: user?.id ?? 'usr-cashier',
-    };
-
-    nextDb.sales.unshift(sale);
-    await repository.save(nextDb);
-    set({ db: nextDb });
-    return sale;
-  },
-
-  payDeferredTransaction: async (saleId, input) => {
-    const { db, isOnline } = get();
-    if (!db) throw new Error('DB not loaded');
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const sale = nextDb.sales.find((s) => s.id === saleId);
-    if (!sale) throw new Error('Transaction not found');
-    if (sale.status !== 'deferred') return sale;
-
-    const nowIso = new Date().toISOString();
-    if (input.customerId !== undefined) {
-      const custOverride = input.customerId
-        ? nextDb.customers.find((c) => c.id === input.customerId)
-        : undefined;
-      sale.customerId = custOverride?.id;
-      sale.customerName = custOverride?.name;
-    }
-    if (input.loyaltyPointsSpent !== undefined) {
-      sale.loyaltyPointsSpent = input.loyaltyPointsSpent;
-      sale.totalAmount = Math.max(0, sale.subtotal - sale.checkDiscountAmount - sale.loyaltyPointsSpent);
-    }
-
-    const totalAmount = sale.totalAmount;
-    const payments: Payment[] = input.payments
-      .filter((p) => p.amount > 0)
-      .map((p) => ({
-        id: uid('pay'),
-        saleId: sale.id,
-        method: p.method,
-        amount: p.amount,
-        storeId: sale.storeId,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-        createdBy: user?.id ?? 'usr-cashier',
-      }));
-
-    const debtAmount = payments
-      .filter((p) => p.method === 'debt')
-      .reduce((s, p) => s + p.amount, 0);
-    const paidAmount = Math.max(0, totalAmount - debtAmount);
-
-    const customer = sale.customerId ? nextDb.customers.find((c) => c.id === sale.customerId) : undefined;
-    const loyaltyAcc = customer ? nextDb.loyaltyAccounts.find((l) => l.customerId === customer.id) : undefined;
-
-    let earnedPoints = 0;
-    if (customer && loyaltyAcc) {
-      if (sale.loyaltyPointsSpent > 0) {
-        loyaltyAcc.pointsBalance = Math.max(0, loyaltyAcc.pointsBalance - sale.loyaltyPointsSpent);
-        nextDb.loyaltyTransactions.unshift({
-          id: uid('ltx'),
-          customerId: customer.id,
-          loyaltyAccountId: loyaltyAcc.id,
-          type: 'spend',
-          points: -sale.loyaltyPointsSpent,
-          saleId: sale.id,
-          note: `Chek ${sale.receiptNumber} da ishlatildi`,
-          storeId: sale.storeId,
-          createdAt: nowIso,
-          updatedAt: nowIso,
-          createdBy: user?.id ?? 'usr-cashier',
-        });
-      }
-
-      earnedPoints = Math.round((paidAmount * loyaltyAcc.cashbackPercent) / 100);
-      if (earnedPoints > 0) {
-        const expDate = new Date();
-        expDate.setDate(expDate.getDate() + (nextDb.settings.cashbackExpiryDays || 180));
-        loyaltyAcc.pointsBalance += earnedPoints;
-        loyaltyAcc.expiresAt = expDate.toISOString();
-        nextDb.loyaltyTransactions.unshift({
-          id: uid('ltx'),
-          customerId: customer.id,
-          loyaltyAccountId: loyaltyAcc.id,
-          type: 'earn',
-          points: earnedPoints,
-          saleId: sale.id,
-          expiresAt: expDate.toISOString(),
-          note: `Chek ${sale.receiptNumber} keshbek`,
-          storeId: sale.storeId,
-          createdAt: nowIso,
-          updatedAt: nowIso,
-          createdBy: user?.id ?? 'usr-cashier',
-        });
-      }
-
-      customer.totalSpent += totalAmount;
-      customer.ordersCount += 1;
-      customer.lastPurchaseAt = nowIso;
-      if (customer.totalSpent >= 3000000) customer.segment = 'vip';
-      else if (customer.ordersCount >= 3) customer.segment = 'regular';
-
-      const tiers = [...nextDb.settings.loyaltyTiers].sort((a, b) => b.minSpend - a.minSpend);
-      const matched = tiers.find((t) => customer.totalSpent >= t.minSpend);
-      if (matched) {
-        loyaltyAcc.tier = matched.tier;
-        loyaltyAcc.cashbackPercent = matched.cashbackPercent;
-      }
-
-      if (debtAmount > 0) {
-        customer.debtBalance += debtAmount;
-        const due = new Date();
-        due.setDate(due.getDate() + 14);
-        nextDb.debts.unshift({
-          id: uid('debt'),
-          customerId: customer.id,
-          customerName: customer.name,
-          saleId: sale.id,
-          originalAmount: debtAmount,
-          remainingAmount: debtAmount,
-          dueDate: due.toISOString(),
-          status: 'open',
-          payments: [],
-          storeId: sale.storeId,
-          createdAt: nowIso,
-          updatedAt: nowIso,
-          createdBy: user?.id ?? 'usr-cashier',
-        });
-      }
-    }
-
-    if (sale.promoCode) {
-      const promo = nextDb.promoCodes.find((pr) => pr.code.toUpperCase() === sale.promoCode?.toUpperCase());
-      if (promo) promo.usedCount += 1;
-    }
-
-    // Deduct stock via StockMovement
-    sale.items.forEach((it) => {
-      mutateStock(nextDb, {
-        productId: it.productId,
-        variantId: it.variantId,
-        warehouseId: sale.warehouseId,
-        storeId: sale.storeId,
-        qtyDelta: -it.qty,
-        type: 'sotuv',
-        unitCost: it.purchasePrice,
-        userId: user?.id ?? 'usr-cashier',
-        referenceId: sale.id,
-        referenceType: 'Sale',
-        note: `Sotuv ${sale.receiptNumber}`,
+        variantId,
+        warehouseId,
+        storeId,
+        qtyDelta: qty,
+        type: 'kirim',
+        unitCost: variant?.purchasePrice ?? 0,
+        userId: user?.id ?? 'system',
+        note: note ?? "Mahsulot kartasidan tezkor kirim",
       });
-    });
-
-    // Update active cash shift & accounts
-    const activeShift =
-      nextDb.cashShifts.find((s) => s.status === 'open' && s.storeId === sale.storeId) ??
-      nextDb.cashShifts.find((s) => s.status === 'open');
-    const cashPaid = payments.filter((p) => p.method === 'cash').reduce((s, p) => s + p.amount, 0);
-    const cardPaid = payments
-      .filter((p) => ['card', 'uzcard', 'humo', 'visa', 'mastercard', 'unionpay'].includes(p.method))
-      .reduce((s, p) => s + p.amount, 0);
-    const otherPaid = payments
-      .filter((p) => ['transfer', 'click', 'payme', 'uzum'].includes(p.method))
-      .reduce((s, p) => s + p.amount, 0);
-
-    if (activeShift) {
-      activeShift.cashSalesTotal += cashPaid;
-      activeShift.cardSalesTotal += cardPaid;
-      activeShift.otherSalesTotal += otherPaid;
-      activeShift.expectedCash += cashPaid;
-      activeShift.updatedAt = nowIso;
-    }
-
-    const cashAcc = nextDb.accounts.find((a) => a.type === 'cash');
-    const cardAcc = nextDb.accounts.find((a) => a.type === 'card_terminal');
-    const bankAcc = nextDb.accounts.find((a) => a.type === 'bank');
-    if (cashAcc && cashPaid > 0) cashAcc.balance += cashPaid;
-    if (cardAcc && cardPaid > 0) cardAcc.balance += cardPaid;
-    if (bankAcc && otherPaid > 0) bankAcc.balance += otherPaid;
-
-    if (sale.checkDiscountPercent >= nextDb.settings.discountApprovalThresholdPercent) {
-      appendAudit(
-        nextDb,
-        user,
-        'big_discount',
-        'Sale',
-        sale.id,
-        `Chek ${sale.receiptNumber} da ${sale.checkDiscountPercent}% chegirma qo'llanildi`,
-        sale.storeId
-      );
-    }
-
-    sale.shiftId = activeShift?.id;
-    sale.cashierId = user?.id ?? sale.cashierId;
-    sale.cashierName = user?.name ?? sale.cashierName;
-    sale.loyaltyPointsEarned = earnedPoints;
-    sale.payments = payments;
-    sale.paidAmount = paidAmount;
-    sale.debtAmount = debtAmount;
-    sale.cashGiven = input.cashGiven;
-    sale.changeAmount = input.changeAmount;
-    sale.paidAt = nowIso;
-    sale.status = 'completed';
-    sale.offlineCreated = !isOnline;
-    sale.syncedAt = isOnline ? nowIso : undefined;
-    sale.updatedAt = nowIso;
-
-    if (!isOnline) {
-      nextDb.offlineQueue.push({
+      await syncOrEnqueue(nextDb, {
         id: uid('sync'),
-        type: 'sale',
-        payload: { saleId: sale.id, receiptNumber: sale.receiptNumber },
+        type: 'quick_stock',
+        payload: { movementId: mov.id, storeId },
         createdAt: nowIso,
         attempts: 0,
       });
-    }
+    },
 
-    await repository.save(nextDb);
-    set({ db: nextDb });
-    return sale;
-  },
+    importProducts: async (products, initialStocks) => {
+      const { db } = get();
+      if (!db || !get().can('edit_catalog')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      nextDb.products.unshift(...products);
+      const movementIds: string[] = [];
+      initialStocks.forEach((st) => {
+        if (st.qty > 0) {
+          const wh = nextDb.warehouses.find((w) => w.id === st.warehouseId);
+          const mov = mutateStock(nextDb, {
+            productId: st.productId,
+            variantId: st.variantId,
+            warehouseId: st.warehouseId,
+            storeId: wh?.storeId ?? nextDb.stores[0]?.id ?? 'store-chilonzor',
+            qtyDelta: st.qty,
+            type: 'kirim',
+            unitCost: st.unitCost,
+            userId: user?.id ?? 'system',
+            note: "Excel/CSV import qoldig'i",
+          });
+          movementIds.push(mov.id);
+        }
+      });
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'import_products',
+        payload: {
+          productIds: products.map((p) => p.id),
+          movementIds,
+          storeId: products[0]?.storeId ?? nextDb.stores[0]?.id ?? 'store-chilonzor',
+        },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
 
-  deleteDeferredTransaction: async (saleId) => {
-    const { db } = get();
-    if (!db) return;
-    const target = db.sales.find((s) => s.id === saleId);
-    if (!target || target.status !== 'deferred') return;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    nextDb.sales = nextDb.sales.filter((s) => s.id !== saleId);
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  completeSale: async (input) => {
-    const { db, isOnline } = get();
-    if (!db) throw new Error('DB not loaded');
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const nowIso = new Date().toISOString();
-    const saleId = uid('sale');
-
-    const storeIdx = Math.max(0, nextDb.stores.findIndex((s) => s.id === input.storeId));
-    const store = nextDb.stores[storeIdx];
-    const storeCode = store?.storeCode || String(storeIdx + 1).padStart(2, '0');
-    const seqNum = 286 + nextDb.sales.length;
-    const receiptNumber = `#${storeCode}010104${String(seqNum).padStart(4, '0')}`;
-
-    const subtotal = input.items.reduce((s, it) => s + it.lineTotal, 0);
-    const costTotal = input.items.reduce((s, it) => s + it.purchasePrice * it.qty, 0);
-    const afterDiscount = Math.max(0, subtotal - input.checkDiscountAmount - input.loyaltyPointsSpent);
-    const vatAmount = nextDb.settings.vatEnabled
-      ? Math.round((afterDiscount * nextDb.settings.vatRate) / (100 + nextDb.settings.vatRate))
-      : 0;
-    const totalAmount = afterDiscount;
-
-    const payments: Payment[] = input.payments
-      .filter((p) => p.amount > 0)
-      .map((p) => ({
-        id: uid('pay'),
-        saleId,
-        method: p.method,
-        amount: p.amount,
-        storeId: input.storeId,
+    openShift: async (startingCash, storeId) => {
+      const { db } = get();
+      if (!db) throw new Error('DB not loaded');
+      if (!get().can('manage_shifts') && !get().can('use_pos')) throw new Error("Ruxsat yo'q");
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const shift: CashShift = {
+        id: uid('shift'),
+        number: `SM-${String(nextDb.cashShifts.length + 43).padStart(3, '0')}`,
+        cashierId: user?.id ?? 'system',
+        cashierName: user?.name ?? 'Kassir',
+        openedAt: nowIso,
+        startingCash,
+        cashSalesTotal: 0,
+        cardSalesTotal: 0,
+        otherSalesTotal: 0,
+        cashRefundsTotal: 0,
+        cashInTotal: 0,
+        cashOutTotal: 0,
+        expectedCash: startingCash,
+        status: 'open',
+        storeId,
         createdAt: nowIso,
         updatedAt: nowIso,
-        createdBy: user?.id ?? 'usr-cashier',
-      }));
+        createdBy: user?.id ?? 'system',
+      };
+      nextDb.cashShifts.unshift(shift);
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'shift_open',
+        payload: { shiftId: shift.id, storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+      return shift;
+    },
 
-    const debtAmount = payments
-      .filter((p) => p.method === 'debt')
-      .reduce((s, p) => s + p.amount, 0);
-    const paidAmount = totalAmount - debtAmount;
-
-    const customer = input.customerId ? nextDb.customers.find((c) => c.id === input.customerId) : undefined;
-    const loyaltyAcc = customer ? nextDb.loyaltyAccounts.find((l) => l.customerId === customer.id) : undefined;
-
-    let earnedPoints = 0;
-    if (customer && loyaltyAcc) {
-      if (input.loyaltyPointsSpent > 0) {
-        loyaltyAcc.pointsBalance = Math.max(0, loyaltyAcc.pointsBalance - input.loyaltyPointsSpent);
-        nextDb.loyaltyTransactions.unshift({
-          id: uid('ltx'),
-          customerId: customer.id,
-          loyaltyAccountId: loyaltyAcc.id,
-          type: 'spend',
-          points: -input.loyaltyPointsSpent,
-          saleId,
-          note: `Chek ${receiptNumber} da ishlatildi`,
-          storeId: input.storeId,
-          createdAt: nowIso,
-          updatedAt: nowIso,
-          createdBy: user?.id ?? 'usr-cashier',
-        });
+    recordCashOp: async (shiftId, type, amount, reason) => {
+      const { db } = get();
+      if (!db) return;
+      if (!get().can('manage_shifts') && !get().can('use_pos')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const shift = nextDb.cashShifts.find((s) => s.id === shiftId);
+      if (!shift) return;
+      const nowIso = new Date().toISOString();
+      const op: CashOperation = {
+        id: uid('cop'),
+        shiftId,
+        type,
+        amount,
+        reason,
+        storeId: shift.storeId,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: user?.id ?? 'system',
+      };
+      nextDb.cashOperations.unshift(op);
+      if (type === 'in') {
+        shift.cashInTotal += amount;
+        shift.expectedCash += amount;
+      } else {
+        shift.cashOutTotal += amount;
+        shift.expectedCash -= amount;
       }
+      shift.updatedAt = nowIso;
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'cash_op',
+        payload: { opId: op.id, storeId: shift.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
 
-      earnedPoints = Math.round((paidAmount * loyaltyAcc.cashbackPercent) / 100);
-      if (earnedPoints > 0) {
-        const expDate = new Date();
-        expDate.setDate(expDate.getDate() + (nextDb.settings.cashbackExpiryDays || 180));
-        loyaltyAcc.pointsBalance += earnedPoints;
-        loyaltyAcc.expiresAt = expDate.toISOString();
-        nextDb.loyaltyTransactions.unshift({
-          id: uid('ltx'),
-          customerId: customer.id,
-          loyaltyAccountId: loyaltyAcc.id,
-          type: 'earn',
-          points: earnedPoints,
-          saleId,
-          expiresAt: expDate.toISOString(),
-          note: `Chek ${receiptNumber} keshbek`,
-          storeId: input.storeId,
-          createdAt: nowIso,
-          updatedAt: nowIso,
-          createdBy: user?.id ?? 'usr-cashier',
-        });
-      }
+    closeShift: async (shiftId, actualCash, notes) => {
+      const { db } = get();
+      if (!db) return;
+      if (!get().can('manage_shifts') && !get().can('use_pos')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const shift = nextDb.cashShifts.find((s) => s.id === shiftId);
+      if (!shift) return;
+      const nowIso = new Date().toISOString();
+      shift.closedAt = nowIso;
+      shift.actualCash = actualCash;
+      shift.discrepancy = actualCash - shift.expectedCash;
+      shift.status = 'closed';
+      shift.notes = notes;
+      shift.updatedAt = nowIso;
+      const auditId = appendAudit(
+        nextDb,
+        user,
+        'shift_close',
+        'CashShift',
+        shift.id,
+        `Smena ${shift.number} yopildi. Kutilgan: ${shift.expectedCash}, Haqiqiy: ${actualCash}`,
+        shift.storeId
+      );
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'shift_close',
+        payload: { shiftId: shift.id, auditId, storeId: shift.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
 
-      customer.totalSpent += totalAmount;
-      customer.ordersCount += 1;
-      customer.lastPurchaseAt = nowIso;
-      if (customer.totalSpent >= 3000000) customer.segment = 'vip';
-      else if (customer.ordersCount >= 3) customer.segment = 'regular';
+    createDeferredTransaction: async (input) => {
+      const { db, isOnline } = get();
+      if (!db) throw new Error('DB not loaded');
+      if (!get().can('use_pos')) throw new Error("Sotuvga ruxsat yo'q");
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const saleId = uid('sale');
 
-      // Recompute tier
-      const tiers = [...nextDb.settings.loyaltyTiers].sort((a, b) => b.minSpend - a.minSpend);
-      const matched = tiers.find((t) => customer.totalSpent >= t.minSpend);
-      if (matched) {
-        loyaltyAcc.tier = matched.tier;
-        loyaltyAcc.cashbackPercent = matched.cashbackPercent;
-      }
+      const storeIdx = Math.max(0, nextDb.stores.findIndex((s) => s.id === input.storeId));
+      const store = nextDb.stores[storeIdx];
+      const storeCode = store?.storeCode || String(storeIdx + 1).padStart(2, '0');
+      const seqNum = 286 + nextDb.sales.length;
+      const receiptNumber = `#${storeCode}010104${String(seqNum).padStart(4, '0')}`;
 
-      if (debtAmount > 0) {
-        customer.debtBalance += debtAmount;
-        const due = new Date();
-        due.setDate(due.getDate() + 14);
-        nextDb.debts.unshift({
-          id: uid('debt'),
-          customerId: customer.id,
-          customerName: customer.name,
-          saleId,
-          originalAmount: debtAmount,
-          remainingAmount: debtAmount,
-          dueDate: due.toISOString(),
-          status: 'open',
-          payments: [],
-          storeId: input.storeId,
-          createdAt: nowIso,
-          updatedAt: nowIso,
-          createdBy: user?.id ?? 'usr-cashier',
-        });
-      }
-    }
+      const subtotal = input.items.reduce((s, it) => s + it.lineTotal, 0);
+      const costTotal = input.items.reduce((s, it) => s + it.purchasePrice * it.qty, 0);
+      const afterDiscount = Math.max(0, subtotal - input.checkDiscountAmount - input.loyaltyPointsSpent);
+      const vatAmount = nextDb.settings.vatEnabled
+        ? Math.round((afterDiscount * nextDb.settings.vatRate) / (100 + nextDb.settings.vatRate))
+        : 0;
+      const totalAmount = afterDiscount;
+      const customer = input.customerId ? nextDb.customers.find((c) => c.id === input.customerId) : undefined;
 
-    if (input.promoCode) {
-      const promo = nextDb.promoCodes.find((pr) => pr.code.toUpperCase() === input.promoCode?.toUpperCase());
-      if (promo) promo.usedCount += 1;
-    }
-
-    // Deduct stock via StockMovement
-    input.items.forEach((it) => {
-      mutateStock(nextDb, {
-        productId: it.productId,
-        variantId: it.variantId,
+      const sale: Sale = {
+        id: saleId,
+        receiptNumber,
         warehouseId: input.warehouseId,
+        cashierId: user?.id ?? 'system',
+        cashierName: user?.name ?? 'Kassir',
+        customerId: customer?.id,
+        customerName: customer?.name,
+        items: input.items,
+        subtotal,
+        checkDiscountAmount: input.checkDiscountAmount,
+        checkDiscountPercent: input.checkDiscountPercent,
+        loyaltyPointsSpent: input.loyaltyPointsSpent,
+        loyaltyPointsEarned: 0,
+        promoCode: input.promoCode,
+        vatAmount,
+        totalAmount,
+        costTotal,
+        payments: [],
+        paidAmount: 0,
+        debtAmount: 0,
+        status: 'deferred',
+        offlineCreated: !isOnline,
+        fiscalStatus: 'not_configured',
+        note: input.note,
         storeId: input.storeId,
-        qtyDelta: -it.qty,
-        type: 'sotuv',
-        unitCost: it.purchasePrice,
-        userId: user?.id ?? 'usr-cashier',
-        referenceId: saleId,
-        referenceType: 'Sale',
-        note: `Chek ${receiptNumber}`,
-      });
-    });
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: user?.id ?? 'system',
+      };
 
-    // Update active cash shift & accounts
-    const activeShift = nextDb.cashShifts.find((s) => s.status === 'open' && s.storeId === input.storeId)
-      ?? nextDb.cashShifts.find((s) => s.status === 'open');
-    const cashPaid = payments.filter((p) => p.method === 'cash').reduce((s, p) => s + p.amount, 0);
-    const cardPaid = payments
-      .filter((p) => ['card', 'uzcard', 'humo', 'visa', 'mastercard', 'unionpay'].includes(p.method))
-      .reduce((s, p) => s + p.amount, 0);
-    const otherPaid = payments
-      .filter((p) => ['transfer', 'click', 'payme', 'uzum'].includes(p.method))
-      .reduce((s, p) => s + p.amount, 0);
-
-    if (activeShift) {
-      activeShift.cashSalesTotal += cashPaid;
-      activeShift.cardSalesTotal += cardPaid;
-      activeShift.otherSalesTotal += otherPaid;
-      activeShift.expectedCash += cashPaid;
-      activeShift.updatedAt = nowIso;
-    }
-
-    const cashAcc = nextDb.accounts.find((a) => a.type === 'cash');
-    const cardAcc = nextDb.accounts.find((a) => a.type === 'card_terminal');
-    const bankAcc = nextDb.accounts.find((a) => a.type === 'bank');
-    if (cashAcc && cashPaid > 0) cashAcc.balance += cashPaid;
-    if (cardAcc && cardPaid > 0) cardAcc.balance += cardPaid;
-    if (bankAcc && otherPaid > 0) bankAcc.balance += otherPaid;
-
-    if (input.checkDiscountPercent >= nextDb.settings.discountApprovalThresholdPercent) {
-      appendAudit(
-        nextDb,
-        user,
-        'big_discount',
-        'Sale',
-        saleId,
-        `Chek ${receiptNumber} da ${input.checkDiscountPercent}% chegirma qo'llanildi`,
-        input.storeId
-      );
-    }
-
-    const sale: Sale = {
-      id: saleId,
-      receiptNumber,
-      warehouseId: input.warehouseId,
-      shiftId: activeShift?.id,
-      cashierId: user?.id ?? 'usr-cashier',
-      cashierName: user?.name ?? 'Kassir',
-      customerId: customer?.id,
-      customerName: customer?.name,
-      items: input.items,
-      subtotal,
-      checkDiscountAmount: input.checkDiscountAmount,
-      checkDiscountPercent: input.checkDiscountPercent,
-      loyaltyPointsSpent: input.loyaltyPointsSpent,
-      loyaltyPointsEarned: earnedPoints,
-      promoCode: input.promoCode,
-      vatAmount,
-      totalAmount,
-      costTotal,
-      payments,
-      paidAmount,
-      debtAmount,
-      paidAt: nowIso,
-      status: 'completed',
-      offlineCreated: !isOnline,
-      syncedAt: isOnline ? nowIso : undefined,
-      fiscalStatus: 'not_configured',
-      note: input.note,
-      storeId: input.storeId,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      createdBy: user?.id ?? 'usr-cashier',
-    };
-
-    nextDb.sales.unshift(sale);
-    if (!isOnline) {
-      nextDb.offlineQueue.push({
+      nextDb.sales.unshift(sale);
+      await syncOrEnqueue(nextDb, {
         id: uid('sync'),
-        type: 'sale',
-        payload: { saleId, receiptNumber },
+        type: 'sale_deferred',
+        payload: { saleId, storeId: input.storeId },
         createdAt: nowIso,
         attempts: 0,
       });
-    }
+      return sale;
+    },
 
-    await repository.save(nextDb);
-    set({ db: nextDb });
-    return sale;
-  },
+    payDeferredTransaction: async (saleId, input) => {
+      const { db, isOnline } = get();
+      if (!db) throw new Error('DB not loaded');
+      if (!get().can('use_pos')) throw new Error("Sotuvga ruxsat yo'q");
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const sale = nextDb.sales.find((s) => s.id === saleId);
+      if (!sale) throw new Error('Transaction not found');
+      if (sale.status !== 'deferred') return sale;
 
-  processReturn: async (input) => {
-    const { db } = get();
-    if (!db) throw new Error('DB not loaded');
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const sale = nextDb.sales.find((s) => s.id === input.saleId);
-    if (!sale) throw new Error('Sale not found');
+      const nowIso = new Date().toISOString();
+      if (input.customerId !== undefined) {
+        const custOverride = input.customerId
+          ? nextDb.customers.find((c) => c.id === input.customerId)
+          : undefined;
+        sale.customerId = custOverride?.id;
+        sale.customerName = custOverride?.name;
+      }
+      if (input.loyaltyPointsSpent !== undefined) {
+        sale.loyaltyPointsSpent = input.loyaltyPointsSpent;
+        sale.totalAmount = Math.max(0, sale.subtotal - sale.checkDiscountAmount - sale.loyaltyPointsSpent);
+      }
 
-    const nowIso = new Date().toISOString();
-    const retId = uid('ret');
-    const retNum = `QAY-${101 + nextDb.returns.length}`;
+      const totalAmount = sale.totalAmount;
+      const payments: Payment[] = input.payments
+        .filter((p) => p.amount > 0)
+        .map((p) => ({
+          id: uid('pay'),
+          saleId: sale.id,
+          method: p.method,
+          amount: p.amount,
+          storeId: sale.storeId,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          createdBy: user?.id ?? 'system',
+        }));
 
-    const returnItems = input.items
-      .filter((it) => it.qty > 0)
-      .map((it) => {
-        const sItem = sale.items.find((si) => si.id === it.saleItemId)!;
-        const perUnit = sItem.lineTotal / sItem.qty;
-        const refundAmount = Math.round(perUnit * it.qty);
-        mutateStock(nextDb, {
-          productId: sItem.productId,
-          variantId: sItem.variantId,
+      const debtAmount = payments
+        .filter((p) => p.method === 'debt')
+        .reduce((s, p) => s + p.amount, 0);
+      const paidAmount = Math.max(0, totalAmount - debtAmount);
+
+      const customer = sale.customerId ? nextDb.customers.find((c) => c.id === sale.customerId) : undefined;
+      const loyaltyAcc = customer ? nextDb.loyaltyAccounts.find((l) => l.customerId === customer.id) : undefined;
+      const loyaltyTxIds: string[] = [];
+      let debtId: string | undefined;
+
+      let earnedPoints = 0;
+      if (customer && loyaltyAcc) {
+        if (sale.loyaltyPointsSpent > 0) {
+          loyaltyAcc.pointsBalance = Math.max(0, loyaltyAcc.pointsBalance - sale.loyaltyPointsSpent);
+          const ltxId = uid('ltx');
+          loyaltyTxIds.push(ltxId);
+          nextDb.loyaltyTransactions.unshift({
+            id: ltxId,
+            customerId: customer.id,
+            loyaltyAccountId: loyaltyAcc.id,
+            type: 'spend',
+            points: -sale.loyaltyPointsSpent,
+            saleId: sale.id,
+            note: `Chek ${sale.receiptNumber} da ishlatildi`,
+            storeId: sale.storeId,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            createdBy: user?.id ?? 'system',
+          });
+        }
+
+        earnedPoints = Math.round((paidAmount * loyaltyAcc.cashbackPercent) / 100);
+        if (earnedPoints > 0) {
+          const expDate = new Date();
+          expDate.setDate(expDate.getDate() + (nextDb.settings.cashbackExpiryDays || 180));
+          loyaltyAcc.pointsBalance += earnedPoints;
+          loyaltyAcc.expiresAt = expDate.toISOString();
+          const ltxId = uid('ltx');
+          loyaltyTxIds.push(ltxId);
+          nextDb.loyaltyTransactions.unshift({
+            id: ltxId,
+            customerId: customer.id,
+            loyaltyAccountId: loyaltyAcc.id,
+            type: 'earn',
+            points: earnedPoints,
+            saleId: sale.id,
+            expiresAt: expDate.toISOString(),
+            note: `Chek ${sale.receiptNumber} keshbek`,
+            storeId: sale.storeId,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            createdBy: user?.id ?? 'system',
+          });
+        }
+
+        customer.totalSpent += totalAmount;
+        customer.ordersCount += 1;
+        customer.lastPurchaseAt = nowIso;
+        if (customer.totalSpent >= 3000000) customer.segment = 'vip';
+        else if (customer.ordersCount >= 3) customer.segment = 'regular';
+
+        const tiers = [...nextDb.settings.loyaltyTiers].sort((a, b) => b.minSpend - a.minSpend);
+        const matched = tiers.find((t) => customer.totalSpent >= t.minSpend);
+        if (matched) {
+          loyaltyAcc.tier = matched.tier;
+          loyaltyAcc.cashbackPercent = matched.cashbackPercent;
+        }
+
+        if (debtAmount > 0) {
+          customer.debtBalance += debtAmount;
+          const due = new Date();
+          due.setDate(due.getDate() + 14);
+          debtId = uid('debt');
+          nextDb.debts.unshift({
+            id: debtId,
+            customerId: customer.id,
+            customerName: customer.name,
+            saleId: sale.id,
+            originalAmount: debtAmount,
+            remainingAmount: debtAmount,
+            dueDate: due.toISOString(),
+            status: 'open',
+            payments: [],
+            storeId: sale.storeId,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            createdBy: user?.id ?? 'system',
+          });
+        }
+      }
+
+      if (sale.promoCode) {
+        const promo = nextDb.promoCodes.find((pr) => pr.code.toUpperCase() === sale.promoCode?.toUpperCase());
+        if (promo) promo.usedCount += 1;
+      }
+
+      const movementIds: string[] = [];
+      sale.items.forEach((it) => {
+        const mov = mutateStock(nextDb, {
+          productId: it.productId,
+          variantId: it.variantId,
           warehouseId: sale.warehouseId,
           storeId: sale.storeId,
-          qtyDelta: it.qty,
-          type: 'qaytarish',
-          unitCost: sItem.purchasePrice,
-          userId: user?.id ?? 'usr-cashier',
-          referenceId: retId,
-          referenceType: 'Return',
-          note: `Qaytarish ${retNum} (Chek ${sale.receiptNumber})`,
-        });
-        return {
-          saleItemId: sItem.id,
-          productId: sItem.productId,
-          variantId: sItem.variantId,
-          productName: sItem.productName,
-          variantLabel: sItem.variantLabel,
-          qty: it.qty,
-          refundAmount,
-          purchasePrice: sItem.purchasePrice,
-        };
-      });
-
-    const totalRefund = returnItems.reduce((s, it) => s + it.refundAmount, 0);
-    const totalSoldQty = sale.items.reduce((s, it) => s + it.qty, 0);
-    const totalReturnedQty = returnItems.reduce((s, it) => s + it.qty, 0);
-    sale.status = totalReturnedQty >= totalSoldQty ? 'returned' : 'partial_return';
-    sale.updatedAt = nowIso;
-
-    if (input.refundMethod === 'cash') {
-      const shift = nextDb.cashShifts.find((s) => s.status === 'open');
-      if (shift) {
-        shift.cashRefundsTotal += totalRefund;
-        shift.expectedCash -= totalRefund;
-      }
-      const cashAcc = nextDb.accounts.find((a) => a.type === 'cash');
-      if (cashAcc) cashAcc.balance -= totalRefund;
-    }
-
-    const ret: Return = {
-      id: retId,
-      number: retNum,
-      saleId: sale.id,
-      receiptNumber: sale.receiptNumber,
-      warehouseId: sale.warehouseId,
-      items: returnItems,
-      totalRefund,
-      refundMethod: input.refundMethod,
-      reason: input.reason,
-      isExchange: input.isExchange,
-      storeId: sale.storeId,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      createdBy: user?.id ?? 'usr-cashier',
-    };
-
-    nextDb.returns.unshift(ret);
-    appendAudit(
-      nextDb,
-      user,
-      'sale_return',
-      'Return',
-      retId,
-      `Qaytarish ${retNum}: Chek ${sale.receiptNumber}, summa ${totalRefund}`,
-      sale.storeId
-    );
-    await repository.save(nextDb);
-    set({ db: nextDb });
-    return ret;
-  },
-
-  syncOfflineQueue: async () => {
-    const { db } = get();
-    if (!db || db.offlineQueue.length === 0) return 0;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const count = nextDb.offlineQueue.length;
-    const nowIso = new Date().toISOString();
-    nextDb.sales.forEach((s) => {
-      if (s.offlineCreated && !s.syncedAt) {
-        s.syncedAt = nowIso;
-      }
-    });
-    nextDb.offlineQueue = [];
-    await repository.save(nextDb);
-    set({ db: nextDb });
-    return count;
-  },
-
-  createPurchaseReceipt: async (receipt) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const nowIso = new Date().toISOString();
-    const id = uid('pr');
-    const fullReceipt: PurchaseReceipt = {
-      ...receipt,
-      id,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      createdBy: user?.id ?? 'usr-warehouse',
-    };
-    nextDb.purchaseReceipts.unshift(fullReceipt);
-
-    receipt.items.forEach((it) => {
-      mutateStock(nextDb, {
-        productId: it.productId,
-        variantId: it.variantId,
-        warehouseId: receipt.warehouseId,
-        storeId: receipt.storeId,
-        qtyDelta: it.qty,
-        type: 'kirim',
-        unitCost: it.purchasePrice,
-        userId: user?.id ?? 'usr-warehouse',
-        referenceId: id,
-        referenceType: 'PurchaseReceipt',
-        note: `Kirim ${receipt.number}`,
-      });
-      // update variant purchase price to latest
-      const prod = nextDb.products.find((p) => p.id === it.productId);
-      const variant = prod?.variants.find((v) => v.id === it.variantId);
-      if (variant && it.purchasePrice > 0) variant.purchasePrice = it.purchasePrice;
-    });
-
-    const debt = receipt.totalAmount - receipt.paidAmount;
-    if (debt > 0) {
-      const sup = nextDb.suppliers.find((s) => s.id === receipt.supplierId);
-      if (sup) sup.debtBalance += debt;
-    }
-    if (receipt.paidAmount > 0) {
-      const cashAcc = nextDb.accounts.find((a) => a.type === 'cash') ?? nextDb.accounts[0];
-      if (cashAcc) cashAcc.balance -= receipt.paidAmount;
-    }
-
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  createPurchaseOrder: async (po) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const nowIso = new Date().toISOString();
-    nextDb.purchaseOrders.unshift({
-      ...po,
-      id: uid('po'),
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      createdBy: user?.id ?? 'usr-manager',
-    });
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  updatePurchaseOrderStatus: async (poId, status) => {
-    const { db } = get();
-    if (!db) return;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const po = nextDb.purchaseOrders.find((p) => p.id === poId);
-    if (po) {
-      po.status = status;
-      po.updatedAt = new Date().toISOString();
-    }
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  createTransfer: async (transfer) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const nowIso = new Date().toISOString();
-    const id = uid('trf');
-    const full: Transfer = {
-      ...transfer,
-      id,
-      status: 'sent',
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      createdBy: user?.id ?? 'usr-warehouse',
-    };
-    nextDb.transfers.unshift(full);
-
-    transfer.items.forEach((it) => {
-      const prod = nextDb.products.find((p) => p.id === it.productId);
-      const variant = prod?.variants.find((v) => v.id === it.variantId);
-      mutateStock(nextDb, {
-        productId: it.productId,
-        variantId: it.variantId,
-        warehouseId: transfer.fromWarehouseId,
-        storeId: transfer.storeId,
-        qtyDelta: -it.sentQty,
-        type: 'kochirish_out',
-        unitCost: variant?.purchasePrice ?? 0,
-        userId: user?.id ?? 'usr-warehouse',
-        referenceId: id,
-        referenceType: 'Transfer',
-        note: `Ko'chirish ${transfer.number} (chiqish)`,
-      });
-    });
-
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  receiveTransfer: async (transferId, receivedItems) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const trf = nextDb.transfers.find((t) => t.id === transferId);
-    if (!trf || trf.status !== 'sent') return;
-
-    let hasDiscrepancy = false;
-    trf.items.forEach((it) => {
-      const rec = receivedItems.find((r) => r.variantId === it.variantId);
-      const recQty = rec ? rec.receivedQty : it.sentQty;
-      it.receivedQty = recQty;
-      if (recQty !== it.sentQty) hasDiscrepancy = true;
-      const prod = nextDb.products.find((p) => p.id === it.productId);
-      const variant = prod?.variants.find((v) => v.id === it.variantId);
-      mutateStock(nextDb, {
-        productId: it.productId,
-        variantId: it.variantId,
-        warehouseId: trf.toWarehouseId,
-        storeId: trf.storeId,
-        qtyDelta: recQty,
-        type: 'kochirish_in',
-        unitCost: variant?.purchasePrice ?? 0,
-        userId: user?.id ?? 'usr-warehouse',
-        referenceId: trf.id,
-        referenceType: 'Transfer',
-        note: `Ko'chirish ${trf.number} (qabul)`,
-      });
-    });
-    trf.status = hasDiscrepancy ? 'discrepancy' : 'received';
-    trf.updatedAt = new Date().toISOString();
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  createWriteOff: async (wo) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const nowIso = new Date().toISOString();
-    const id = uid('wo');
-    nextDb.writeOffs.unshift({
-      ...wo,
-      id,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      createdBy: user?.id ?? 'usr-warehouse',
-    });
-    wo.items.forEach((it) => {
-      mutateStock(nextDb, {
-        productId: it.productId,
-        variantId: it.variantId,
-        warehouseId: wo.warehouseId,
-        storeId: wo.storeId,
-        qtyDelta: -it.qty,
-        type: 'chiqim',
-        unitCost: it.unitCost,
-        userId: user?.id ?? 'usr-warehouse',
-        referenceId: id,
-        referenceType: 'WriteOff',
-        note: `Hisobdan chiqarish ${wo.number}: ${wo.reason}`,
-      });
-    });
-    appendAudit(
-      nextDb,
-      user,
-      'stock_writeoff',
-      'WriteOff',
-      id,
-      `Hisobdan chiqarish ${wo.number} (${wo.reason}), tannarx: ${wo.totalCost}`,
-      wo.storeId
-    );
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  saveStocktake: async (st) => {
-    const { db } = get();
-    if (!db) throw new Error('DB not loaded');
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const nowIso = new Date().toISOString();
-    const id = st.id || uid('inv');
-    const full: Stocktake = {
-      ...st,
-      id,
-      createdAt: st.id ? nextDb.stocktakes.find((x) => x.id === st.id)?.createdAt ?? nowIso : nowIso,
-      updatedAt: nowIso,
-      createdBy: user?.id ?? 'usr-warehouse',
-    };
-    const idx = nextDb.stocktakes.findIndex((x) => x.id === id);
-    if (idx >= 0) nextDb.stocktakes[idx] = full;
-    else nextDb.stocktakes.unshift(full);
-    await repository.save(nextDb);
-    set({ db: nextDb });
-    return full;
-  },
-
-  applyStocktake: async (stocktakeId) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const st = nextDb.stocktakes.find((x) => x.id === stocktakeId);
-    if (!st || st.status === 'completed') return;
-
-    st.items.forEach((it) => {
-      const currentSys =
-        nextDb.stockItems.find((s) => s.variantId === it.variantId && s.warehouseId === st.warehouseId)?.qty ?? 0;
-      const diff = it.countedQty - currentSys;
-      if (diff !== 0) {
-        mutateStock(nextDb, {
-          productId: it.productId,
-          variantId: it.variantId,
-          warehouseId: st.warehouseId,
-          storeId: st.storeId,
-          qtyDelta: diff,
-          type: 'inventarizatsiya',
-          unitCost: it.unitCost,
-          userId: user?.id ?? 'usr-warehouse',
-          referenceId: st.id,
-          referenceType: 'Stocktake',
-          note: `Inventarizatsiya ${st.number}`,
-        });
-      }
-    });
-    st.status = 'completed';
-    st.updatedAt = new Date().toISOString();
-    appendAudit(
-      nextDb,
-      user,
-      'stocktake_apply',
-      'Stocktake',
-      st.id,
-      `Inventarizatsiya ${st.number} tasdiqlandi va qoldiqlar tuzatildi`,
-      st.storeId
-    );
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  upsertSupplier: async (supplier) => {
-    const { db } = get();
-    if (!db) return;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const idx = nextDb.suppliers.findIndex((s) => s.id === supplier.id);
-    if (idx >= 0) nextDb.suppliers[idx] = supplier;
-    else nextDb.suppliers.unshift(supplier);
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  paySupplierDebt: async (supplierId, amount, accountId) => {
-    const { db } = get();
-    if (!db || amount <= 0) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const sup = nextDb.suppliers.find((s) => s.id === supplierId);
-    const acc = nextDb.accounts.find((a) => a.id === accountId);
-    if (!sup || !acc) return;
-    sup.debtBalance = Math.max(0, sup.debtBalance - amount);
-    acc.balance -= amount;
-    const nowIso = new Date().toISOString();
-    nextDb.transactions.unshift({
-      id: uid('trx'),
-      accountId: acc.id,
-      type: 'expense',
-      category: 'supplier_payment',
-      amount,
-      description: `Ta'minotchiga to'lov: ${sup.name}`,
-      referenceId: sup.id,
-      storeId: acc.storeId,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      createdBy: user?.id ?? 'usr-owner',
-    });
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  upsertCustomer: async (customer) => {
-    const { db } = get();
-    if (!db) throw new Error('DB not loaded');
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const idx = nextDb.customers.findIndex((c) => c.id === customer.id);
-    const nowIso = new Date().toISOString();
-    if (idx >= 0) {
-      nextDb.customers[idx] = { ...customer, updatedAt: nowIso };
-    } else {
-      nextDb.customers.unshift(customer);
-      const exp = new Date();
-      exp.setDate(exp.getDate() + (nextDb.settings.cashbackExpiryDays || 180));
-      nextDb.loyaltyAccounts.unshift({
-        id: uid('loy'),
-        customerId: customer.id,
-        tier: 'bronze',
-        cashbackPercent: nextDb.settings.loyaltyTiers[0]?.cashbackPercent ?? 2,
-        pointsBalance: 0,
-        cardNumber: `SHU-${1001 + nextDb.loyaltyAccounts.length}`,
-        expiresAt: exp.toISOString(),
-        storeId: customer.storeId,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-        createdBy: user?.id ?? 'usr-cashier',
-      });
-    }
-    await repository.save(nextDb);
-    set({ db: nextDb });
-    return customer;
-  },
-
-  repayDebt: async (debtId, amount, method, note) => {
-    const { db } = get();
-    if (!db || amount <= 0) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const debt = nextDb.debts.find((d) => d.id === debtId);
-    if (!debt) return;
-    const applied = Math.min(amount, debt.remainingAmount);
-    const nowIso = new Date().toISOString();
-    debt.remainingAmount -= applied;
-    debt.status = debt.remainingAmount <= 0 ? 'paid' : 'partial';
-    debt.payments.push({ id: uid('dp'), amount: applied, method, paidAt: nowIso, note });
-    debt.updatedAt = nowIso;
-
-    const cust = nextDb.customers.find((c) => c.id === debt.customerId);
-    if (cust) cust.debtBalance = Math.max(0, cust.debtBalance - applied);
-
-    const acc = nextDb.accounts.find((a) => (method === 'cash' ? a.type === 'cash' : a.type === 'card_terminal')) ?? nextDb.accounts[0];
-    if (acc) {
-      acc.balance += applied;
-      nextDb.transactions.unshift({
-        id: uid('trx'),
-        accountId: acc.id,
-        type: 'income',
-        category: 'debt_repayment',
-        amount: applied,
-        description: `Nasiya to'lovi: ${debt.customerName}`,
-        referenceId: debt.id,
-        storeId: debt.storeId,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-        createdBy: user?.id ?? 'usr-cashier',
-      });
-    }
-    appendAudit(
-      nextDb,
-      user,
-      'debt_repay',
-      'Debt',
-      debt.id,
-      `${debt.customerName} qarzidan ${applied} so'm to'landi`,
-      debt.storeId
-    );
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  upsertPromoCode: async (promo) => {
-    const { db } = get();
-    if (!db) return;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const idx = nextDb.promoCodes.findIndex((p) => p.id === promo.id);
-    if (idx >= 0) nextDb.promoCodes[idx] = promo;
-    else nextDb.promoCodes.unshift(promo);
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  addExpense: async (exp) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const nowIso = new Date().toISOString();
-    const id = uid('exp');
-    nextDb.expenses.unshift({
-      ...exp,
-      id,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      createdBy: user?.id ?? 'usr-owner',
-    });
-    const acc = nextDb.accounts.find((a) => a.id === exp.accountId);
-    if (acc) acc.balance -= exp.amount;
-    nextDb.transactions.unshift({
-      id: uid('trx'),
-      accountId: exp.accountId,
-      type: 'expense',
-      category: exp.category,
-      amount: exp.amount,
-      description: exp.description,
-      referenceId: id,
-      storeId: exp.storeId,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      createdBy: user?.id ?? 'usr-owner',
-    });
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  transferFunds: async (fromAccountId, toAccountId, amount, note) => {
-    const { db } = get();
-    if (!db || amount <= 0 || fromAccountId === toAccountId) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const from = nextDb.accounts.find((a) => a.id === fromAccountId);
-    const to = nextDb.accounts.find((a) => a.id === toAccountId);
-    if (!from || !to) return;
-    from.balance -= amount;
-    to.balance += amount;
-    const nowIso = new Date().toISOString();
-    nextDb.transactions.unshift({
-      id: uid('trx'),
-      accountId: from.id,
-      toAccountId: to.id,
-      type: 'transfer',
-      category: 'transfer',
-      amount,
-      description: note || `${from.name} -> ${to.name}`,
-      storeId: from.storeId,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      createdBy: user?.id ?? 'usr-owner',
-    });
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  upsertAccount: async (acc) => {
-    const { db } = get();
-    if (!db) return;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const idx = nextDb.accounts.findIndex((a) => a.id === acc.id);
-    if (idx >= 0) nextDb.accounts[idx] = acc;
-    else nextDb.accounts.push(acc);
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  upsertEmployee: async (emp, userUpdates, options) => {
-    const { db } = get();
-    if (!db) return;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const idx = nextDb.employees.findIndex((e) => e.id === emp.id);
-    if (idx >= 0) nextDb.employees[idx] = emp;
-    else nextDb.employees.unshift(emp);
-
-    const uIdx = nextDb.users.findIndex((u) => u.id === emp.userId);
-    if (uIdx >= 0) {
-      const updatedUser: User = {
-        ...nextDb.users[uIdx],
-        name: emp.name,
-        phone: emp.phone,
-        roleId: emp.roleId,
-        ...userUpdates,
-        updatedAt: new Date().toISOString(),
-      };
-      if (options?.clearCustomPermissions) {
-        delete updatedUser.customPermissions;
-      }
-      nextDb.users[uIdx] = updatedUser;
-    } else {
-      const nowIso = new Date().toISOString();
-      const newUser: User = {
-        id: emp.userId,
-        name: emp.name,
-        phone: emp.phone,
-        password: userUpdates?.password || '123456',
-        pin: userUpdates?.pin || String(Math.floor(1000 + Math.random() * 8999)),
-        roleId: emp.roleId,
-        assignedStoreIds: userUpdates?.assignedStoreIds?.length ? userUpdates.assignedStoreIds : [emp.storeId],
-        isActive: userUpdates?.isActive ?? true,
-        storeId: emp.storeId,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-        createdBy: 'usr-owner',
-      };
-      if (!options?.clearCustomPermissions && userUpdates?.customPermissions) {
-        newUser.customPermissions = userUpdates.customPermissions;
-      }
-      nextDb.users.push(newUser);
-    }
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  deleteEmployee: async (empId) => {
-    const { db, currentUserId } = get();
-    if (!db) return { ok: false, error: 'DB not loaded' };
-    const emp = db.employees.find((e) => e.id === empId);
-    if (!emp) return { ok: false, error: 'Xodim topilmadi' };
-    if (emp.userId === 'usr-owner') {
-      return { ok: false, error: "Asosiy do'kon egasini o'chirib bo'lmaydi" };
-    }
-    if (emp.userId === currentUserId) {
-      return { ok: false, error: "Joriy tizimga kirgan o'z hisobingizni o'chira olmaysiz" };
-    }
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    nextDb.employees = nextDb.employees.filter((e) => e.id !== empId);
-    nextDb.users = nextDb.users.filter((u) => u.id !== emp.userId);
-    nextDb.targets = nextDb.targets.filter((tg) => tg.employeeId !== empId);
-    await repository.save(nextDb);
-    set({ db: nextDb });
-    return { ok: true };
-  },
-
-  updateUserCredentials: async (userId, input) => {
-    const { db } = get();
-    if (!db) return { ok: false, error: 'DB not loaded' };
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const user = nextDb.users.find((u) => u.id === userId);
-    if (!user) return { ok: false, error: 'Foydalanuvchi topilmadi' };
-
-    if (input.currentPassword !== undefined && input.currentPassword !== user.password) {
-      return { ok: false, error: "Joriy parol noto'g'ri" };
-    }
-    if (input.newPin !== undefined) {
-      const cleanPin = input.newPin.trim();
-      if (!/^\d{4}$/.test(cleanPin)) {
-        return { ok: false, error: 'PIN-kod aniq 4 ta raqamdan iborat bo\'lishi kerak' };
-      }
-      const duplicate = nextDb.users.find((u) => u.id !== userId && u.pin === cleanPin && u.isActive);
-      if (duplicate) {
-        return { ok: false, error: `Bu PIN-kod (${cleanPin}) boshqa xodimda band` };
-      }
-      user.pin = cleanPin;
-    }
-    if (input.newPassword !== undefined) {
-      const cleanPass = input.newPassword.trim();
-      if (cleanPass.length < 4) {
-        return { ok: false, error: "Yangi parol kamida 4 ta belgidan iborat bo'lishi kerak" };
-      }
-      user.password = cleanPass;
-    }
-    if (input.name !== undefined && input.name.trim()) {
-      user.name = input.name.trim();
-      const emp = nextDb.employees.find((e) => e.userId === userId);
-      if (emp) emp.name = user.name;
-    }
-    user.updatedAt = new Date().toISOString();
-    await repository.save(nextDb);
-    set({ db: nextDb });
-    return { ok: true };
-  },
-
-  upsertTarget: async (target) => {
-    const { db } = get();
-    if (!db) return;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const idx = nextDb.targets.findIndex((t) => t.id === target.id);
-    if (idx >= 0) nextDb.targets[idx] = target;
-    else nextDb.targets.unshift(target);
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  createOnlineOrder: async (orderInput) => {
-    const { db } = get();
-    if (!db) throw new Error('DB not loaded');
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const nowIso = new Date().toISOString();
-    const order: OnlineOrder = {
-      ...orderInput,
-      id: uid('ord'),
-      orderNumber: `WEB-${205 + nextDb.onlineOrders.length}`,
-      status: 'new',
-      createdAt: nowIso,
-      updatedAt: nowIso,
-      createdBy: 'web-guest',
-    };
-    nextDb.onlineOrders.unshift(order);
-    await repository.save(nextDb);
-    set({ db: nextDb });
-    return order;
-  },
-
-  updateOnlineOrderStatus: async (orderId, status) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const ord = nextDb.onlineOrders.find((o) => o.id === orderId);
-    if (!ord) return;
-    const prevStatus = ord.status;
-    ord.status = status;
-    ord.updatedAt = new Date().toISOString();
-
-    if (prevStatus === 'new' && status === 'confirmed') {
-      const whId = get().getWarehouseForStore(ord.storeId);
-      ord.items.forEach((it) => {
-        const prod = nextDb.products.find((p) => p.id === it.productId);
-        const variant = prod?.variants.find((v) => v.id === it.variantId);
-        mutateStock(nextDb, {
-          productId: it.productId,
-          variantId: it.variantId,
-          warehouseId: whId,
-          storeId: ord.storeId,
           qtyDelta: -it.qty,
-          type: 'online_sotuv',
-          unitCost: variant?.purchasePrice ?? 0,
-          userId: user?.id ?? 'usr-manager',
-          referenceId: ord.id,
-          referenceType: 'OnlineOrder',
-          note: `Onlayn buyurtma ${ord.orderNumber}`,
+          type: 'sotuv',
+          unitCost: it.purchasePrice,
+          userId: user?.id ?? 'system',
+          referenceId: sale.id,
+          referenceType: 'Sale',
+          note: `Sotuv ${sale.receiptNumber}`,
         });
+        movementIds.push(mov.id);
       });
-    } else if (prevStatus === 'confirmed' && status === 'canceled') {
-      const whId = get().getWarehouseForStore(ord.storeId);
-      ord.items.forEach((it) => {
-        const prod = nextDb.products.find((p) => p.id === it.productId);
-        const variant = prod?.variants.find((v) => v.id === it.variantId);
-        mutateStock(nextDb, {
+
+      const activeShift =
+        nextDb.cashShifts.find((s) => s.status === 'open' && s.storeId === sale.storeId) ??
+        nextDb.cashShifts.find((s) => s.status === 'open');
+      const cashPaid = payments.filter((p) => p.method === 'cash').reduce((s, p) => s + p.amount, 0);
+      const cardPaid = payments
+        .filter((p) => ['card', 'uzcard', 'humo', 'visa', 'mastercard', 'unionpay'].includes(p.method))
+        .reduce((s, p) => s + p.amount, 0);
+      const otherPaid = payments
+        .filter((p) => ['transfer', 'click', 'payme', 'uzum'].includes(p.method))
+        .reduce((s, p) => s + p.amount, 0);
+
+      if (activeShift) {
+        activeShift.cashSalesTotal += cashPaid;
+        activeShift.cardSalesTotal += cardPaid;
+        activeShift.otherSalesTotal += otherPaid;
+        activeShift.expectedCash += cashPaid;
+        activeShift.updatedAt = nowIso;
+      }
+
+      const touchedAccountIds: string[] = [];
+      const cashAcc = nextDb.accounts.find((a) => a.type === 'cash');
+      const cardAcc = nextDb.accounts.find((a) => a.type === 'card_terminal');
+      const bankAcc = nextDb.accounts.find((a) => a.type === 'bank');
+      if (cashAcc && cashPaid > 0) {
+        cashAcc.balance += cashPaid;
+        touchedAccountIds.push(cashAcc.id);
+      }
+      if (cardAcc && cardPaid > 0) {
+        cardAcc.balance += cardPaid;
+        touchedAccountIds.push(cardAcc.id);
+      }
+      if (bankAcc && otherPaid > 0) {
+        bankAcc.balance += otherPaid;
+        touchedAccountIds.push(bankAcc.id);
+      }
+
+      let auditId: string | undefined;
+      if (sale.checkDiscountPercent >= nextDb.settings.discountApprovalThresholdPercent) {
+        auditId = appendAudit(
+          nextDb,
+          user,
+          'big_discount',
+          'Sale',
+          sale.id,
+          `Chek ${sale.receiptNumber} da ${sale.checkDiscountPercent}% chegirma qo'llanildi`,
+          sale.storeId
+        );
+      }
+
+      sale.shiftId = activeShift?.id;
+      sale.cashierId = user?.id ?? sale.cashierId;
+      sale.cashierName = user?.name ?? sale.cashierName;
+      sale.loyaltyPointsEarned = earnedPoints;
+      sale.payments = payments;
+      sale.paidAmount = paidAmount;
+      sale.debtAmount = debtAmount;
+      sale.cashGiven = input.cashGiven;
+      sale.changeAmount = input.changeAmount;
+      sale.paidAt = nowIso;
+      sale.status = 'completed';
+      sale.offlineCreated = !isOnline;
+      sale.syncedAt = isOnline ? nowIso : undefined;
+      sale.updatedAt = nowIso;
+
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'sale_pay_deferred',
+        payload: {
+          saleId: sale.id,
+          receiptNumber: sale.receiptNumber,
+          movementIds,
+          loyaltyTxIds,
+          debtId,
+          accountIds: touchedAccountIds,
+          auditId,
+          storeId: sale.storeId,
+        },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+      return sale;
+    },
+
+    deleteDeferredTransaction: async (saleId) => {
+      const { db } = get();
+      if (!db || !get().can('use_pos')) return;
+      const target = db.sales.find((s) => s.id === saleId);
+      if (!target || target.status !== 'deferred') return;
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      nextDb.sales = nextDb.sales.filter((s) => s.id !== saleId);
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'sale_delete_deferred',
+        payload: { saleId, storeId: target.storeId },
+        createdAt: new Date().toISOString(),
+        attempts: 0,
+      });
+    },
+
+    completeSale: async (input) => {
+      const { db, isOnline } = get();
+      if (!db) throw new Error('DB not loaded');
+      if (!get().can('use_pos')) throw new Error("Sotuvga ruxsat yo'q");
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const saleId = uid('sale');
+
+      const storeIdx = Math.max(0, nextDb.stores.findIndex((s) => s.id === input.storeId));
+      const store = nextDb.stores[storeIdx];
+      const storeCode = store?.storeCode || String(storeIdx + 1).padStart(2, '0');
+      const seqNum = 286 + nextDb.sales.length;
+      const receiptNumber = `#${storeCode}010104${String(seqNum).padStart(4, '0')}`;
+
+      const subtotal = input.items.reduce((s, it) => s + it.lineTotal, 0);
+      const costTotal = input.items.reduce((s, it) => s + it.purchasePrice * it.qty, 0);
+      const afterDiscount = Math.max(0, subtotal - input.checkDiscountAmount - input.loyaltyPointsSpent);
+      const vatAmount = nextDb.settings.vatEnabled
+        ? Math.round((afterDiscount * nextDb.settings.vatRate) / (100 + nextDb.settings.vatRate))
+        : 0;
+      const totalAmount = afterDiscount;
+
+      const payments: Payment[] = input.payments
+        .filter((p) => p.amount > 0)
+        .map((p) => ({
+          id: uid('pay'),
+          saleId,
+          method: p.method,
+          amount: p.amount,
+          storeId: input.storeId,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          createdBy: user?.id ?? 'system',
+        }));
+
+      const debtAmount = payments
+        .filter((p) => p.method === 'debt')
+        .reduce((s, p) => s + p.amount, 0);
+      const paidAmount = totalAmount - debtAmount;
+
+      const customer = input.customerId ? nextDb.customers.find((c) => c.id === input.customerId) : undefined;
+      const loyaltyAcc = customer ? nextDb.loyaltyAccounts.find((l) => l.customerId === customer.id) : undefined;
+      const loyaltyTxIds: string[] = [];
+      let debtId: string | undefined;
+
+      let earnedPoints = 0;
+      if (customer && loyaltyAcc) {
+        if (input.loyaltyPointsSpent > 0) {
+          loyaltyAcc.pointsBalance = Math.max(0, loyaltyAcc.pointsBalance - input.loyaltyPointsSpent);
+          const ltxId = uid('ltx');
+          loyaltyTxIds.push(ltxId);
+          nextDb.loyaltyTransactions.unshift({
+            id: ltxId,
+            customerId: customer.id,
+            loyaltyAccountId: loyaltyAcc.id,
+            type: 'spend',
+            points: -input.loyaltyPointsSpent,
+            saleId,
+            note: `Chek ${receiptNumber} da ishlatildi`,
+            storeId: input.storeId,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            createdBy: user?.id ?? 'system',
+          });
+        }
+
+        earnedPoints = Math.round((paidAmount * loyaltyAcc.cashbackPercent) / 100);
+        if (earnedPoints > 0) {
+          const expDate = new Date();
+          expDate.setDate(expDate.getDate() + (nextDb.settings.cashbackExpiryDays || 180));
+          loyaltyAcc.pointsBalance += earnedPoints;
+          loyaltyAcc.expiresAt = expDate.toISOString();
+          const ltxId = uid('ltx');
+          loyaltyTxIds.push(ltxId);
+          nextDb.loyaltyTransactions.unshift({
+            id: ltxId,
+            customerId: customer.id,
+            loyaltyAccountId: loyaltyAcc.id,
+            type: 'earn',
+            points: earnedPoints,
+            saleId,
+            expiresAt: expDate.toISOString(),
+            note: `Chek ${receiptNumber} keshbek`,
+            storeId: input.storeId,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            createdBy: user?.id ?? 'system',
+          });
+        }
+
+        customer.totalSpent += totalAmount;
+        customer.ordersCount += 1;
+        customer.lastPurchaseAt = nowIso;
+        if (customer.totalSpent >= 3000000) customer.segment = 'vip';
+        else if (customer.ordersCount >= 3) customer.segment = 'regular';
+
+        const tiers = [...nextDb.settings.loyaltyTiers].sort((a, b) => b.minSpend - a.minSpend);
+        const matched = tiers.find((t) => customer.totalSpent >= t.minSpend);
+        if (matched) {
+          loyaltyAcc.tier = matched.tier;
+          loyaltyAcc.cashbackPercent = matched.cashbackPercent;
+        }
+
+        if (debtAmount > 0) {
+          customer.debtBalance += debtAmount;
+          const due = new Date();
+          due.setDate(due.getDate() + 14);
+          debtId = uid('debt');
+          nextDb.debts.unshift({
+            id: debtId,
+            customerId: customer.id,
+            customerName: customer.name,
+            saleId,
+            originalAmount: debtAmount,
+            remainingAmount: debtAmount,
+            dueDate: due.toISOString(),
+            status: 'open',
+            payments: [],
+            storeId: input.storeId,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            createdBy: user?.id ?? 'system',
+          });
+        }
+      }
+
+      if (input.promoCode) {
+        const promo = nextDb.promoCodes.find((pr) => pr.code.toUpperCase() === input.promoCode?.toUpperCase());
+        if (promo) promo.usedCount += 1;
+      }
+
+      const movementIds: string[] = [];
+      input.items.forEach((it) => {
+        const mov = mutateStock(nextDb, {
           productId: it.productId,
           variantId: it.variantId,
-          warehouseId: whId,
-          storeId: ord.storeId,
-          qtyDelta: it.qty,
-          type: 'qaytarish',
-          unitCost: variant?.purchasePrice ?? 0,
-          userId: user?.id ?? 'usr-manager',
-          referenceId: ord.id,
-          referenceType: 'OnlineOrder',
-          note: `Bekor qilingan buyurtma ${ord.orderNumber}`,
+          warehouseId: input.warehouseId,
+          storeId: input.storeId,
+          qtyDelta: -it.qty,
+          type: 'sotuv',
+          unitCost: it.purchasePrice,
+          userId: user?.id ?? 'system',
+          referenceId: saleId,
+          referenceType: 'Sale',
+          note: `Chek ${receiptNumber}`,
         });
+        movementIds.push(mov.id);
       });
-    }
 
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
+      const activeShift =
+        nextDb.cashShifts.find((s) => s.status === 'open' && s.storeId === input.storeId) ??
+        nextDb.cashShifts.find((s) => s.status === 'open');
+      const cashPaid = payments.filter((p) => p.method === 'cash').reduce((s, p) => s + p.amount, 0);
+      const cardPaid = payments
+        .filter((p) => ['card', 'uzcard', 'humo', 'visa', 'mastercard', 'unionpay'].includes(p.method))
+        .reduce((s, p) => s + p.amount, 0);
+      const otherPaid = payments
+        .filter((p) => ['transfer', 'click', 'payme', 'uzum'].includes(p.method))
+        .reduce((s, p) => s + p.amount, 0);
 
-  upsertStore: async (store) => {
-    const { db } = get();
-    if (!db) return;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const idx = nextDb.stores.findIndex((s) => s.id === store.id);
-    if (idx >= 0) nextDb.stores[idx] = store;
-    else nextDb.stores.push(store);
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  deleteStore: async (storeId) => {
-    const { db, activeStoreId } = get();
-    if (!db) return { ok: false, error: 'DB not loaded' };
-    if (db.stores.length <= 1) {
-      return { ok: false, error: "Kamida 1 ta filial qolishi shart" };
-    }
-    const store = db.stores.find((s) => s.id === storeId);
-    if (!store) return { ok: false, error: 'Filial topilmadi' };
-
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    nextDb.stores = nextDb.stores.filter((s) => s.id !== storeId);
-    if (nextDb.warehouses.length > 1) {
-      nextDb.warehouses = nextDb.warehouses.filter((w) => w.id !== store.defaultWarehouseId);
-    }
-    const fallbackStoreId = nextDb.stores[0].id;
-    nextDb.users.forEach((u) => {
-      u.assignedStoreIds = u.assignedStoreIds.filter((id) => id !== storeId);
-      if (u.assignedStoreIds.length === 0) {
-        u.assignedStoreIds = [fallbackStoreId];
+      if (activeShift) {
+        activeShift.cashSalesTotal += cashPaid;
+        activeShift.cardSalesTotal += cardPaid;
+        activeShift.otherSalesTotal += otherPaid;
+        activeShift.expectedCash += cashPaid;
+        activeShift.updatedAt = nowIso;
       }
-      if (u.storeId === storeId) u.storeId = fallbackStoreId;
-    });
-    nextDb.employees.forEach((e) => {
-      if (e.storeId === storeId) e.storeId = fallbackStoreId;
-    });
 
-    await repository.save(nextDb);
-    set({
-      db: nextDb,
-      activeStoreId: activeStoreId === storeId ? 'all' : activeStoreId,
-    });
-    return { ok: true };
-  },
-
-  upsertWarehouse: async (wh) => {
-    const { db } = get();
-    if (!db) return;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const idx = nextDb.warehouses.findIndex((w) => w.id === wh.id);
-    if (idx >= 0) nextDb.warehouses[idx] = wh;
-    else nextDb.warehouses.push(wh);
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  updateSettings: async (partial) => {
-    const { db } = get();
-    if (!db) return;
-    const user = get().getCurrentUser();
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    nextDb.settings = { ...nextDb.settings, ...partial };
-    appendAudit(
-      nextDb,
-      user,
-      'settings_change',
-      'AppSettings',
-      'settings',
-      'Tizim sozlamalari yangilandi',
-      nextDb.stores[0]?.id ?? 'store-chilonzor'
-    );
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  upsertCategory: async (cat) => {
-    const { db } = get();
-    if (!db) return;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const idx = nextDb.categories.findIndex((c) => c.id === cat.id);
-    if (idx >= 0) nextDb.categories[idx] = { ...cat, updatedAt: new Date().toISOString() };
-    else nextDb.categories.push(cat);
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
-
-  deleteCategory: async (catId) => {
-    const { db } = get();
-    if (!db) return { ok: false, error: 'DB not loaded' };
-    if (db.categories.length <= 1) {
-      return { ok: false, error: "Kamida 1 ta kategoriya qolishi shart" };
-    }
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    nextDb.categories = nextDb.categories.filter((c) => c.id !== catId);
-    const fallbackCatId = nextDb.categories[0].id;
-    nextDb.products.forEach((p) => {
-      if (p.categoryId === catId) {
-        p.categoryId = fallbackCatId;
+      const touchedAccountIds: string[] = [];
+      const cashAcc = nextDb.accounts.find((a) => a.type === 'cash');
+      const cardAcc = nextDb.accounts.find((a) => a.type === 'card_terminal');
+      const bankAcc = nextDb.accounts.find((a) => a.type === 'bank');
+      if (cashAcc && cashPaid > 0) {
+        cashAcc.balance += cashPaid;
+        touchedAccountIds.push(cashAcc.id);
       }
-    });
-    await repository.save(nextDb);
-    set({ db: nextDb });
-    return { ok: true };
-  },
-
-  resetCategoriesToMensClothing: async () => {
-    const { db } = get();
-    if (!db) return;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const mensCats = getMensClothingCategories(nextDb.stores[0]?.id ?? 'store-chilonzor');
-    nextDb.categories = mensCats;
-    const validIds = new Set(mensCats.map((c) => c.id));
-    nextDb.products.forEach((p) => {
-      if (!validIds.has(p.categoryId)) {
-        p.categoryId = mensCats[0].id;
+      if (cardAcc && cardPaid > 0) {
+        cardAcc.balance += cardPaid;
+        touchedAccountIds.push(cardAcc.id);
       }
-    });
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
+      if (bankAcc && otherPaid > 0) {
+        bankAcc.balance += otherPaid;
+        touchedAccountIds.push(bankAcc.id);
+      }
 
-  updateRolePermissions: async (roleId, permissions) => {
-    const { db } = get();
-    if (!db) return;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const role = nextDb.roles.find((r) => r.id === roleId);
-    if (role) role.permissions = permissions;
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
+      let auditId: string | undefined;
+      if (input.checkDiscountPercent >= nextDb.settings.discountApprovalThresholdPercent) {
+        auditId = appendAudit(
+          nextDb,
+          user,
+          'big_discount',
+          'Sale',
+          saleId,
+          `Chek ${receiptNumber} da ${input.checkDiscountPercent}% chegirma qo'llanildi`,
+          input.storeId
+        );
+      }
 
-  upsertRole: async (role) => {
-    const { db } = get();
-    if (!db) return;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    const idx = nextDb.roles.findIndex((r) => r.id === role.id);
-    if (idx >= 0) {
-      nextDb.roles[idx] = role;
-    } else {
-      nextDb.roles.push(role);
-    }
-    await repository.save(nextDb);
-    set({ db: nextDb });
-  },
+      const sale: Sale = {
+        id: saleId,
+        receiptNumber,
+        warehouseId: input.warehouseId,
+        shiftId: activeShift?.id,
+        cashierId: user?.id ?? 'system',
+        cashierName: user?.name ?? 'Kassir',
+        customerId: customer?.id,
+        customerName: customer?.name,
+        items: input.items,
+        subtotal,
+        checkDiscountAmount: input.checkDiscountAmount,
+        checkDiscountPercent: input.checkDiscountPercent,
+        loyaltyPointsSpent: input.loyaltyPointsSpent,
+        loyaltyPointsEarned: earnedPoints,
+        promoCode: input.promoCode,
+        vatAmount,
+        totalAmount,
+        costTotal,
+        payments,
+        paidAmount,
+        debtAmount,
+        paidAt: nowIso,
+        status: 'completed',
+        offlineCreated: !isOnline,
+        syncedAt: isOnline ? nowIso : undefined,
+        fiscalStatus: 'not_configured',
+        note: input.note,
+        storeId: input.storeId,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: user?.id ?? 'system',
+      };
 
-  deleteRole: async (roleId) => {
-    const { db } = get();
-    if (!db) return { ok: false, error: 'DB not loaded' };
-    if (roleId === 'owner') {
-      return { ok: false, error: "Egasi (Owner) rolini o'chirib bo'lmaydi" };
-    }
-    if (db.roles.length <= 2) {
-      return { ok: false, error: "Kamida 2 ta rol qolishi kerak" };
-    }
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    nextDb.roles = nextDb.roles.filter((r) => r.id !== roleId);
-    const fallbackRole =
-      nextDb.roles.find((r) => r.id === 'cashier')?.id ??
-      nextDb.roles.find((r) => r.id !== 'owner')?.id ??
-      nextDb.roles[0].id;
-    nextDb.users.forEach((u) => {
-      if (u.roleId === roleId) u.roleId = fallbackRole;
-    });
-    nextDb.employees.forEach((e) => {
-      if (e.roleId === roleId) e.roleId = fallbackRole;
-    });
-    await repository.save(nextDb);
-    set({ db: nextDb });
-    return { ok: true };
-  },
+      nextDb.sales.unshift(sale);
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'sale',
+        payload: {
+          saleId,
+          receiptNumber,
+          movementIds,
+          loyaltyTxIds,
+          debtId,
+          accountIds: touchedAccountIds,
+          auditId,
+          storeId: input.storeId,
+        },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+      return sale;
+    },
 
-  resetDemoData: async () => {
-    const fresh = await repository.resetToDemo();
-    set({ db: fresh });
-  },
+    processReturn: async (input) => {
+      const { db } = get();
+      if (!db) throw new Error('DB not loaded');
+      if (!get().can('process_returns')) throw new Error("Qaytarishga ruxsat yo'q");
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const sale = nextDb.sales.find((s) => s.id === input.saleId);
+      if (!sale) throw new Error('Sale not found');
 
-  clearAllTestData: async () => {
-    const { db } = get();
-    if (!db) return;
-    const nextDb: DatabaseSnapshot = structuredClone(db);
-    nextDb.products = [];
-    nextDb.stockItems = [];
-    nextDb.stockMovements = [];
-    nextDb.purchaseReceipts = [];
-    nextDb.purchaseOrders = [];
-    nextDb.transfers = [];
-    nextDb.writeOffs = [];
-    nextDb.stocktakes = [];
-    nextDb.sales = [];
-    nextDb.returns = [];
-    nextDb.cashShifts = [];
-    nextDb.cashOperations = [];
-    nextDb.transactions = [];
-    nextDb.expenses = [];
-    nextDb.customers = [];
-    nextDb.loyaltyAccounts = [];
-    nextDb.loyaltyTransactions = [];
-    nextDb.debts = [];
-    nextDb.promoCodes = [];
-    nextDb.onlineOrders = [];
-    nextDb.auditLogs = [];
-    nextDb.offlineQueue = [];
-    nextDb.targets = [];
-    nextDb.accounts = nextDb.accounts.map((a) => ({ ...a, balance: 0 }));
-    nextDb.suppliers = nextDb.suppliers.map((s) => ({ ...s, debtBalance: 0 }));
-    localStorage.removeItem(HELD_CARTS_KEY);
-    await repository.save(nextDb);
-    set({
-      db: nextDb,
-      heldCarts: [],
-      cartItems: [],
-      cartCustomerId: '',
-      cartDiscountPercent: 0,
-      cartDiscountFixed: 0,
-      cartPromoCode: '',
-      cartLoyaltySpent: 0,
-    });
-  },
+      const nowIso = new Date().toISOString();
+      const retId = uid('ret');
+      const retNum = `QAY-${101 + nextDb.returns.length}`;
+      const movementIds: string[] = [];
 
-  importBackupJson: async (json) => {
-    const imported = await repository.importJson(json);
-    set({ db: imported });
-  },
-}));
+      const returnItems = input.items
+        .filter((it) => it.qty > 0)
+        .map((it) => {
+          const sItem = sale.items.find((si) => si.id === it.saleItemId)!;
+          const perUnit = sItem.lineTotal / sItem.qty;
+          const refundAmount = Math.round(perUnit * it.qty);
+          const mov = mutateStock(nextDb, {
+            productId: sItem.productId,
+            variantId: sItem.variantId,
+            warehouseId: sale.warehouseId,
+            storeId: sale.storeId,
+            qtyDelta: it.qty,
+            type: 'qaytarish',
+            unitCost: sItem.purchasePrice,
+            userId: user?.id ?? 'system',
+            referenceId: retId,
+            referenceType: 'Return',
+            note: `Qaytarish ${retNum} (Chek ${sale.receiptNumber})`,
+          });
+          movementIds.push(mov.id);
+          return {
+            saleItemId: sItem.id,
+            productId: sItem.productId,
+            variantId: sItem.variantId,
+            productName: sItem.productName,
+            variantLabel: sItem.variantLabel,
+            qty: it.qty,
+            refundAmount,
+            purchasePrice: sItem.purchasePrice,
+          };
+        });
+
+      const totalRefund = returnItems.reduce((s, it) => s + it.refundAmount, 0);
+      const totalSoldQty = sale.items.reduce((s, it) => s + it.qty, 0);
+      const totalReturnedQty = returnItems.reduce((s, it) => s + it.qty, 0);
+      sale.status = totalReturnedQty >= totalSoldQty ? 'returned' : 'partial_return';
+      sale.updatedAt = nowIso;
+
+      let touchedShiftId: string | undefined;
+      let touchedAccountId: string | undefined;
+      if (input.refundMethod === 'cash') {
+        const shift = nextDb.cashShifts.find((s) => s.status === 'open');
+        if (shift) {
+          shift.cashRefundsTotal += totalRefund;
+          shift.expectedCash -= totalRefund;
+          touchedShiftId = shift.id;
+        }
+        const cashAcc = nextDb.accounts.find((a) => a.type === 'cash');
+        if (cashAcc) {
+          cashAcc.balance -= totalRefund;
+          touchedAccountId = cashAcc.id;
+        }
+      }
+
+      const ret: Return = {
+        id: retId,
+        number: retNum,
+        saleId: sale.id,
+        receiptNumber: sale.receiptNumber,
+        warehouseId: sale.warehouseId,
+        items: returnItems,
+        totalRefund,
+        refundMethod: input.refundMethod,
+        reason: input.reason,
+        isExchange: input.isExchange,
+        storeId: sale.storeId,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: user?.id ?? 'system',
+      };
+
+      nextDb.returns.unshift(ret);
+      const auditId = appendAudit(
+        nextDb,
+        user,
+        'sale_return',
+        'Return',
+        retId,
+        `Qaytarish ${retNum}: Chek ${sale.receiptNumber}, summa ${totalRefund}`,
+        sale.storeId
+      );
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'return',
+        payload: {
+          returnId: retId,
+          movementIds,
+          shiftId: touchedShiftId,
+          accountId: touchedAccountId,
+          auditId,
+          storeId: sale.storeId,
+        },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+      return ret;
+    },
+
+    syncOfflineQueue: async () => {
+      const { db, cloudConnected, workspaceContext, isOnline } = get();
+      if (!db || db.offlineQueue.length === 0) return 0;
+
+      if (!cloudConnected || !workspaceContext) {
+        if (!isOnline) return 0;
+        const nextDb: DatabaseSnapshot = structuredClone(db);
+        const count = nextDb.offlineQueue.length;
+        const nowIso = new Date().toISOString();
+        nextDb.sales.forEach((s) => {
+          if (s.offlineCreated && !s.syncedAt) s.syncedAt = nowIso;
+        });
+        nextDb.offlineQueue = [];
+        await repository.save(nextDb);
+        set({ db: nextDb });
+        return count;
+      }
+
+      if (!isOnline) return 0;
+      set({ syncStatus: 'syncing' });
+
+      const remaining: OfflineSyncItem[] = [];
+      let syncedCount = 0;
+      const workingDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+
+      for (const item of workingDb.offlineQueue) {
+        try {
+          await pushSyncItemToFirestore(workspaceContext, item, workingDb);
+          syncedCount += 1;
+          if (item.type === 'sale' || item.type === 'sale_pay_deferred') {
+            const sId = String((item.payload as Record<string, unknown>)?.saleId || '');
+            const s = workingDb.sales.find((x) => x.id === sId);
+            if (s) s.syncedAt = nowIso;
+          }
+        } catch (err) {
+          if (isPermissionError(err)) {
+            // Drop operations rejected by rules so queue doesn't spin forever
+            continue;
+          }
+          remaining.push({ ...item, attempts: (item.attempts || 0) + 1 });
+        }
+      }
+
+      workingDb.offlineQueue = remaining;
+      await repository.save(workingDb);
+      set({
+        db: workingDb,
+        syncStatus: get().isOnline ? 'online' : 'offline',
+      });
+      return syncedCount;
+    },
+
+    createPurchaseReceipt: async (receipt) => {
+      const { db } = get();
+      if (!db || !get().can('manage_inventory')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const id = uid('pr');
+      const fullReceipt: PurchaseReceipt = {
+        ...receipt,
+        id,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: user?.id ?? 'system',
+      };
+      nextDb.purchaseReceipts.unshift(fullReceipt);
+
+      const movementIds: string[] = [];
+      receipt.items.forEach((it) => {
+        const mov = mutateStock(nextDb, {
+          productId: it.productId,
+          variantId: it.variantId,
+          warehouseId: receipt.warehouseId,
+          storeId: receipt.storeId,
+          qtyDelta: it.qty,
+          type: 'kirim',
+          unitCost: it.purchasePrice,
+          userId: user?.id ?? 'system',
+          referenceId: id,
+          referenceType: 'PurchaseReceipt',
+          note: `Kirim ${receipt.number}`,
+        });
+        movementIds.push(mov.id);
+        const prod = nextDb.products.find((p) => p.id === it.productId);
+        const variant = prod?.variants.find((v) => v.id === it.variantId);
+        if (variant && it.purchasePrice > 0) variant.purchasePrice = it.purchasePrice;
+      });
+
+      const debt = receipt.totalAmount - receipt.paidAmount;
+      if (debt > 0) {
+        const sup = nextDb.suppliers.find((s) => s.id === receipt.supplierId);
+        if (sup) sup.debtBalance += debt;
+      }
+      let paidAccId: string | undefined;
+      if (receipt.paidAmount > 0) {
+        const cashAcc = nextDb.accounts.find((a) => a.type === 'cash') ?? nextDb.accounts[0];
+        if (cashAcc) {
+          cashAcc.balance -= receipt.paidAmount;
+          paidAccId = cashAcc.id;
+        }
+      }
+
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'purchase_receipt',
+        payload: {
+          receiptId: id,
+          movementIds,
+          accountId: paidAccId,
+          storeId: receipt.storeId,
+        },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    createPurchaseOrder: async (po) => {
+      const { db } = get();
+      if (!db || !get().can('manage_inventory')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const poId = uid('po');
+      nextDb.purchaseOrders.unshift({
+        ...po,
+        id: poId,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: user?.id ?? 'system',
+      });
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'purchase_order',
+        payload: { poId, storeId: po.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    updatePurchaseOrderStatus: async (poId, status) => {
+      const { db } = get();
+      if (!db || !get().can('manage_inventory')) return;
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const po = nextDb.purchaseOrders.find((p) => p.id === poId);
+      if (!po) return;
+      po.status = status;
+      po.updatedAt = nowIso;
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'purchase_order_status',
+        payload: { poId, storeId: po.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    createTransfer: async (transfer) => {
+      const { db } = get();
+      if (!db || !get().can('manage_inventory')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const id = uid('trf');
+      const full: Transfer = {
+        ...transfer,
+        id,
+        status: 'sent',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: user?.id ?? 'system',
+      };
+      nextDb.transfers.unshift(full);
+
+      const movementIds: string[] = [];
+      transfer.items.forEach((it) => {
+        const prod = nextDb.products.find((p) => p.id === it.productId);
+        const variant = prod?.variants.find((v) => v.id === it.variantId);
+        const mov = mutateStock(nextDb, {
+          productId: it.productId,
+          variantId: it.variantId,
+          warehouseId: transfer.fromWarehouseId,
+          storeId: transfer.storeId,
+          qtyDelta: -it.sentQty,
+          type: 'kochirish_out',
+          unitCost: variant?.purchasePrice ?? 0,
+          userId: user?.id ?? 'system',
+          referenceId: id,
+          referenceType: 'Transfer',
+          note: `Ko'chirish ${transfer.number} (chiqish)`,
+        });
+        movementIds.push(mov.id);
+      });
+
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'transfer',
+        payload: { transferId: id, movementIds, storeId: transfer.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    receiveTransfer: async (transferId, receivedItems) => {
+      const { db } = get();
+      if (!db || !get().can('manage_inventory')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const trf = nextDb.transfers.find((t) => t.id === transferId);
+      if (!trf || trf.status !== 'sent') return;
+
+      const nowIso = new Date().toISOString();
+      const movementIds: string[] = [];
+      let hasDiscrepancy = false;
+      trf.items.forEach((it) => {
+        const rec = receivedItems.find((r) => r.variantId === it.variantId);
+        const recQty = rec ? rec.receivedQty : it.sentQty;
+        it.receivedQty = recQty;
+        if (recQty !== it.sentQty) hasDiscrepancy = true;
+        const prod = nextDb.products.find((p) => p.id === it.productId);
+        const variant = prod?.variants.find((v) => v.id === it.variantId);
+        const mov = mutateStock(nextDb, {
+          productId: it.productId,
+          variantId: it.variantId,
+          warehouseId: trf.toWarehouseId,
+          storeId: trf.storeId,
+          qtyDelta: recQty,
+          type: 'kochirish_in',
+          unitCost: variant?.purchasePrice ?? 0,
+          userId: user?.id ?? 'system',
+          referenceId: trf.id,
+          referenceType: 'Transfer',
+          note: `Ko'chirish ${trf.number} (qabul)`,
+        });
+        movementIds.push(mov.id);
+      });
+      trf.status = hasDiscrepancy ? 'discrepancy' : 'received';
+      trf.updatedAt = nowIso;
+
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'transfer_receive',
+        payload: { transferId, movementIds, storeId: trf.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    createWriteOff: async (wo) => {
+      const { db } = get();
+      if (!db || !get().can('manage_inventory')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const id = uid('wo');
+      nextDb.writeOffs.unshift({
+        ...wo,
+        id,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: user?.id ?? 'system',
+      });
+      const movementIds: string[] = [];
+      wo.items.forEach((it) => {
+        const mov = mutateStock(nextDb, {
+          productId: it.productId,
+          variantId: it.variantId,
+          warehouseId: wo.warehouseId,
+          storeId: wo.storeId,
+          qtyDelta: -it.qty,
+          type: 'chiqim',
+          unitCost: it.unitCost,
+          userId: user?.id ?? 'system',
+          referenceId: id,
+          referenceType: 'WriteOff',
+          note: `Hisobdan chiqarish ${wo.number}: ${wo.reason}`,
+        });
+        movementIds.push(mov.id);
+      });
+      const auditId = appendAudit(
+        nextDb,
+        user,
+        'stock_writeoff',
+        'WriteOff',
+        id,
+        `Hisobdan chiqarish ${wo.number} (${wo.reason}), tannarx: ${wo.totalCost}`,
+        wo.storeId
+      );
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'write_off',
+        payload: { writeOffId: id, movementIds, auditId, storeId: wo.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    saveStocktake: async (st) => {
+      const { db } = get();
+      if (!db) throw new Error('DB not loaded');
+      if (!get().can('manage_inventory')) throw new Error("Ruxsat yo'q");
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const id = st.id || uid('inv');
+      const full: Stocktake = {
+        ...st,
+        id,
+        createdAt: st.id ? nextDb.stocktakes.find((x) => x.id === st.id)?.createdAt ?? nowIso : nowIso,
+        updatedAt: nowIso,
+        createdBy: user?.id ?? 'system',
+      };
+      const idx = nextDb.stocktakes.findIndex((x) => x.id === id);
+      if (idx >= 0) nextDb.stocktakes[idx] = full;
+      else nextDb.stocktakes.unshift(full);
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'stocktake',
+        payload: { stocktakeId: id, storeId: full.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+      return full;
+    },
+
+    applyStocktake: async (stocktakeId) => {
+      const { db } = get();
+      if (!db || !get().can('manage_inventory')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const st = nextDb.stocktakes.find((x) => x.id === stocktakeId);
+      if (!st || st.status === 'completed') return;
+
+      const nowIso = new Date().toISOString();
+      const movementIds: string[] = [];
+      st.items.forEach((it) => {
+        const currentSys =
+          nextDb.stockItems.find((s) => s.variantId === it.variantId && s.warehouseId === st.warehouseId)?.qty ?? 0;
+        const diff = it.countedQty - currentSys;
+        if (diff !== 0) {
+          const mov = mutateStock(nextDb, {
+            productId: it.productId,
+            variantId: it.variantId,
+            warehouseId: st.warehouseId,
+            storeId: st.storeId,
+            qtyDelta: diff,
+            type: 'inventarizatsiya',
+            unitCost: it.unitCost,
+            userId: user?.id ?? 'system',
+            referenceId: st.id,
+            referenceType: 'Stocktake',
+            note: `Inventarizatsiya ${st.number}`,
+          });
+          movementIds.push(mov.id);
+        }
+      });
+      st.status = 'completed';
+      st.updatedAt = nowIso;
+      const auditId = appendAudit(
+        nextDb,
+        user,
+        'stocktake_apply',
+        'Stocktake',
+        st.id,
+        `Inventarizatsiya ${st.number} tasdiqlandi va qoldiqlar tuzatildi`,
+        st.storeId
+      );
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'stocktake_apply',
+        payload: { stocktakeId: st.id, movementIds, auditId, storeId: st.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    upsertSupplier: async (supplier) => {
+      const { db } = get();
+      if (!db || !get().can('manage_inventory')) return;
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const idx = nextDb.suppliers.findIndex((s) => s.id === supplier.id);
+      if (idx >= 0) nextDb.suppliers[idx] = { ...supplier, updatedAt: nowIso };
+      else nextDb.suppliers.unshift(supplier);
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'supplier',
+        payload: { supplierId: supplier.id, storeId: supplier.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    paySupplierDebt: async (supplierId, amount, accountId) => {
+      const { db } = get();
+      if (!db || amount <= 0 || !get().can('manage_finance')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const sup = nextDb.suppliers.find((s) => s.id === supplierId);
+      const acc = nextDb.accounts.find((a) => a.id === accountId);
+      if (!sup || !acc) return;
+      sup.debtBalance = Math.max(0, sup.debtBalance - amount);
+      acc.balance -= amount;
+      const nowIso = new Date().toISOString();
+      const trxId = uid('trx');
+      nextDb.transactions.unshift({
+        id: trxId,
+        accountId: acc.id,
+        type: 'expense',
+        category: 'supplier_payment',
+        amount,
+        description: `Ta'minotchiga to'lov: ${sup.name}`,
+        referenceId: sup.id,
+        storeId: acc.storeId,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: user?.id ?? 'system',
+      });
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'supplier_debt_pay',
+        payload: { supplierId, accountId: acc.id, transactionId: trxId, storeId: acc.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    upsertCustomer: async (customer) => {
+      const { db } = get();
+      if (!db) throw new Error('DB not loaded');
+      if (!get().can('manage_customers') && !get().can('use_pos')) throw new Error("Ruxsat yo'q");
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const idx = nextDb.customers.findIndex((c) => c.id === customer.id);
+      const nowIso = new Date().toISOString();
+      let loyId: string | undefined;
+      if (idx >= 0) {
+        nextDb.customers[idx] = { ...customer, updatedAt: nowIso };
+      } else {
+        nextDb.customers.unshift(customer);
+        const exp = new Date();
+        exp.setDate(exp.getDate() + (nextDb.settings.cashbackExpiryDays || 180));
+        loyId = uid('loy');
+        nextDb.loyaltyAccounts.unshift({
+          id: loyId,
+          customerId: customer.id,
+          tier: 'bronze',
+          cashbackPercent: nextDb.settings.loyaltyTiers[0]?.cashbackPercent ?? 2,
+          pointsBalance: 0,
+          cardNumber: `SHU-${1001 + nextDb.loyaltyAccounts.length}`,
+          expiresAt: exp.toISOString(),
+          storeId: customer.storeId,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          createdBy: user?.id ?? 'system',
+        });
+      }
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'customer',
+        payload: { customerId: customer.id, loyaltyAccountId: loyId, storeId: customer.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+      return customer;
+    },
+
+    repayDebt: async (debtId, amount, method, note) => {
+      const { db } = get();
+      if (!db || amount <= 0) return;
+      if (!get().can('manage_debts') && !get().can('manage_customers')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const debt = nextDb.debts.find((d) => d.id === debtId);
+      if (!debt) return;
+      const applied = Math.min(amount, debt.remainingAmount);
+      const nowIso = new Date().toISOString();
+      debt.remainingAmount -= applied;
+      debt.status = debt.remainingAmount <= 0 ? 'paid' : 'partial';
+      debt.payments.push({ id: uid('dp'), amount: applied, method, paidAt: nowIso, note });
+      debt.updatedAt = nowIso;
+
+      const cust = nextDb.customers.find((c) => c.id === debt.customerId);
+      if (cust) cust.debtBalance = Math.max(0, cust.debtBalance - applied);
+
+      const acc =
+        nextDb.accounts.find((a) => (method === 'cash' ? a.type === 'cash' : a.type === 'card_terminal')) ??
+        nextDb.accounts[0];
+      let trxId: string | undefined;
+      if (acc) {
+        acc.balance += applied;
+        trxId = uid('trx');
+        nextDb.transactions.unshift({
+          id: trxId,
+          accountId: acc.id,
+          type: 'income',
+          category: 'debt_repayment',
+          amount: applied,
+          description: `Nasiya to'lovi: ${debt.customerName}`,
+          referenceId: debt.id,
+          storeId: debt.storeId,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          createdBy: user?.id ?? 'system',
+        });
+      }
+      const auditId = appendAudit(
+        nextDb,
+        user,
+        'debt_repay',
+        'Debt',
+        debt.id,
+        `${debt.customerName} qarzidan ${applied} so'm to'landi`,
+        debt.storeId
+      );
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'debt_pay',
+        payload: {
+          debtId: debt.id,
+          accountId: acc?.id,
+          transactionId: trxId,
+          auditId,
+          storeId: debt.storeId,
+        },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    upsertPromoCode: async (promo) => {
+      const { db } = get();
+      if (!db || !get().can('manage_customers')) return;
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const idx = nextDb.promoCodes.findIndex((p) => p.id === promo.id);
+      if (idx >= 0) nextDb.promoCodes[idx] = { ...promo, updatedAt: nowIso };
+      else nextDb.promoCodes.unshift(promo);
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'promo',
+        payload: { promoId: promo.id, storeId: promo.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    addExpense: async (exp) => {
+      const { db } = get();
+      if (!db || !get().can('manage_finance')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const id = uid('exp');
+      const trxId = uid('trx');
+      nextDb.expenses.unshift({
+        ...exp,
+        id,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: user?.id ?? 'system',
+      });
+      const acc = nextDb.accounts.find((a) => a.id === exp.accountId);
+      if (acc) acc.balance -= exp.amount;
+      nextDb.transactions.unshift({
+        id: trxId,
+        accountId: exp.accountId,
+        type: 'expense',
+        category: exp.category,
+        amount: exp.amount,
+        description: exp.description,
+        referenceId: id,
+        storeId: exp.storeId,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: user?.id ?? 'system',
+      });
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'expense',
+        payload: { expenseId: id, transactionId: trxId, storeId: exp.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    transferFunds: async (fromAccountId, toAccountId, amount, note) => {
+      const { db } = get();
+      if (!db || amount <= 0 || fromAccountId === toAccountId || !get().can('manage_finance')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const from = nextDb.accounts.find((a) => a.id === fromAccountId);
+      const to = nextDb.accounts.find((a) => a.id === toAccountId);
+      if (!from || !to) return;
+      from.balance -= amount;
+      to.balance += amount;
+      const nowIso = new Date().toISOString();
+      const trxId = uid('trx');
+      nextDb.transactions.unshift({
+        id: trxId,
+        accountId: from.id,
+        toAccountId: to.id,
+        type: 'transfer',
+        category: 'transfer',
+        amount,
+        description: note || `${from.name} -> ${to.name}`,
+        storeId: from.storeId,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: user?.id ?? 'system',
+      });
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'finance_transfer',
+        payload: { fromAccountId, toAccountId, transactionId: trxId, storeId: from.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    upsertAccount: async (acc) => {
+      const { db } = get();
+      if (!db || !get().can('manage_finance')) return;
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const idx = nextDb.accounts.findIndex((a) => a.id === acc.id);
+      if (idx >= 0) nextDb.accounts[idx] = { ...acc, updatedAt: nowIso };
+      else nextDb.accounts.push(acc);
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'account',
+        payload: { accountId: acc.id, storeId: acc.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    upsertEmployee: async (emp, userUpdates, options) => {
+      const { db } = get();
+      if (!db || !get().can('manage_employees')) return;
+      const currentUser = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const idx = nextDb.employees.findIndex((e) => e.id === emp.id);
+      const cleanEmail = emp.googleEmail?.trim().toLowerCase() || userUpdates?.googleEmail?.trim().toLowerCase() || undefined;
+      const empToSave: Employee = {
+        ...emp,
+        ...(cleanEmail ? { googleEmail: cleanEmail } : {}),
+        updatedAt: nowIso,
+      };
+      if (idx >= 0) nextDb.employees[idx] = empToSave;
+      else nextDb.employees.unshift(empToSave);
+
+      const uIdx = nextDb.users.findIndex((u) => u.id === emp.userId);
+      if (uIdx >= 0) {
+        const existingUser = nextDb.users[uIdx];
+        const nextPassword = userUpdates?.password?.trim()
+          ? userUpdates.password.trim()
+          : existingUser.password;
+        const updatedUser: User = {
+          ...existingUser,
+          name: emp.name,
+          phone: emp.phone,
+          roleId: emp.roleId,
+          ...userUpdates,
+          password: nextPassword,
+          ...(cleanEmail ? { googleEmail: cleanEmail } : {}),
+          updatedAt: nowIso,
+        };
+        if (!cleanEmail && existingUser.googleEmail && userUpdates && 'googleEmail' in userUpdates && !userUpdates.googleEmail) {
+          delete updatedUser.googleEmail;
+        }
+        if (options?.clearCustomPermissions) {
+          delete updatedUser.customPermissions;
+        }
+        nextDb.users[uIdx] = updatedUser;
+      } else {
+        const newUser: User = {
+          id: emp.userId,
+          name: emp.name,
+          phone: emp.phone,
+          password: userUpdates?.password?.trim() || '',
+          pin: userUpdates?.pin || String(Math.floor(1000 + Math.random() * 8999)),
+          ...(cleanEmail ? { googleEmail: cleanEmail } : {}),
+          roleId: emp.roleId,
+          assignedStoreIds: userUpdates?.assignedStoreIds?.length ? userUpdates.assignedStoreIds : [emp.storeId],
+          isActive: userUpdates?.isActive ?? true,
+          storeId: emp.storeId,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          createdBy: currentUser?.id ?? 'system',
+        };
+        if (!options?.clearCustomPermissions && userUpdates?.customPermissions) {
+          newUser.customPermissions = userUpdates.customPermissions;
+        }
+        nextDb.users.push(newUser);
+      }
+
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'employee',
+        payload: { empId: emp.id, userId: emp.userId, storeId: emp.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    deleteEmployee: async (empId) => {
+      const { db, currentUserId } = get();
+      if (!db) return { ok: false, error: 'DB not loaded' };
+      if (!get().can('manage_employees')) return { ok: false, error: "Ruxsat yo'q" };
+      const emp = db.employees.find((e) => e.id === empId);
+      if (!emp) return { ok: false, error: 'Xodim topilmadi' };
+      if (emp.userId === 'usr-owner' || emp.roleId === 'owner') {
+        return { ok: false, error: "Asosiy do'kon egasini o'chirib bo'lmaydi" };
+      }
+      if (emp.userId === currentUserId) {
+        return { ok: false, error: "Joriy tizimga kirgan o'z hisobingizni o'chira olmaysiz" };
+      }
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      nextDb.employees = nextDb.employees.filter((e) => e.id !== empId);
+      nextDb.users = nextDb.users.filter((u) => u.id !== emp.userId);
+      nextDb.targets = nextDb.targets.filter((tg) => tg.employeeId !== empId);
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'employee_delete',
+        payload: { empId, storeId: emp.storeId },
+        createdAt: new Date().toISOString(),
+        attempts: 0,
+      });
+      return { ok: true };
+    },
+
+    updateUserCredentials: async (userId, input) => {
+      const { db } = get();
+      if (!db) return { ok: false, error: 'DB not loaded' };
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const user = nextDb.users.find((u) => u.id === userId);
+      if (!user) return { ok: false, error: 'Foydalanuvchi topilmadi' };
+
+      if (input.currentPassword !== undefined && user.password && input.currentPassword !== user.password) {
+        return { ok: false, error: "Joriy parol noto'g'ri" };
+      }
+      if (input.newPin !== undefined) {
+        const cleanPin = input.newPin.trim();
+        if (!/^\d{4,6}$/.test(cleanPin)) {
+          return { ok: false, error: "PIN-kod 4–6 ta raqamdan iborat bo'lishi kerak" };
+        }
+        const duplicate = nextDb.users.find((u) => u.id !== userId && u.pin === cleanPin && u.isActive);
+        if (duplicate) {
+          return { ok: false, error: `Bu PIN-kod (${cleanPin}) boshqa xodimda band` };
+        }
+        user.pin = cleanPin;
+      }
+      if (input.newPassword !== undefined) {
+        const cleanPass = input.newPassword.trim();
+        if (cleanPass.length < 4) {
+          return { ok: false, error: "Yangi parol kamida 4 ta belgidan iborat bo'lishi kerak" };
+        }
+        user.password = cleanPass;
+      }
+      if (input.name !== undefined && input.name.trim()) {
+        user.name = input.name.trim();
+        const emp = nextDb.employees.find((e) => e.userId === userId);
+        if (emp) emp.name = user.name;
+      }
+      const nowIso = new Date().toISOString();
+      user.updatedAt = nowIso;
+      const emp = nextDb.employees.find((e) => e.userId === userId);
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'employee',
+        payload: { empId: emp?.id ?? userId, userId, storeId: user.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+      return { ok: true };
+    },
+
+    upsertTarget: async (target) => {
+      const { db } = get();
+      if (!db || !get().can('manage_employees')) return;
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const idx = nextDb.targets.findIndex((t) => t.id === target.id);
+      if (idx >= 0) nextDb.targets[idx] = { ...target, updatedAt: nowIso };
+      else nextDb.targets.unshift(target);
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'target',
+        payload: { targetId: target.id, storeId: target.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    createOnlineOrder: async (orderInput) => {
+      const { db, cloudConnected } = get();
+      if (!db) throw new Error('DB not loaded');
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const order: OnlineOrder = {
+        ...orderInput,
+        id: uid('ord'),
+        orderNumber: `WEB-${205 + nextDb.onlineOrders.length}`,
+        status: 'new',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        createdBy: 'web-guest',
+      };
+      nextDb.onlineOrders.unshift(order);
+      if (cloudConnected) {
+        await syncOrEnqueue(nextDb, {
+          id: uid('sync'),
+          type: 'online_order',
+          payload: { orderId: order.id, storeId: order.storeId },
+          createdAt: nowIso,
+          attempts: 0,
+        });
+      } else {
+        await repository.save(nextDb);
+        set({ db: nextDb });
+      }
+      return order;
+    },
+
+    updateOnlineOrderStatus: async (orderId, status) => {
+      const { db } = get();
+      if (!db || !get().can('manage_online_orders')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const ord = nextDb.onlineOrders.find((o) => o.id === orderId);
+      if (!ord) return;
+      const prevStatus = ord.status;
+      const nowIso = new Date().toISOString();
+      ord.status = status;
+      ord.updatedAt = nowIso;
+
+      const movementIds: string[] = [];
+      if (prevStatus === 'new' && status === 'confirmed') {
+        const whId = get().getWarehouseForStore(ord.storeId);
+        ord.items.forEach((it) => {
+          const prod = nextDb.products.find((p) => p.id === it.productId);
+          const variant = prod?.variants.find((v) => v.id === it.variantId);
+          const mov = mutateStock(nextDb, {
+            productId: it.productId,
+            variantId: it.variantId,
+            warehouseId: whId,
+            storeId: ord.storeId,
+            qtyDelta: -it.qty,
+            type: 'online_sotuv',
+            unitCost: variant?.purchasePrice ?? 0,
+            userId: user?.id ?? 'system',
+            referenceId: ord.id,
+            referenceType: 'OnlineOrder',
+            note: `Onlayn buyurtma ${ord.orderNumber}`,
+          });
+          movementIds.push(mov.id);
+        });
+      } else if (prevStatus === 'confirmed' && status === 'canceled') {
+        const whId = get().getWarehouseForStore(ord.storeId);
+        ord.items.forEach((it) => {
+          const prod = nextDb.products.find((p) => p.id === it.productId);
+          const variant = prod?.variants.find((v) => v.id === it.variantId);
+          const mov = mutateStock(nextDb, {
+            productId: it.productId,
+            variantId: it.variantId,
+            warehouseId: whId,
+            storeId: ord.storeId,
+            qtyDelta: it.qty,
+            type: 'qaytarish',
+            unitCost: variant?.purchasePrice ?? 0,
+            userId: user?.id ?? 'system',
+            referenceId: ord.id,
+            referenceType: 'OnlineOrder',
+            note: `Bekor qilingan buyurtma ${ord.orderNumber}`,
+          });
+          movementIds.push(mov.id);
+        });
+      }
+
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'online_order_status',
+        payload: { orderId, movementIds, storeId: ord.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    upsertStore: async (store) => {
+      const { db } = get();
+      if (!db || !get().can('manage_settings')) return;
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const idx = nextDb.stores.findIndex((s) => s.id === store.id);
+      if (idx >= 0) nextDb.stores[idx] = { ...store, updatedAt: nowIso };
+      else nextDb.stores.push(store);
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'store',
+        payload: { storeId: store.id },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    deleteStore: async (storeId) => {
+      const { db, activeStoreId } = get();
+      if (!db) return { ok: false, error: 'DB not loaded' };
+      if (!get().can('manage_settings')) return { ok: false, error: "Ruxsat yo'q" };
+      if (db.stores.length <= 1) {
+        return { ok: false, error: "Kamida 1 ta filial qolishi shart" };
+      }
+      const store = db.stores.find((s) => s.id === storeId);
+      if (!store) return { ok: false, error: 'Filial topilmadi' };
+
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      nextDb.stores = nextDb.stores.filter((s) => s.id !== storeId);
+      let deletedWarehouseId: string | undefined;
+      if (nextDb.warehouses.length > 1) {
+        deletedWarehouseId = store.defaultWarehouseId;
+        nextDb.warehouses = nextDb.warehouses.filter((w) => w.id !== store.defaultWarehouseId);
+      }
+      const fallbackStoreId = nextDb.stores[0].id;
+      nextDb.users.forEach((u) => {
+        u.assignedStoreIds = u.assignedStoreIds.filter((id) => id !== storeId);
+        if (u.assignedStoreIds.length === 0) {
+          u.assignedStoreIds = [fallbackStoreId];
+        }
+        if (u.storeId === storeId) u.storeId = fallbackStoreId;
+      });
+      nextDb.employees.forEach((e) => {
+        if (e.storeId === storeId) e.storeId = fallbackStoreId;
+      });
+
+      set({ activeStoreId: activeStoreId === storeId ? 'all' : activeStoreId });
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'store_delete',
+        payload: { storeId, deletedWarehouseId },
+        createdAt: new Date().toISOString(),
+        attempts: 0,
+      });
+      return { ok: true };
+    },
+
+    upsertWarehouse: async (wh) => {
+      const { db } = get();
+      const user = get().getCurrentUser();
+      if (!db || (!get().can('manage_settings') && user?.roleId !== 'owner' && user?.roleId !== 'admin')) return;
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const idx = nextDb.warehouses.findIndex((w) => w.id === wh.id);
+      if (idx >= 0) nextDb.warehouses[idx] = { ...wh, updatedAt: nowIso };
+      else nextDb.warehouses.push(wh);
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'warehouse',
+        payload: { warehouseId: wh.id, storeId: wh.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    updateSettings: async (partial) => {
+      const { db } = get();
+      if (!db || !get().can('manage_settings')) return;
+      const user = get().getCurrentUser();
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      nextDb.settings = { ...nextDb.settings, ...partial };
+      const storeId = nextDb.stores[0]?.id ?? 'store-chilonzor';
+      const auditId = appendAudit(
+        nextDb,
+        user,
+        'settings_change',
+        'AppSettings',
+        'settings',
+        'Tizim sozlamalari yangilandi',
+        storeId
+      );
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'settings',
+        payload: { auditId, storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+    },
+
+    isCategoryUsed: (catId) => {
+      const { db } = get();
+      if (!db) return false;
+      if (db.products.some((p) => p.categoryId === catId)) return true;
+      return db.purchaseReceipts.some(
+        (pr) =>
+          pr.categoryId === catId ||
+          pr.items.some((it) => db.products.find((p) => p.id === it.productId)?.categoryId === catId)
+      );
+    },
+
+    upsertCategory: async (cat) => {
+      const { db, language } = get();
+      if (!db) return { ok: false, error: 'DB not loaded' };
+      if (!get().can('edit_catalog') && !get().can('manage_inventory') && !get().can('manage_settings')) {
+        return { ok: false, error: language === 'ru' ? 'Недостаточно прав' : "Ruxsat yo'q" };
+      }
+      const cleanUz = cat.nameUz.trim();
+      const cleanRu = (cat.nameRu || cat.nameUz).trim();
+      if (!cleanUz) {
+        return {
+          ok: false,
+          error: language === 'ru' ? 'Введите название категории' : 'Kategoriya nomini kiriting',
+        };
+      }
+      const duplicate = db.categories.find(
+        (c) =>
+          c.id !== cat.id &&
+          (c.nameUz.trim().toLowerCase() === cleanUz.toLowerCase() ||
+            c.nameRu.trim().toLowerCase() === cleanRu.toLowerCase())
+      );
+      if (duplicate) {
+        return {
+          ok: false,
+          error:
+            language === 'ru'
+              ? 'Категория с таким названием уже существует'
+              : 'Bu nomdagi kategoriya allaqachon mavjud',
+        };
+      }
+
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const nowIso = new Date().toISOString();
+      const savedCat: Category = {
+        ...cat,
+        nameUz: cleanUz,
+        nameRu: cleanRu,
+        updatedAt: nowIso,
+      };
+      const idx = nextDb.categories.findIndex((c) => c.id === cat.id);
+      if (idx >= 0) nextDb.categories[idx] = savedCat;
+      else nextDb.categories.push(savedCat);
+
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'category',
+        payload: { categoryId: savedCat.id, storeId: savedCat.storeId },
+        createdAt: nowIso,
+        attempts: 0,
+      });
+      return { ok: true };
+    },
+
+    deleteCategory: async (catId) => {
+      const { db } = get();
+      if (!db) return { ok: false, error: 'DB not loaded' };
+      if (!get().can('edit_catalog') && !get().can('manage_inventory') && !get().can('manage_settings')) {
+        return { ok: false, error: "Ruxsat yo'q" };
+      }
+      if (db.categories.length <= 1) {
+        return { ok: false, error: "Kamida 1 ta kategoriya qolishi shart" };
+      }
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      nextDb.categories = nextDb.categories.filter((c) => c.id !== catId);
+      const fallbackCatId = nextDb.categories[0].id;
+      const reassignedProductIds: string[] = [];
+      nextDb.products.forEach((p) => {
+        if (p.categoryId === catId) {
+          p.categoryId = fallbackCatId;
+          reassignedProductIds.push(p.id);
+        }
+      });
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'category_delete',
+        payload: {
+          categoryId: catId,
+          reassignedProductIds,
+          storeId: nextDb.stores[0]?.id ?? 'store-chilonzor',
+        },
+        createdAt: new Date().toISOString(),
+        attempts: 0,
+      });
+      return { ok: true };
+    },
+
+    resetCategoriesToMensClothing: async () => {
+      const { db } = get();
+      if (!db || !get().can('edit_catalog')) return;
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const storeId = nextDb.stores[0]?.id ?? 'store-chilonzor';
+      const mensCats = getMensClothingCategories(storeId);
+      nextDb.categories = mensCats;
+      const validIds = new Set(mensCats.map((c) => c.id));
+      nextDb.products.forEach((p) => {
+        if (!validIds.has(p.categoryId)) {
+          p.categoryId = mensCats[0].id;
+        }
+      });
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'categories_reset',
+        payload: { storeId },
+        createdAt: new Date().toISOString(),
+        attempts: 0,
+      });
+    },
+
+    updateRolePermissions: async (roleId, permissions) => {
+      const { db } = get();
+      if (!db || (!get().can('manage_settings') && !get().can('manage_employees'))) return;
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const role = nextDb.roles.find((r) => r.id === roleId);
+      if (role) role.permissions = permissions;
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'roles',
+        payload: { storeId: nextDb.stores[0]?.id ?? 'store-chilonzor' },
+        createdAt: new Date().toISOString(),
+        attempts: 0,
+      });
+    },
+
+    upsertRole: async (role) => {
+      const { db, language } = get();
+      if (!db) return { ok: false, error: 'DB not loaded' };
+      if (!get().can('manage_settings') && !get().can('manage_employees')) {
+        return { ok: false, error: language === 'ru' ? 'Недостаточно прав' : "Ruxsat yo'q" };
+      }
+      const cleanUz = role.nameUz.trim();
+      const cleanRu = (role.nameRu || role.nameUz).trim();
+      if (!cleanUz) {
+        return { ok: false, error: language === 'ru' ? 'Введите название роли' : 'Rol nomini kiriting' };
+      }
+      const duplicate = db.roles.find(
+        (r) =>
+          r.id !== role.id &&
+          (r.nameUz.trim().toLowerCase() === cleanUz.toLowerCase() ||
+            r.nameRu.trim().toLowerCase() === cleanRu.toLowerCase())
+      );
+      if (duplicate) {
+        return {
+          ok: false,
+          error: language === 'ru' ? 'Роль с таким названием уже существует' : 'Bu nomdagi rol allaqachon mavjud',
+        };
+      }
+      const isExisting = db.roles.some((r) => r.id === role.id);
+      if (!isExisting && db.roles.length >= 20) {
+        return {
+          ok: false,
+          error: language === 'ru' ? 'Максимум 20 ролей' : 'Maksimum 20 ta rol yaratish mumkin',
+        };
+      }
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      const savedRole: Role = {
+        ...role,
+        nameUz: cleanUz.slice(0, 80),
+        nameRu: cleanRu.slice(0, 80),
+        permissions: role.permissions.slice(0, 30),
+      };
+      const idx = nextDb.roles.findIndex((r) => r.id === savedRole.id);
+      if (idx >= 0) nextDb.roles[idx] = savedRole;
+      else nextDb.roles.push(savedRole);
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'roles',
+        payload: { storeId: nextDb.stores[0]?.id ?? 'store-chilonzor' },
+        createdAt: new Date().toISOString(),
+        attempts: 0,
+      });
+      return { ok: true };
+    },
+
+    deleteRole: async (roleId) => {
+      const { db } = get();
+      if (!db) return { ok: false, error: 'DB not loaded' };
+      if (!get().can('manage_settings') && !get().can('manage_employees')) {
+        return { ok: false, error: "Ruxsat yo'q" };
+      }
+      if (roleId === 'owner') {
+        return { ok: false, error: "Egasi (Owner) rolini o'chirib bo'lmaydi" };
+      }
+      if (db.roles.length <= 2) {
+        return { ok: false, error: "Kamida 2 ta rol qolishi kerak" };
+      }
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      nextDb.roles = nextDb.roles.filter((r) => r.id !== roleId);
+      const fallbackRole =
+        nextDb.roles.find((r) => r.id === 'cashier')?.id ??
+        nextDb.roles.find((r) => r.id !== 'owner')?.id ??
+        nextDb.roles[0].id;
+      nextDb.users.forEach((u) => {
+        if (u.roleId === roleId) u.roleId = fallbackRole;
+      });
+      nextDb.employees.forEach((e) => {
+        if (e.roleId === roleId) e.roleId = fallbackRole;
+      });
+      await syncOrEnqueue(nextDb, {
+        id: uid('sync'),
+        type: 'roles',
+        payload: { storeId: nextDb.stores[0]?.id ?? 'store-chilonzor' },
+        createdAt: new Date().toISOString(),
+        attempts: 0,
+      });
+      return { ok: true };
+    },
+
+    resetDemoData: async () => {
+      const fresh = await repository.resetToDemo();
+      set({ db: fresh });
+    },
+
+    clearAllTestData: async () => {
+      const { db, cloudConnected, workspaceContext, isOnline } = get();
+      if (!db || !get().can('manage_settings')) return;
+      const nextDb: DatabaseSnapshot = structuredClone(db);
+      nextDb.products = [];
+      nextDb.stockItems = [];
+      nextDb.stockMovements = [];
+      nextDb.purchaseReceipts = [];
+      nextDb.purchaseOrders = [];
+      nextDb.transfers = [];
+      nextDb.writeOffs = [];
+      nextDb.stocktakes = [];
+      nextDb.sales = [];
+      nextDb.returns = [];
+      nextDb.cashShifts = [];
+      nextDb.cashOperations = [];
+      nextDb.transactions = [];
+      nextDb.expenses = [];
+      nextDb.customers = [];
+      nextDb.loyaltyAccounts = [];
+      nextDb.loyaltyTransactions = [];
+      nextDb.debts = [];
+      nextDb.promoCodes = [];
+      nextDb.onlineOrders = [];
+      nextDb.auditLogs = [];
+      nextDb.offlineQueue = [];
+      nextDb.targets = [];
+      nextDb.accounts = nextDb.accounts.map((a) => ({ ...a, balance: 0 }));
+      nextDb.suppliers = nextDb.suppliers.map((s) => ({ ...s, debtBalance: 0 }));
+      localStorage.removeItem(HELD_CARTS_KEY);
+      await repository.save(nextDb);
+      set({
+        db: nextDb,
+        heldCarts: [],
+        cartItems: [],
+        cartCustomerId: '',
+        cartDiscountPercent: 0,
+        cartDiscountFixed: 0,
+        cartPromoCode: '',
+        cartLoyaltySpent: 0,
+      });
+      if (cloudConnected && workspaceContext && isOnline) {
+        await clearWorkspaceOperationalData(workspaceContext, nextDb);
+      }
+    },
+
+    importBackupJson: async (json) => {
+      const imported = await repository.importJson(json);
+      set({ db: imported });
+    },
+  };
+});

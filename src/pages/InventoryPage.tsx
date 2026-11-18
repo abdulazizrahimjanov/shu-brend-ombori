@@ -13,17 +13,23 @@ import {
   Download,
   X,
   Check,
+  Edit3,
+  FolderCog,
+  Warehouse as WarehouseIcon,
+  PackagePlus,
 } from 'lucide-react';
 import { useAppStore, uid } from '../store/useAppStore';
 import { formatDate, formatDateTime, formatMoney, useT } from '../i18n';
-import { Product, PurchaseReceiptItem, StocktakeItem, TransferItem, Variant, WriteOffItem, WriteOffReason } from '../types/models';
+import { Category, Product, PurchaseReceiptItem, StocktakeItem, TransferItem, Variant, WriteOffItem, WriteOffReason } from '../types/models';
 import { exportToExcel } from '../utils/export';
+import { generateEAN13 } from '../utils/barcode';
 
 type InvTab = 'stock' | 'receiving' | 'transfers' | 'writeoffs' | 'stocktake' | 'movements' | 'suppliers';
 
 export const InventoryPage: React.FC = () => {
   const db = useAppStore((s) => s.db);
   const can = useAppStore((s) => s.can);
+  const currentUser = useAppStore((s) => s.getCurrentUser());
   const language = useAppStore((s) => s.language);
   const getVariantStock = useAppStore((s) => s.getVariantStock);
   const createPurchaseReceipt = useAppStore((s) => s.createPurchaseReceipt);
@@ -35,12 +41,19 @@ export const InventoryPage: React.FC = () => {
   const saveStocktake = useAppStore((s) => s.saveStocktake);
   const applyStocktake = useAppStore((s) => s.applyStocktake);
   const upsertSupplier = useAppStore((s) => s.upsertSupplier);
+  const upsertWarehouse = useAppStore((s) => s.upsertWarehouse);
+  const upsertProduct = useAppStore((s) => s.upsertProduct);
   const paySupplierDebt = useAppStore((s) => s.paySupplierDebt);
+  const isCategoryUsed = useAppStore((s) => s.isCategoryUsed);
+  const upsertCategory = useAppStore((s) => s.upsertCategory);
+  const deleteCategory = useAppStore((s) => s.deleteCategory);
   const notify = useAppStore((s) => s.notify);
   const t = useT();
 
   const canManage = can('manage_inventory');
   const canViewCost = can('view_profit_cost');
+  const canCreateWarehouse = can('manage_settings') || currentUser?.roleId === 'owner' || currentUser?.roleId === 'admin';
+  const canCreateProduct = can('edit_catalog') || can('manage_inventory');
 
   const [searchParams] = useSearchParams();
   const initialTab = (searchParams.get('tab') as InvTab) || 'stock';
@@ -59,11 +72,20 @@ export const InventoryPage: React.FC = () => {
   const [recOpen, setRecOpen] = useState(false);
   const [recSupplierId, setRecSupplierId] = useState('');
   const [recWarehouseId, setRecWarehouseId] = useState('');
+  const [recCategoryId, setRecCategoryId] = useState('all');
   const [recVariantId, setRecVariantId] = useState('');
   const [recQty, setRecQty] = useState(10);
   const [recPrice, setRecPrice] = useState(100000);
   const [recItems, setRecItems] = useState<PurchaseReceiptItem[]>([]);
   const [recPaid, setRecPaid] = useState(0);
+
+  // Category create/manage modal inside Receiving
+  const [catModalOpen, setCatModalOpen] = useState(false);
+  const [catNameUz, setCatNameUz] = useState('');
+  const [catNameRu, setCatNameRu] = useState('');
+  const [catError, setCatError] = useState('');
+  const [editingCat, setEditingCat] = useState<Category | null>(null);
+  const [deleteCatConfirm, setDeleteCatConfirm] = useState<Category | null>(null);
 
   // Transfer modal
   const [trfOpen, setTrfOpen] = useState(false);
@@ -91,6 +113,25 @@ export const InventoryPage: React.FC = () => {
   const [supName, setSupName] = useState('');
   const [supContact, setSupContact] = useState('');
   const [supPhone, setSupPhone] = useState('+99890');
+  const [supError, setSupError] = useState('');
+
+  // Quick Warehouse modal (inside Receiving)
+  const [whQuickOpen, setWhQuickOpen] = useState(false);
+  const [whName, setWhName] = useState('');
+  const [whAddress, setWhAddress] = useState('');
+  const [whStoreId, setWhStoreId] = useState('');
+  const [whError, setWhError] = useState('');
+
+  // Quick Product & Variant modal (inside Receiving)
+  const [prodQuickOpen, setProdQuickOpen] = useState(false);
+  const [prodName, setProdName] = useState('');
+  const [prodCategoryId, setProdCategoryId] = useState('');
+  const [prodUnit, setProdUnit] = useState<Product['unit']>('dona');
+  const [prodSize, setProdSize] = useState('');
+  const [prodColor, setProdColor] = useState('');
+  const [prodPurchasePrice, setProdPurchasePrice] = useState(100000);
+  const [prodRetailPrice, setProdRetailPrice] = useState(160000);
+  const [prodError, setProdError] = useState('');
 
   // PO modal
   const [poOpen, setPoOpen] = useState(false);
@@ -155,18 +196,40 @@ export const InventoryPage: React.FC = () => {
     return rows;
   }, [db, warehouseFilter, stockFilter, search, getVariantStock, velocityMap]);
 
+  const receivingFilteredVariants = useMemo(() => {
+    if (!db) return [];
+    return db.products
+      .filter((p) => recCategoryId === 'all' || p.categoryId === recCategoryId)
+      .flatMap((p) => p.variants.map((v) => ({ product: p, variant: v })));
+  }, [db, recCategoryId]);
+
   if (!db) return null;
 
   const initReceivingModal = () => {
     const firstVar = db.products[0]?.variants[0];
     setRecSupplierId(db.suppliers[0]?.id ?? '');
     setRecWarehouseId(db.warehouses[0]?.id ?? '');
+    setRecCategoryId('all');
     setRecVariantId(firstVar?.id ?? '');
     setRecPrice(firstVar?.purchasePrice ?? 100000);
     setRecQty(10);
     setRecItems([]);
     setRecPaid(0);
     setRecOpen(true);
+  };
+
+  const handleRecCategoryChange = (nextCatId: string) => {
+    setRecCategoryId(nextCatId);
+    const matching = db.products
+      .filter((p) => nextCatId === 'all' || p.categoryId === nextCatId)
+      .flatMap((p) => p.variants);
+    const firstMatch = matching[0];
+    if (firstMatch) {
+      setRecVariantId(firstMatch.id);
+      setRecPrice(firstMatch.purchasePrice);
+    } else {
+      setRecVariantId('');
+    }
   };
 
   const addReceivingItem = () => {
@@ -404,10 +467,18 @@ export const InventoryPage: React.FC = () => {
             {db.purchaseReceipts.map((pr) => {
               const sup = db.suppliers.find((s) => s.id === pr.supplierId);
               const wh = db.warehouses.find((w) => w.id === pr.warehouseId);
+              const cat = pr.categoryId ? db.categories.find((c) => c.id === pr.categoryId) : undefined;
               return (
                 <div key={pr.id} className="p-4 flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <div className="text-sm font-bold font-mono">{pr.number} · {sup?.name}</div>
+                    <div className="text-sm font-bold font-mono flex items-center gap-2 flex-wrap">
+                      <span>{pr.number} · {sup?.name}</span>
+                      {cat && (
+                        <span className="px-2 py-0.5 rounded-md bg-teal-50 dark:bg-teal-950/60 text-teal-700 dark:text-teal-300 font-sans text-[11px] font-semibold">
+                          {language === 'ru' ? cat.nameRu : cat.nameUz}
+                        </span>
+                      )}
+                    </div>
                     <div className="text-xs text-slate-500 mt-0.5">
                       {wh?.name} · {pr.items.length} pozitsiya · {formatDateTime(pr.createdAt, language)}
                     </div>
@@ -789,33 +860,190 @@ export const InventoryPage: React.FC = () => {
               <h3 className="font-display text-base font-bold">{t.inventory.newReceiving}</h3>
               <button type="button" onClick={() => setRecOpen(false)}><X className="w-4 h-4" /></button>
             </div>
-            <div className="grid grid-cols-2 gap-2">
-              <select value={recSupplierId} onChange={(e) => setRecSupplierId(e.target.value)} className="h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs">
-                {db.suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-              </select>
-              <select value={recWarehouseId} onChange={(e) => setRecWarehouseId(e.target.value)} className="h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs">
-                {db.warehouses.map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}
-              </select>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              {/* Supplier + Quick "+" */}
+              <div className="space-y-1">
+                <label className="block text-[11px] font-medium text-slate-500">Yetkazib beruvchi</label>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={recSupplierId}
+                    onChange={(e) => setRecSupplierId(e.target.value)}
+                    className="flex-1 min-w-0 h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+                  >
+                    {db.suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSupName('');
+                      setSupContact('');
+                      setSupPhone('+99890');
+                      setSupError('');
+                      setSupModalOpen(true);
+                    }}
+                    title={t.inventory.newSupplier}
+                    aria-label={t.inventory.newSupplier}
+                    className="w-10 h-10 shrink-0 rounded-lg bg-teal-700 hover:bg-teal-800 text-white flex items-center justify-center transition-colors"
+                  >
+                    <Plus className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Warehouse + Quick "+" */}
+              <div className="space-y-1">
+                <label className="block text-[11px] font-medium text-slate-500">Ombor</label>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={recWarehouseId}
+                    onChange={(e) => setRecWarehouseId(e.target.value)}
+                    className="flex-1 min-w-0 h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+                  >
+                    {db.warehouses.map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}
+                  </select>
+                  {canCreateWarehouse && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setWhName('');
+                        setWhAddress('');
+                        setWhStoreId(db.stores[0]?.id ?? '');
+                        setWhError('');
+                        setWhQuickOpen(true);
+                      }}
+                      title="Yangi ombor qo'shish"
+                      aria-label="Yangi ombor qo'shish"
+                      className="w-10 h-10 shrink-0 rounded-lg bg-teal-700 hover:bg-teal-800 text-white flex items-center justify-center transition-colors"
+                    >
+                      <Plus className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
-              <select
-                value={recVariantId}
-                onChange={(e) => {
-                  setRecVariantId(e.target.value);
-                  const found = variantLookup.get(e.target.value);
-                  if (found) setRecPrice(found.variant.purchasePrice);
-                }}
-                className="sm:col-span-2 h-10 px-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
-              >
-                {db.products.flatMap((p) =>
-                  p.variants.map((v) => (
-                    <option key={v.id} value={v.id}>{p.name} ({[v.size, v.color].filter(Boolean).join('/') || v.sku})</option>
-                  ))
-                )}
-              </select>
-              <input type="number" min={1} value={recQty} onChange={(e) => setRecQty(Number(e.target.value))} placeholder="Soni" className="h-10 px-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono" />
-              <button type="button" onClick={addReceivingItem} className="h-10 rounded-lg bg-slate-900 dark:bg-slate-700 text-white text-xs font-semibold">+ Qo'shish</button>
+
+            {/* Category Selector + Quick "+" Add Category Button */}
+            <div className="space-y-1">
+              <label className="block text-[11px] font-medium text-slate-500">{t.inventory.category}</label>
+              <div className="flex items-center gap-2">
+                <select
+                  value={recCategoryId}
+                  onChange={(e) => handleRecCategoryChange(e.target.value)}
+                  className="flex-1 min-w-0 h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-medium"
+                >
+                  <option value="all">{t.inventory.allCategoriesFilter}</option>
+                  {db.categories.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {language === 'ru' ? c.nameRu : c.nameUz}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCatNameUz('');
+                    setCatNameRu('');
+                    setCatError('');
+                    setEditingCat(null);
+                    setDeleteCatConfirm(null);
+                    setCatModalOpen(true);
+                  }}
+                  title={t.inventory.createCategoryTitle}
+                  aria-label={t.inventory.createCategoryTitle}
+                  className="w-10 h-10 shrink-0 rounded-lg bg-teal-700 hover:bg-teal-800 text-white flex items-center justify-center transition-colors"
+                >
+                  <Plus className="w-4 h-4" />
+                </button>
+              </div>
             </div>
+
+            {/* Product / Variant Selector + Quick "+" Add Product Button */}
+            <div className="space-y-2">
+              <div className="space-y-1">
+                <label className="block text-[11px] font-medium text-slate-500">Mahsulot / variant</label>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={recVariantId}
+                    onChange={(e) => {
+                      setRecVariantId(e.target.value);
+                      const found = variantLookup.get(e.target.value);
+                      if (found) setRecPrice(found.variant.purchasePrice);
+                    }}
+                    className="flex-1 min-w-0 h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+                  >
+                    {receivingFilteredVariants.length === 0 ? (
+                      <option value="">Ushbu kategoriyada mahsulot yo'q</option>
+                    ) : (
+                      receivingFilteredVariants.map(({ product: p, variant: v }) => (
+                        <option key={v.id} value={v.id}>
+                          {p.name} ({[v.size, v.color].filter(Boolean).join('/') || v.sku})
+                        </option>
+                      ))
+                    )}
+                  </select>
+                  {canCreateProduct && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProdName('');
+                        setProdCategoryId(recCategoryId !== 'all' ? recCategoryId : (db.categories[0]?.id ?? ''));
+                        setProdUnit('dona');
+                        setProdSize('');
+                        setProdColor('');
+                        setProdPurchasePrice(100000);
+                        setProdRetailPrice(160000);
+                        setProdError('');
+                        setProdQuickOpen(true);
+                      }}
+                      title="Yangi mahsulot qo'shish"
+                      aria-label="Yangi mahsulot qo'shish"
+                      className="w-10 h-10 shrink-0 rounded-lg bg-teal-700 hover:bg-teal-800 text-white flex items-center justify-center transition-colors"
+                    >
+                      <Plus className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                <input
+                  type="number"
+                  min={1}
+                  value={recQty}
+                  onChange={(e) => setRecQty(Number(e.target.value))}
+                  placeholder="Soni"
+                  className="h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono"
+                />
+                <input
+                  type="number"
+                  min={0}
+                  value={recPrice}
+                  onChange={(e) => setRecPrice(Number(e.target.value))}
+                  placeholder="Kelish narxi"
+                  className="h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono"
+                />
+                <button
+                  type="button"
+                  disabled={!recVariantId}
+                  onClick={addReceivingItem}
+                  className="col-span-2 sm:col-span-1 h-10 rounded-lg bg-slate-900 dark:bg-slate-700 text-white text-xs font-semibold disabled:opacity-40"
+                >
+                  + Qo'shish
+                </button>
+              </div>
+            </div>
+            {recCategoryId !== 'all' && receivingFilteredVariants.length === 0 && (
+              <div className="flex items-center justify-between rounded-lg bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 px-3 py-2 text-[11px] text-slate-500">
+                <span>Tanlangan kategoriyada mahsulotlar hali mavjud emas.</span>
+                <button
+                  type="button"
+                  onClick={() => handleRecCategoryChange('all')}
+                  className="text-teal-700 dark:text-teal-400 font-semibold hover:underline"
+                >
+                  {t.inventory.allCategoriesFilter}
+                </button>
+              </div>
+            )}
             {recItems.length > 0 && (
               <div className="border border-slate-200 dark:border-slate-800 rounded-xl divide-y divide-slate-100 dark:divide-slate-800 text-xs">
                 {recItems.map((it, i) => (
@@ -848,6 +1076,7 @@ export const InventoryPage: React.FC = () => {
                   number: `KIR-${String(db.purchaseReceipts.length + 19).padStart(3, '0')}`,
                   supplierId: recSupplierId,
                   warehouseId: recWarehouseId,
+                  categoryId: recCategoryId !== 'all' ? recCategoryId : undefined,
                   items: recItems,
                   totalAmount,
                   paidAmount: recPaid,
@@ -861,6 +1090,248 @@ export const InventoryPage: React.FC = () => {
             >
               Kirimni saqlash
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* Create / Edit / Delete Category Modal inside Receiving */}
+      {catModalOpen && (
+        <div className="fixed inset-0 z-[60] bg-black/55 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-md max-h-[86vh] overflow-y-auto bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 space-y-4 shadow-2xl text-xs">
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <FolderCog className="w-4 h-4 text-teal-700 dark:text-teal-400" />
+                <h3 className="font-display text-base font-bold">{t.inventory.createCategoryTitle}</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setCatModalOpen(false);
+                  setEditingCat(null);
+                  setDeleteCatConfirm(null);
+                  setCatError('');
+                }}
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* New Category Creation Form */}
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                setCatError('');
+                const cleanUz = catNameUz.trim();
+                if (!cleanUz) {
+                  setCatError(language === 'ru' ? 'Введите название категории' : 'Kategoriya nomini kiriting');
+                  return;
+                }
+                const cleanRu = catNameRu.trim() || cleanUz;
+                const nowIso = new Date().toISOString();
+                const newId = uid('cat');
+                const wh = db.warehouses.find((w) => w.id === recWarehouseId);
+                const res = await upsertCategory({
+                  id: newId,
+                  nameUz: cleanUz,
+                  nameRu: cleanRu,
+                  sortOrder: db.categories.length + 1,
+                  storeId: wh?.storeId ?? db.stores[0]?.id ?? 'store-chilonzor',
+                  createdAt: nowIso,
+                  updatedAt: nowIso,
+                  createdBy: currentUser?.id ?? 'system',
+                });
+                if (!res.ok) {
+                  setCatError(res.error || t.inventory.categoryDuplicateError);
+                  return;
+                }
+                handleRecCategoryChange(newId);
+                setCatNameUz('');
+                setCatNameRu('');
+                setCatModalOpen(false);
+                notify(`"${cleanUz}" kategoriyasi yaratildi`, 'success');
+              }}
+              className="space-y-3"
+            >
+              <div>
+                <label className="block text-slate-600 dark:text-slate-300 font-medium mb-1">
+                  {t.inventory.categoryNameLabel} *
+                </label>
+                <input
+                  autoFocus
+                  value={catNameUz}
+                  onChange={(e) => {
+                    setCatNameUz(e.target.value);
+                    if (catError) setCatError('');
+                  }}
+                  placeholder="Masalan: Sport kiyimlar"
+                  className="w-full h-10 px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs focus:outline-none focus:ring-2 focus:ring-teal-600"
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-500 font-medium mb-1">
+                  {t.inventory.categoryNameRuLabel}
+                </label>
+                <input
+                  value={catNameRu}
+                  onChange={(e) => setCatNameRu(e.target.value)}
+                  placeholder="Спортивная одежда"
+                  className="w-full h-10 px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs focus:outline-none focus:ring-2 focus:ring-teal-600"
+                />
+              </div>
+
+              {catError && (
+                <div className="rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900 px-3 py-2 text-red-600 dark:text-red-400 font-medium">
+                  {catError}
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCatModalOpen(false);
+                    setEditingCat(null);
+                    setDeleteCatConfirm(null);
+                    setCatError('');
+                  }}
+                  className="h-10 px-4 rounded-xl border border-slate-200 dark:border-slate-700 font-medium"
+                >
+                  {t.common.cancel}
+                </button>
+                <button
+                  type="submit"
+                  className="h-10 px-5 rounded-xl bg-teal-700 hover:bg-teal-800 text-white font-semibold"
+                >
+                  {t.common.save}
+                </button>
+              </div>
+            </form>
+
+            {/* Manage Existing Categories (Edit & Delete with usage warning) */}
+            <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-2">
+              <div className="font-semibold text-slate-600 dark:text-slate-300">
+                {t.inventory.manageCategories} ({db.categories.length})
+              </div>
+
+              {deleteCatConfirm && (
+                <div className="rounded-xl border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/50 p-3 space-y-2">
+                  <div className="flex items-start gap-2 text-amber-900 dark:text-amber-200">
+                    <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+                    <div>
+                      <div className="font-bold">"{deleteCatConfirm.nameUz}"</div>
+                      <p className="mt-0.5 leading-relaxed">
+                        {isCategoryUsed(deleteCatConfirm.id)
+                          ? t.inventory.categoryUsedDeleteWarning
+                          : "Ushbu kategoriyani o'chirmoqchimisiz?"}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setDeleteCatConfirm(null)}
+                      className="h-8 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 font-medium"
+                    >
+                      {t.common.cancel}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const res = await deleteCategory(deleteCatConfirm.id);
+                        if (!res.ok) {
+                          notify(res.error || "O'chirib bo'lmadi", 'error');
+                        } else {
+                          if (recCategoryId === deleteCatConfirm.id) {
+                            handleRecCategoryChange('all');
+                          }
+                          notify(`"${deleteCatConfirm.nameUz}" o'chirildi`, 'info');
+                        }
+                        setDeleteCatConfirm(null);
+                      }}
+                      className="h-8 px-3 rounded-lg bg-red-600 hover:bg-red-700 text-white font-semibold"
+                    >
+                      {t.common.delete}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="divide-y divide-slate-100 dark:divide-slate-800 border border-slate-200 dark:border-slate-800 rounded-xl max-h-56 overflow-y-auto">
+                {db.categories.map((c) => {
+                  const isEditing = editingCat?.id === c.id;
+                  const used = isCategoryUsed(c.id);
+                  return (
+                    <div key={c.id} className="p-2.5 flex items-center justify-between gap-2">
+                      {isEditing ? (
+                        <div className="flex-1 flex gap-1.5">
+                          <input
+                            value={editingCat.nameUz}
+                            onChange={(e) =>
+                              setEditingCat({ ...editingCat, nameUz: e.target.value, nameRu: e.target.value })
+                            }
+                            className="flex-1 h-8 px-2.5 rounded-lg border border-teal-500 bg-white dark:bg-slate-950"
+                            autoFocus
+                          />
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const res = await upsertCategory({
+                                ...editingCat,
+                                nameUz: editingCat.nameUz.trim(),
+                                nameRu: editingCat.nameRu.trim() || editingCat.nameUz.trim(),
+                              });
+                              if (!res.ok) {
+                                notify(res.error || t.inventory.categoryDuplicateError, 'error');
+                                return;
+                              }
+                              setEditingCat(null);
+                              notify('Kategoriya yangilandi', 'success');
+                            }}
+                            className="h-8 px-2.5 rounded-lg bg-teal-700 text-white font-semibold"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="min-w-0">
+                            <div className="font-semibold text-slate-900 dark:text-white truncate">
+                              {language === 'ru' ? c.nameRu : c.nameUz}
+                            </div>
+                            {used && (
+                              <div className="text-[10px] text-slate-400">
+                                Mahsulot yoki hujjatlarda ishlatilgan
+                              </div>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => setEditingCat(structuredClone(c))}
+                              title={t.common.edit}
+                              className="w-8 h-8 rounded-lg border border-slate-200 dark:border-slate-700 inline-flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+                            >
+                              <Edit3 className="w-3.5 h-3.5" />
+                            </button>
+                            {db.categories.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={() => setDeleteCatConfirm(c)}
+                                title={t.common.delete}
+                                className="w-8 h-8 rounded-lg border border-slate-200 dark:border-slate-700 inline-flex items-center justify-center text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -983,42 +1454,401 @@ export const InventoryPage: React.FC = () => {
         </div>
       )}
 
-      {/* Supplier Modal */}
+      {/* Supplier Modal (shared by Suppliers tab and Receiving "+" button) */}
       {supModalOpen && (
-        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="w-full max-w-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 space-y-3">
-            <div className="flex items-center justify-between">
-              <h3 className="font-display text-base font-bold">{t.inventory.newSupplier}</h3>
+        <div className="fixed inset-0 z-[60] bg-black/55 backdrop-blur-xs flex items-center justify-center p-4">
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              setSupError('');
+              const cleanName = supName.trim();
+              if (!cleanName) {
+                setSupError("Ta'minotchi nomini kiriting");
+                return;
+              }
+              const duplicate = db.suppliers.find(
+                (s) => s.name.trim().toLowerCase() === cleanName.toLowerCase()
+              );
+              if (duplicate) {
+                setSupError("Bu nomdagi ta'minotchi allaqachon mavjud");
+                return;
+              }
+              const nowIso = new Date().toISOString();
+              const newSupId = uid('sup');
+              const wh = db.warehouses.find((w) => w.id === recWarehouseId);
+              await upsertSupplier({
+                id: newSupId,
+                name: cleanName,
+                contactName: supContact.trim(),
+                phone: supPhone.trim(),
+                debtBalance: 0,
+                storeId: wh?.storeId ?? db.stores[0]?.id ?? 'store-chilonzor',
+                createdAt: nowIso,
+                updatedAt: nowIso,
+                createdBy: currentUser?.id ?? 'system',
+              });
+              if (recOpen) {
+                setRecSupplierId(newSupId);
+              }
+              notify(`"${cleanName}" ta'minotchisi qo'shildi`, 'success');
+              setSupModalOpen(false);
+              setSupName('');
+              setSupContact('');
+              setSupPhone('+99890');
+            }}
+            className="w-full max-w-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 space-y-3 shadow-2xl text-xs"
+          >
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <Truck className="w-4 h-4 text-teal-700 dark:text-teal-400" />
+                <h3 className="font-display text-base font-bold">{t.inventory.newSupplier}</h3>
+              </div>
               <button type="button" onClick={() => setSupModalOpen(false)}><X className="w-4 h-4" /></button>
             </div>
-            <input value={supName} onChange={(e) => setSupName(e.target.value)} placeholder="Kompaniya nomi" className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs" />
-            <input value={supContact} onChange={(e) => setSupContact(e.target.value)} placeholder="Mas'ul shaxs" className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs" />
-            <input value={supPhone} onChange={(e) => setSupPhone(e.target.value)} placeholder="Telefon" className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono" />
-            <button
-              type="button"
-              onClick={async () => {
-                if (!supName.trim()) return;
-                const nowIso = new Date().toISOString();
-                await upsertSupplier({
-                  id: uid('sup'),
-                  name: supName.trim(),
-                  contactName: supContact.trim(),
-                  phone: supPhone.trim(),
-                  debtBalance: 0,
-                  storeId: db.stores[0].id,
-                  createdAt: nowIso,
-                  updatedAt: nowIso,
-                  createdBy: 'usr-owner',
-                });
-                notify("Ta'minotchi qo'shildi", 'success');
-                setSupModalOpen(false);
-                setSupName('');
+            <input
+              autoFocus
+              value={supName}
+              onChange={(e) => {
+                setSupName(e.target.value);
+                if (supError) setSupError('');
               }}
-              className="w-full h-10 rounded-lg bg-teal-700 text-white text-xs font-semibold"
-            >
-              {t.common.save}
-            </button>
-          </div>
+              placeholder="Kompaniya yoki shaxs nomi *"
+              className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+            />
+            <input
+              value={supContact}
+              onChange={(e) => setSupContact(e.target.value)}
+              placeholder="Mas'ul shaxs"
+              className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+            />
+            <input
+              value={supPhone}
+              onChange={(e) => setSupPhone(e.target.value)}
+              placeholder="Telefon (+99890...)"
+              className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono"
+            />
+            {supError && (
+              <div className="rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900 px-3 py-2 text-red-600 dark:text-red-400 font-medium">
+                {supError}
+              </div>
+            )}
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setSupModalOpen(false)}
+                className="h-10 px-4 rounded-lg border border-slate-200 dark:border-slate-700 font-medium"
+              >
+                {t.common.cancel}
+              </button>
+              <button
+                type="submit"
+                className="h-10 px-5 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-xs font-semibold"
+              >
+                {t.common.save}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Quick Warehouse Modal inside Receiving */}
+      {whQuickOpen && (
+        <div className="fixed inset-0 z-[60] bg-black/55 backdrop-blur-xs flex items-center justify-center p-4">
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              setWhError('');
+              const cleanName = whName.trim();
+              if (!cleanName) {
+                setWhError('Ombor nomini kiriting');
+                return;
+              }
+              const duplicate = db.warehouses.find(
+                (w) => w.name.trim().toLowerCase() === cleanName.toLowerCase()
+              );
+              if (duplicate) {
+                setWhError('Bu nomdagi ombor allaqachon mavjud');
+                return;
+              }
+              const nowIso = new Date().toISOString();
+              const newWhId = uid('wh');
+              const targetStoreId = whStoreId || db.stores[0]?.id || 'store-chilonzor';
+              await upsertWarehouse({
+                id: newWhId,
+                name: cleanName,
+                address: whAddress.trim(),
+                isMain: false,
+                storeId: targetStoreId,
+                createdAt: nowIso,
+                updatedAt: nowIso,
+                createdBy: currentUser?.id ?? 'system',
+              });
+              setRecWarehouseId(newWhId);
+              setWhQuickOpen(false);
+              setWhName('');
+              setWhAddress('');
+              notify(`"${cleanName}" ombori qo'shildi`, 'success');
+            }}
+            className="w-full max-w-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 space-y-3 shadow-2xl text-xs"
+          >
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <WarehouseIcon className="w-4 h-4 text-teal-700 dark:text-teal-400" />
+                <h3 className="font-display text-base font-bold">Yangi ombor</h3>
+              </div>
+              <button type="button" onClick={() => setWhQuickOpen(false)}><X className="w-4 h-4" /></button>
+            </div>
+            <div>
+              <label className="block text-slate-500 mb-1 font-medium">Ombor nomi *</label>
+              <input
+                autoFocus
+                value={whName}
+                onChange={(e) => {
+                  setWhName(e.target.value);
+                  if (whError) setWhError('');
+                }}
+                placeholder="Masalan: Yunusobod ombori"
+                className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+              />
+            </div>
+            <div>
+              <label className="block text-slate-500 mb-1 font-medium">Manzil</label>
+              <input
+                value={whAddress}
+                onChange={(e) => setWhAddress(e.target.value)}
+                placeholder="Tuman, ko'cha..."
+                className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+              />
+            </div>
+            <div>
+              <label className="block text-slate-500 mb-1 font-medium">Biriktirilgan filial</label>
+              <select
+                value={whStoreId}
+                onChange={(e) => setWhStoreId(e.target.value)}
+                className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+              >
+                {db.stores.map((s) => (
+                  <option key={s.id} value={s.id}>{s.name}</option>
+                ))}
+              </select>
+            </div>
+            {whError && (
+              <div className="rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900 px-3 py-2 text-red-600 dark:text-red-400 font-medium">
+                {whError}
+              </div>
+            )}
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setWhQuickOpen(false)}
+                className="h-10 px-4 rounded-lg border border-slate-200 dark:border-slate-700 font-medium"
+              >
+                {t.common.cancel}
+              </button>
+              <button
+                type="submit"
+                className="h-10 px-5 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-xs font-semibold"
+              >
+                {t.common.save}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Quick Product & Variant Modal inside Receiving */}
+      {prodQuickOpen && (
+        <div className="fixed inset-0 z-[60] bg-black/55 backdrop-blur-xs flex items-center justify-center p-4">
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              setProdError('');
+              const cleanName = prodName.trim();
+              if (!cleanName) {
+                setProdError('Mahsulot nomini kiriting');
+                return;
+              }
+              const targetCatId = prodCategoryId || db.categories[0]?.id || 'cat-shirts';
+              const duplicate = db.products.find(
+                (p) => p.name.trim().toLowerCase() === cleanName.toLowerCase()
+              );
+              if (duplicate) {
+                setProdError('Bu nomdagi mahsulot katalogda allaqachon mavjud');
+                return;
+              }
+              const nowIso = new Date().toISOString();
+              const newProdId = uid('prod');
+              const newVarId = uid('var');
+              const wh = db.warehouses.find((w) => w.id === recWarehouseId);
+              const storeId = wh?.storeId ?? db.stores[0]?.id ?? 'store-chilonzor';
+              const skuPrefix = cleanName
+                .replace(/[^a-zA-Z0-9]/g, '')
+                .toUpperCase()
+                .slice(0, 4) || 'SHU';
+              const sku = `${skuPrefix}-${String(Date.now()).slice(-4)}`;
+              const buyPrice = Math.max(0, Number(prodPurchasePrice) || 0);
+              const sellPrice = Math.max(0, Number(prodRetailPrice) || buyPrice);
+
+              await upsertProduct({
+                id: newProdId,
+                name: cleanName,
+                categoryId: targetCatId,
+                unit: prodUnit,
+                supplierId: recSupplierId || undefined,
+                tags: [],
+                isPublishedOnline: true,
+                variants: [
+                  {
+                    id: newVarId,
+                    productId: newProdId,
+                    sku,
+                    ...(prodSize.trim() ? { size: prodSize.trim() } : {}),
+                    ...(prodColor.trim() ? { color: prodColor.trim() } : {}),
+                    purchasePrice: buyPrice,
+                    retailPrice: sellPrice,
+                    wholesalePrice: Math.round(sellPrice * 0.9),
+                    minStock: 3,
+                    barcodes: [generateEAN13()],
+                    storeId,
+                    createdAt: nowIso,
+                    updatedAt: nowIso,
+                    createdBy: currentUser?.id ?? 'system',
+                  },
+                ],
+                storeId,
+                createdAt: nowIso,
+                updatedAt: nowIso,
+                createdBy: currentUser?.id ?? 'system',
+              });
+
+              if (recCategoryId !== 'all' && recCategoryId !== targetCatId) {
+                setRecCategoryId(targetCatId);
+              }
+              setRecVariantId(newVarId);
+              setRecPrice(buyPrice);
+              setProdQuickOpen(false);
+              setProdName('');
+              notify(`"${cleanName}" katalogga qo'shildi`, 'success');
+            }}
+            className="w-full max-w-md max-h-[88vh] overflow-y-auto bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 space-y-3 shadow-2xl text-xs"
+          >
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <PackagePlus className="w-4 h-4 text-teal-700 dark:text-teal-400" />
+                <h3 className="font-display text-base font-bold">Yangi mahsulot qo'shish</h3>
+              </div>
+              <button type="button" onClick={() => setProdQuickOpen(false)}><X className="w-4 h-4" /></button>
+            </div>
+
+            <div>
+              <label className="block text-slate-500 mb-1 font-medium">Mahsulot nomi *</label>
+              <input
+                autoFocus
+                value={prodName}
+                onChange={(e) => {
+                  setProdName(e.target.value);
+                  if (prodError) setProdError('');
+                }}
+                placeholder="Masalan: Klassik Polo Futbolka"
+                className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-slate-500 mb-1 font-medium">{t.inventory.category}</label>
+                <select
+                  value={prodCategoryId}
+                  onChange={(e) => setProdCategoryId(e.target.value)}
+                  className="w-full h-10 px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+                >
+                  {db.categories.map((c) => (
+                    <option key={c.id} value={c.id}>{language === 'ru' ? c.nameRu : c.nameUz}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-slate-500 mb-1 font-medium">O'lchov birligi</label>
+                <select
+                  value={prodUnit}
+                  onChange={(e) => setProdUnit(e.target.value as Product['unit'])}
+                  className="w-full h-10 px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+                >
+                  <option value="dona">dona</option>
+                  <option value="juft">juft</option>
+                  <option value="quti">quti</option>
+                  <option value="kg">kg</option>
+                  <option value="metr">metr</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-slate-500 mb-1 font-medium">O'lcham</label>
+                <input
+                  value={prodSize}
+                  onChange={(e) => setProdSize(e.target.value)}
+                  placeholder="L, XL, 42..."
+                  className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+                />
+              </div>
+              <div>
+                <label className="block text-slate-500 mb-1 font-medium">Rang</label>
+                <input
+                  value={prodColor}
+                  onChange={(e) => setProdColor(e.target.value)}
+                  placeholder="Qora, Oq..."
+                  className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-slate-500 mb-1 font-medium">Kelish narxi (so'm)</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={prodPurchasePrice}
+                  onChange={(e) => setProdPurchasePrice(Number(e.target.value))}
+                  className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-slate-500 mb-1 font-medium">Sotuv narxi (so'm)</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={prodRetailPrice}
+                  onChange={(e) => setProdRetailPrice(Number(e.target.value))}
+                  className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono"
+                />
+              </div>
+            </div>
+
+            {prodError && (
+              <div className="rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900 px-3 py-2 text-red-600 dark:text-red-400 font-medium">
+                {prodError}
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setProdQuickOpen(false)}
+                className="h-10 px-4 rounded-lg border border-slate-200 dark:border-slate-700 font-medium"
+              >
+                {t.common.cancel}
+              </button>
+              <button
+                type="submit"
+                className="h-10 px-5 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-xs font-semibold"
+              >
+                {t.common.save}
+              </button>
+            </div>
+          </form>
         </div>
       )}
 

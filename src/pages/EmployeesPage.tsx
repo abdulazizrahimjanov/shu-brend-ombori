@@ -1,8 +1,8 @@
 import React, { useMemo, useState } from 'react';
-import { UserPlus, Download, X, Edit3, Trash2, ShieldCheck, KeyRound, Eye, EyeOff } from 'lucide-react';
+import { UserPlus, Download, X, Edit3, Trash2, ShieldCheck, KeyRound, Eye, EyeOff, Plus, Check } from 'lucide-react';
 import { useAppStore, uid } from '../store/useAppStore';
 import { formatDateTime, formatMoney, useT } from '../i18n';
-import { Employee, Permission, RoleId } from '../types/models';
+import { Employee, Permission, Role, RoleId } from '../types/models';
 import { exportToExcel } from '../utils/export';
 
 const PERMISSION_GROUPS: { title: string; items: { id: Permission; label: string }[] }[] = [
@@ -60,27 +60,39 @@ export const EmployeesPage: React.FC = () => {
   const upsertEmployee = useAppStore((s) => s.upsertEmployee);
   const deleteEmployee = useAppStore((s) => s.deleteEmployee);
   const upsertTarget = useAppStore((s) => s.upsertTarget);
+  const upsertRole = useAppStore((s) => s.upsertRole);
+  const deleteRole = useAppStore((s) => s.deleteRole);
   const notify = useAppStore((s) => s.notify);
   const t = useT();
 
   const canManage = can('manage_employees');
+  const canManageRoles = can('manage_employees') || can('manage_settings');
   const [modalOpen, setModalOpen] = useState(false);
   const [editingEmp, setEditingEmp] = useState<Employee | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Employee | null>(null);
 
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('+99890');
+  const [googleEmail, setGoogleEmail] = useState('');
   const [roleId, setRoleId] = useState<RoleId>('cashier');
   const [assignedStoreIds, setAssignedStoreIds] = useState<string[]>([]);
   const [baseSalary, setBaseSalary] = useState(3500000);
   const [commissionPct, setCommissionPct] = useState(1.5);
   const [schedule, setSchedule] = useState('2/2 smena, 09:00–21:00');
   const [pin, setPin] = useState('6666');
-  const [password, setPassword] = useState('123456');
+  const [password, setPassword] = useState('');
   const [showPass, setShowPass] = useState(false);
 
   const [useCustomPerms, setUseCustomPerms] = useState(false);
   const [customPerms, setCustomPerms] = useState<Permission[]>([]);
+
+  // Quick Role Create / Edit / Delete Modal
+  const [roleModalOpen, setRoleModalOpen] = useState(false);
+  const [newRoleName, setNewRoleName] = useState('');
+  const [newRolePerms, setNewRolePerms] = useState<Permission[]>(['use_pos', 'view_catalog']);
+  const [roleError, setRoleError] = useState('');
+  const [editingRole, setEditingRole] = useState<Role | null>(null);
+  const [deleteRoleConfirm, setDeleteRoleConfirm] = useState<Role | null>(null);
 
   const payrollRows = useMemo(() => {
     if (!db) return [];
@@ -115,13 +127,14 @@ export const EmployeesPage: React.FC = () => {
     setEditingEmp(null);
     setName('');
     setPhone('+99890');
+    setGoogleEmail('');
     setRoleId('cashier');
     setAssignedStoreIds(db.stores[0] ? [db.stores[0].id] : []);
     setBaseSalary(3500000);
     setCommissionPct(1.5);
     setSchedule('2/2 smena, 09:00–21:00');
     setPin(String(Math.floor(1000 + Math.random() * 8999)));
-    setPassword('123456');
+    setPassword('');
     setUseCustomPerms(false);
     const defaultRolePerms = db.roles.find((r) => r.id === 'cashier')?.permissions ?? ['use_pos', 'view_catalog'];
     setCustomPerms(defaultRolePerms);
@@ -134,13 +147,14 @@ export const EmployeesPage: React.FC = () => {
     setEditingEmp(emp);
     setName(emp.name);
     setPhone(emp.phone);
+    setGoogleEmail(linkedUser?.googleEmail ?? '');
     setRoleId(emp.roleId);
     setAssignedStoreIds(linkedUser?.assignedStoreIds?.length ? linkedUser.assignedStoreIds : [emp.storeId]);
     setBaseSalary(emp.baseSalary);
     setCommissionPct(emp.commissionPercent);
     setSchedule(emp.schedule);
     setPin(linkedUser?.pin ?? '4444');
-    setPassword(linkedUser?.password ?? '123456');
+    setPassword('');
     const hasCustom = Array.isArray(linkedUser?.customPermissions);
     setUseCustomPerms(hasCustom);
     const rolePerms = db.roles.find((r) => r.id === emp.roleId)?.permissions ?? [];
@@ -186,14 +200,19 @@ export const EmployeesPage: React.FC = () => {
     e.preventDefault();
     if (!name.trim()) return;
     const cleanPin = pin.replace(/\D/g, '');
-    if (cleanPin.length !== 4) {
-      notify("PIN-kod aniq 4 ta raqamdan iborat bo'lishi kerak", 'error');
+    if (cleanPin.length < 4 || cleanPin.length > 6) {
+      notify("PIN-kod 4–6 ta raqamdan iborat bo'lishi kerak", 'error');
       return;
     }
     const targetUserId = editingEmp ? editingEmp.userId : uid('usr');
     const duplicatePin = db.users.find((u) => u.id !== targetUserId && u.pin === cleanPin && u.isActive);
     if (duplicatePin) {
       notify(`PIN-kod (${cleanPin}) ${duplicatePin.name} da band! Boshqa PIN tanlang.`, 'error');
+      return;
+    }
+
+    if (!editingEmp && !password.trim() && !googleEmail.trim()) {
+      notify('Kamida parol yoki Google Email kiriting', 'error');
       return;
     }
 
@@ -207,6 +226,7 @@ export const EmployeesPage: React.FC = () => {
         userId: targetUserId,
         name: name.trim(),
         phone: phone.trim(),
+        googleEmail: googleEmail.trim().toLowerCase() || undefined,
         roleId,
         baseSalary,
         commissionPercent: commissionPct,
@@ -215,11 +235,12 @@ export const EmployeesPage: React.FC = () => {
         storeId: primaryStoreId,
         createdAt: editingEmp ? editingEmp.createdAt : nowIso,
         updatedAt: nowIso,
-        createdBy: currentUser?.id ?? 'usr-owner',
+        createdBy: currentUser?.id ?? 'system',
       },
       {
         pin: cleanPin,
-        password: password.trim() || '123456',
+        googleEmail: googleEmail.trim().toLowerCase() || undefined,
+        ...(password.trim() ? { password: password.trim() } : {}),
         assignedStoreIds: assignedStoreIds.length ? assignedStoreIds : [primaryStoreId],
         ...(useCustomPerms ? { customPermissions: customPerms } : {}),
       },
@@ -236,7 +257,7 @@ export const EmployeesPage: React.FC = () => {
         storeId: primaryStoreId,
         createdAt: nowIso,
         updatedAt: nowIso,
-        createdBy: currentUser?.id ?? 'usr-owner',
+        createdBy: currentUser?.id ?? 'system',
       });
     }
 
@@ -318,6 +339,11 @@ export const EmployeesPage: React.FC = () => {
                     <div className="text-[11px] text-slate-500 font-mono">
                       {getRoleLabel(r.emp.roleId)} · {r.emp.phone}
                     </div>
+                    {(r.linkedUser?.googleEmail || r.emp.googleEmail) && (
+                      <div className="text-[10px] text-teal-700 dark:text-teal-400 font-mono truncate">
+                        {r.linkedUser?.googleEmail || r.emp.googleEmail}
+                      </div>
+                    )}
                   </td>
                   <td className="py-3 px-3 text-slate-500">
                     <div className="font-mono text-slate-700 dark:text-slate-300 flex items-center gap-1">
@@ -356,7 +382,7 @@ export const EmployeesPage: React.FC = () => {
                         >
                           <Edit3 className="w-3.5 h-3.5" />
                         </button>
-                        {r.emp.userId !== 'usr-owner' && r.emp.userId !== currentUser?.id && (
+                        {r.emp.roleId !== 'owner' && r.emp.userId !== 'usr-owner' && r.emp.userId !== currentUser?.id && (
                           <button
                             type="button"
                             onClick={() => setDeleteTarget(r.emp)}
@@ -455,26 +481,48 @@ export const EmployeesPage: React.FC = () => {
 
               <div>
                 <label className="block text-slate-500 mb-1 font-medium">Asosiy rol</label>
-                <select
-                  value={roleId}
-                  onChange={(e) => {
-                    const nextRole = e.target.value as RoleId;
-                    setRoleId(nextRole);
-                    if (!useCustomPerms) {
-                      setCustomPerms(db.roles.find((r) => r.id === nextRole)?.permissions ?? []);
-                    }
-                  }}
-                  disabled={editingEmp?.userId === 'usr-owner'}
-                  className="w-full h-10 px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
-                >
-                  {db.roles
-                    .filter((r) => r.id !== 'owner' || editingEmp?.userId === 'usr-owner')
-                    .map((r) => (
-                      <option key={r.id} value={r.id}>
-                        {language === 'ru' ? r.nameRu : r.nameUz}
-                      </option>
-                    ))}
-                </select>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={roleId}
+                    onChange={(e) => {
+                      const nextRole = e.target.value as RoleId;
+                      setRoleId(nextRole);
+                      if (!useCustomPerms) {
+                        setCustomPerms(db.roles.find((r) => r.id === nextRole)?.permissions ?? []);
+                      }
+                    }}
+                    disabled={editingEmp?.roleId === 'owner' || editingEmp?.userId === 'usr-owner'}
+                    className="flex-1 min-w-0 h-10 px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs"
+                  >
+                    {db.roles
+                      .filter((r) => r.id !== 'owner' || editingEmp?.roleId === 'owner' || editingEmp?.userId === 'usr-owner')
+                      .map((r) => (
+                        <option key={r.id} value={r.id}>
+                          {language === 'ru' ? r.nameRu : r.nameUz}
+                        </option>
+                      ))}
+                  </select>
+                  {canManageRoles &&
+                    editingEmp?.roleId !== 'owner' &&
+                    editingEmp?.userId !== 'usr-owner' && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setNewRoleName('');
+                          setNewRolePerms(['use_pos', 'view_catalog', 'view_customers', 'manage_customers']);
+                          setRoleError('');
+                          setEditingRole(null);
+                          setDeleteRoleConfirm(null);
+                          setRoleModalOpen(true);
+                        }}
+                        title="Yangi rol yaratish"
+                        aria-label="Yangi rol yaratish"
+                        className="w-10 h-10 shrink-0 rounded-lg bg-teal-700 hover:bg-teal-800 text-white flex items-center justify-center transition-colors"
+                      >
+                        <Plus className="w-4 h-4" />
+                      </button>
+                    )}
+                </div>
               </div>
 
               <div>
@@ -486,6 +534,19 @@ export const EmployeesPage: React.FC = () => {
                 />
               </div>
 
+              <div className="sm:col-span-2">
+                <label className="block text-slate-500 mb-1 font-medium">
+                  Google Email (bulutli sinxronlash uchun)
+                </label>
+                <input
+                  type="email"
+                  value={googleEmail}
+                  onChange={(e) => setGoogleEmail(e.target.value)}
+                  placeholder="xodim@gmail.com"
+                  className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono"
+                />
+              </div>
+
               <div>
                 <label className="block text-slate-500 mb-1 font-medium">Kirish paroli</label>
                 <div className="relative">
@@ -493,6 +554,7 @@ export const EmployeesPage: React.FC = () => {
                     type={showPass ? 'text' : 'password'}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
+                    placeholder={editingEmp ? "O'zgartirmaslik uchun bo'sh qoldiring" : 'Kamida 4 ta belgi'}
                     className="w-full h-10 pl-3 pr-9 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono"
                   />
                   <button
@@ -506,12 +568,12 @@ export const EmployeesPage: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-slate-500 mb-1 font-medium">4-xonali PIN-kod</label>
+                <label className="block text-slate-500 mb-1 font-medium">PIN-kod (4–6 raqam)</label>
                 <input
-                  maxLength={4}
+                  maxLength={6}
                   inputMode="numeric"
                   value={pin}
-                  onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                  onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
                   className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono tracking-widest text-center"
                 />
               </div>
@@ -628,7 +690,7 @@ export const EmployeesPage: React.FC = () => {
                           <input
                             type="checkbox"
                             checked={checked}
-                            disabled={editingEmp?.userId === 'usr-owner'}
+                            disabled={editingEmp?.roleId === 'owner' || editingEmp?.userId === 'usr-owner'}
                             onChange={() => togglePerm(item.id)}
                           />
                           <span>{item.label}</span>
@@ -656,6 +718,281 @@ export const EmployeesPage: React.FC = () => {
               </button>
             </div>
           </form>
+        </div>
+      )}
+
+      {/* Create / Edit / Delete Role Modal inside Employee Modal */}
+      {roleModalOpen && (
+        <div className="fixed inset-0 z-[60] bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="w-full max-w-lg max-h-[88vh] overflow-y-auto bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 space-y-4 shadow-2xl text-xs">
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-teal-700 dark:text-teal-400" />
+                <h3 className="font-display text-base font-bold">Yangi rol yaratish</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setRoleModalOpen(false);
+                  setEditingRole(null);
+                  setDeleteRoleConfirm(null);
+                  setRoleError('');
+                }}
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                setRoleError('');
+                const cleanName = newRoleName.trim();
+                if (!cleanName) {
+                  setRoleError('Rol nomini kiriting (masalan: Aziz ishchi)');
+                  return;
+                }
+                const newRoleId: RoleId = `role-${Date.now().toString(36)}`;
+                const newRole: Role = {
+                  id: newRoleId,
+                  nameUz: cleanName,
+                  nameRu: cleanName,
+                  permissions: newRolePerms,
+                };
+                const res = await upsertRole(newRole);
+                if (!res.ok) {
+                  setRoleError(res.error || 'Rolni saqlashda xatolik');
+                  return;
+                }
+                setRoleId(newRoleId);
+                setUseCustomPerms(false);
+                setCustomPerms(newRolePerms);
+                setNewRoleName('');
+                setRoleModalOpen(false);
+                notify(`"${cleanName}" roli yaratildi va tanlandi`, 'success');
+              }}
+              className="space-y-3"
+            >
+              <div>
+                <label className="block text-slate-600 dark:text-slate-300 font-medium mb-1">
+                  Rol nomi *
+                </label>
+                <input
+                  autoFocus
+                  value={newRoleName}
+                  onChange={(e) => {
+                    setNewRoleName(e.target.value);
+                    if (roleError) setRoleError('');
+                  }}
+                  placeholder="Masalan: Aziz ishchi"
+                  className="w-full h-10 px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs focus:outline-none focus:ring-2 focus:ring-teal-600"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex flex-wrap items-center justify-between gap-1.5">
+                  <span className="font-medium text-slate-600 dark:text-slate-300">Huquqlar shabloni</span>
+                  <div className="flex flex-wrap gap-1">
+                    <button
+                      type="button"
+                      onClick={() => setNewRolePerms(['use_pos', 'view_catalog', 'view_customers', 'manage_customers'])}
+                      className="px-2 py-1 rounded-md border border-slate-200 dark:border-slate-700 text-[11px]"
+                    >
+                      Kassir
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setNewRolePerms(['view_catalog', 'edit_catalog', 'view_inventory', 'manage_inventory', 'manage_online_orders'])}
+                      className="px-2 py-1 rounded-md border border-slate-200 dark:border-slate-700 text-[11px]"
+                    >
+                      Omborchi
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setNewRolePerms(['view_dashboard', 'use_pos', 'process_returns', 'manage_shifts', 'view_catalog', 'edit_catalog', 'view_inventory', 'manage_inventory', 'view_customers', 'manage_customers', 'manage_debts', 'view_reports'])}
+                      className="px-2 py-1 rounded-md border border-slate-200 dark:border-slate-700 text-[11px]"
+                    >
+                      Menejer
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setNewRolePerms([...ALL_PERMISSIONS])}
+                      className="px-2 py-1 rounded-md border border-slate-200 dark:border-slate-700 text-[11px]"
+                    >
+                      To'liq
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-h-44 overflow-y-auto p-3 rounded-xl bg-slate-50 dark:bg-slate-950/60 border border-slate-200/80 dark:border-slate-800">
+                  {PERMISSION_GROUPS.map((grp) => (
+                    <div key={grp.title} className="space-y-1">
+                      <div className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">{grp.title}</div>
+                      {grp.items.map((item) => (
+                        <label key={item.id} className="flex items-center gap-2 py-0.5 cursor-pointer text-slate-700 dark:text-slate-300">
+                          <input
+                            type="checkbox"
+                            checked={newRolePerms.includes(item.id)}
+                            onChange={() =>
+                              setNewRolePerms((prev) =>
+                                prev.includes(item.id) ? prev.filter((p) => p !== item.id) : [...prev, item.id]
+                              )
+                            }
+                          />
+                          <span>{item.label}</span>
+                        </label>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {roleError && (
+                <div className="rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900 px-3 py-2 text-red-600 dark:text-red-400 font-medium">
+                  {roleError}
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setRoleModalOpen(false)}
+                  className="h-10 px-4 rounded-xl border border-slate-200 dark:border-slate-700 font-medium"
+                >
+                  {t.common.cancel}
+                </button>
+                <button
+                  type="submit"
+                  className="h-10 px-5 rounded-xl bg-teal-700 hover:bg-teal-800 text-white font-semibold"
+                >
+                  {t.common.save}
+                </button>
+              </div>
+            </form>
+
+            {/* Manage existing roles (edit name / delete non-owner roles) */}
+            <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-2">
+              <div className="font-semibold text-slate-600 dark:text-slate-300">
+                Mavjud rollar ({db.roles.length})
+              </div>
+
+              {deleteRoleConfirm && (
+                <div className="rounded-xl border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/50 p-3 space-y-2">
+                  <div className="font-bold text-amber-900 dark:text-amber-200">
+                    "{deleteRoleConfirm.nameUz}" rolini o'chirmoqchimisiz?
+                  </div>
+                  <p className="text-amber-800 dark:text-amber-300">
+                    {db.employees.some((e) => e.roleId === deleteRoleConfirm.id)
+                      ? "Bu rol xodimlarga biriktirilgan — o'chirilsa ular avtomatik boshqa rolga o'tkaziladi."
+                      : "Ushbu rol tizimdan o'chiriladi."}
+                  </p>
+                  <div className="flex justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setDeleteRoleConfirm(null)}
+                      className="h-8 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 font-medium"
+                    >
+                      {t.common.cancel}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const res = await deleteRole(deleteRoleConfirm.id);
+                        if (!res.ok) {
+                          notify(res.error || "O'chirib bo'lmadi", 'error');
+                        } else {
+                          if (roleId === deleteRoleConfirm.id) {
+                            const fallback = db.roles.find((r) => r.id === 'cashier' && r.id !== deleteRoleConfirm.id)?.id ?? 'cashier';
+                            setRoleId(fallback);
+                          }
+                          notify(`"${deleteRoleConfirm.nameUz}" roli o'chirildi`, 'info');
+                        }
+                        setDeleteRoleConfirm(null);
+                      }}
+                      className="h-8 px-3 rounded-lg bg-red-600 hover:bg-red-700 text-white font-semibold"
+                    >
+                      {t.common.delete}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="divide-y divide-slate-100 dark:divide-slate-800 border border-slate-200 dark:border-slate-800 rounded-xl max-h-44 overflow-y-auto">
+                {db.roles
+                  .filter((r) => r.id !== 'owner')
+                  .map((r) => {
+                    const isEditing = editingRole?.id === r.id;
+                    const empCount = db.employees.filter((e) => e.roleId === r.id).length;
+                    return (
+                      <div key={r.id} className="p-2.5 flex items-center justify-between gap-2">
+                        {isEditing ? (
+                          <div className="flex-1 flex gap-1.5">
+                            <input
+                              value={editingRole.nameUz}
+                              onChange={(e) =>
+                                setEditingRole({ ...editingRole, nameUz: e.target.value, nameRu: e.target.value })
+                              }
+                              className="flex-1 h-8 px-2.5 rounded-lg border border-teal-500 bg-white dark:bg-slate-950"
+                              autoFocus
+                            />
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                const res = await upsertRole({
+                                  ...editingRole,
+                                  nameUz: editingRole.nameUz.trim(),
+                                  nameRu: editingRole.nameRu.trim() || editingRole.nameUz.trim(),
+                                });
+                                if (!res.ok) {
+                                  notify(res.error || 'Saqlashda xatolik', 'error');
+                                  return;
+                                }
+                                setEditingRole(null);
+                                notify('Rol nomi yangilandi', 'success');
+                              }}
+                              className="h-8 px-2.5 rounded-lg bg-teal-700 text-white font-semibold"
+                            >
+                              <Check className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="min-w-0">
+                              <div className="font-semibold text-slate-900 dark:text-white truncate">
+                                {language === 'ru' ? r.nameRu : r.nameUz}
+                              </div>
+                              <div className="text-[10px] text-slate-400">
+                                {r.permissions.length} ta huquq{empCount > 0 ? ` · ${empCount} ta xodim` : ''}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-1 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => setEditingRole(structuredClone(r))}
+                                title={t.common.edit}
+                                className="w-8 h-8 rounded-lg border border-slate-200 dark:border-slate-700 inline-flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+                              >
+                                <Edit3 className="w-3.5 h-3.5" />
+                              </button>
+                              {db.roles.length > 2 && (
+                                <button
+                                  type="button"
+                                  onClick={() => setDeleteRoleConfirm(r)}
+                                  title={t.common.delete}
+                                  className="w-8 h-8 rounded-lg border border-slate-200 dark:border-slate-700 inline-flex items-center justify-center text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })}
+              </div>
+            </div>
+          </div>
         </div>
       )}
 

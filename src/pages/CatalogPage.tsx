@@ -21,6 +21,7 @@ import {
   Camera,
   FolderCog,
   RotateCcw,
+  AlertTriangle,
 } from 'lucide-react';
 import { useAppStore, uid } from '../store/useAppStore';
 import { formatMoney, useT } from '../i18n';
@@ -52,6 +53,7 @@ function getColorSwatch(colorName?: string): string {
 export const CatalogPage: React.FC = () => {
   const db = useAppStore((s) => s.db);
   const can = useAppStore((s) => s.can);
+  const currentUser = useAppStore((s) => s.getCurrentUser());
   const language = useAppStore((s) => s.language);
   const activeStoreId = useAppStore((s) => s.activeStoreId);
   const getVariantStock = useAppStore((s) => s.getVariantStock);
@@ -61,6 +63,7 @@ export const CatalogPage: React.FC = () => {
   const bulkUpdatePrices = useAppStore((s) => s.bulkUpdatePrices);
   const quickAddStock = useAppStore((s) => s.quickAddStock);
   const importProducts = useAppStore((s) => s.importProducts);
+  const isCategoryUsed = useAppStore((s) => s.isCategoryUsed);
   const upsertCategory = useAppStore((s) => s.upsertCategory);
   const deleteCategory = useAppStore((s) => s.deleteCategory);
   const resetCategoriesToMensClothing = useAppStore((s) => s.resetCategoriesToMensClothing);
@@ -108,6 +111,7 @@ export const CatalogPage: React.FC = () => {
   const [catManagerOpen, setCatManagerOpen] = useState(false);
   const [newCatName, setNewCatName] = useState('');
   const [editingCat, setEditingCat] = useState<Category | null>(null);
+  const [catDeleteConfirm, setCatDeleteConfirm] = useState<Category | null>(null);
   const [inlineNewCatOpen, setInlineNewCatOpen] = useState(false);
   const [inlineNewCatName, setInlineNewCatName] = useState('');
 
@@ -194,13 +198,13 @@ export const CatalogPage: React.FC = () => {
           storeId,
           createdAt: nowIso,
           updatedAt: nowIso,
-          createdBy: 'usr-owner',
+          createdBy: currentUser?.id ?? 'system',
         },
       ],
       storeId,
       createdAt: nowIso,
       updatedAt: nowIso,
-      createdBy: 'usr-owner',
+      createdBy: currentUser?.id ?? 'system',
     });
   };
 
@@ -310,7 +314,7 @@ export const CatalogPage: React.FC = () => {
           storeId: editingProduct.storeId,
           createdAt: nowIso,
           updatedAt: nowIso,
-          createdBy: 'usr-owner',
+          createdBy: currentUser?.id ?? 'system',
         });
         nextStockMap[vId] = qty;
         addedCount += 1;
@@ -459,13 +463,13 @@ export const CatalogPage: React.FC = () => {
               storeId,
               createdAt: nowIso,
               updatedAt: nowIso,
-              createdBy: 'usr-owner',
+              createdBy: currentUser?.id ?? 'system',
             },
           ],
           storeId,
           createdAt: nowIso,
           updatedAt: nowIso,
-          createdBy: 'usr-owner',
+          createdBy: currentUser?.id ?? 'system',
         });
         if (qty > 0) {
           stocks.push({ productId: pId, variantId: vId, warehouseId: whId, qty, unitCost: purchasePrice });
@@ -1024,7 +1028,7 @@ export const CatalogPage: React.FC = () => {
                         if (!clean) return;
                         const nowIso = new Date().toISOString();
                         const newCatId = uid('cat');
-                        await upsertCategory({
+                        const res = await upsertCategory({
                           id: newCatId,
                           nameUz: clean,
                           nameRu: clean,
@@ -1032,8 +1036,12 @@ export const CatalogPage: React.FC = () => {
                           storeId: editingProduct.storeId,
                           createdAt: nowIso,
                           updatedAt: nowIso,
-                          createdBy: 'usr-owner',
+                          createdBy: currentUser?.id ?? 'system',
                         });
+                        if (!res.ok) {
+                          notify(res.error || t.inventory.categoryDuplicateError, 'error');
+                          return;
+                        }
                         setEditingProduct({ ...editingProduct, categoryId: newCatId });
                         setInlineNewCatName('');
                         setInlineNewCatOpen(false);
@@ -1339,7 +1347,7 @@ export const CatalogPage: React.FC = () => {
                         storeId: editingProduct.storeId,
                         createdAt: nowIso,
                         updatedAt: nowIso,
-                        createdBy: 'usr-owner',
+                        createdBy: currentUser?.id ?? 'system',
                       };
                       setEditingProduct({ ...editingProduct, variants: [...editingProduct.variants, v] });
                     }}
@@ -1818,7 +1826,7 @@ export const CatalogPage: React.FC = () => {
                 if (!clean) return;
                 const nowIso = new Date().toISOString();
                 const newId = uid('cat');
-                await upsertCategory({
+                const res = await upsertCategory({
                   id: newId,
                   nameUz: clean,
                   nameRu: clean,
@@ -1826,8 +1834,12 @@ export const CatalogPage: React.FC = () => {
                   storeId: activeStoreId !== 'all' ? activeStoreId : db.stores[0]?.id ?? 'store-chilonzor',
                   createdAt: nowIso,
                   updatedAt: nowIso,
-                  createdBy: 'usr-owner',
+                  createdBy: currentUser?.id ?? 'system',
                 });
+                if (!res.ok) {
+                  notify(res.error || t.inventory.categoryDuplicateError, 'error');
+                  return;
+                }
                 if (editingProduct) {
                   setEditingProduct({ ...editingProduct, categoryId: newId });
                 }
@@ -1847,9 +1859,49 @@ export const CatalogPage: React.FC = () => {
                 className="h-10 px-4 rounded-xl bg-teal-700 hover:bg-teal-800 text-white font-semibold inline-flex items-center gap-1"
               >
                 <Plus className="w-4 h-4" />
-                <span>Qo'shish</span>
+                <span>{t.common.save}</span>
               </button>
             </form>
+
+            {catDeleteConfirm && (
+              <div className="rounded-xl border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/50 p-3 space-y-2">
+                <div className="flex items-start gap-2 text-amber-900 dark:text-amber-200">
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+                  <div>
+                    <div className="font-bold">"{catDeleteConfirm.nameUz}"</div>
+                    <p className="mt-0.5 leading-relaxed">
+                      {isCategoryUsed(catDeleteConfirm.id)
+                        ? t.inventory.categoryUsedDeleteWarning
+                        : "Ushbu kategoriyani o'chirmoqchimisiz?"}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setCatDeleteConfirm(null)}
+                    className="h-8 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 font-medium"
+                  >
+                    {t.common.cancel}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const res = await deleteCategory(catDeleteConfirm.id);
+                      if (!res.ok) notify(res.error || "O'chirib bo'lmadi", 'error');
+                      else {
+                        if (categoryFilter === catDeleteConfirm.id) setCategoryFilter('all');
+                        notify(`"${catDeleteConfirm.nameUz}" o'chirildi`, 'info');
+                      }
+                      setCatDeleteConfirm(null);
+                    }}
+                    className="h-8 px-3 rounded-lg bg-red-600 hover:bg-red-700 text-white font-semibold"
+                  >
+                    {t.common.delete}
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* Category List with Edit & Delete */}
             <div className="divide-y divide-slate-100 dark:divide-slate-800 border border-slate-200 dark:border-slate-800 rounded-xl max-h-72 overflow-y-auto">
@@ -1872,11 +1924,15 @@ export const CatalogPage: React.FC = () => {
                           type="button"
                           onClick={async () => {
                             if (!editingCat.nameUz.trim()) return;
-                            await upsertCategory({
+                            const res = await upsertCategory({
                               ...editingCat,
                               nameUz: editingCat.nameUz.trim(),
                               nameRu: editingCat.nameUz.trim(),
                             });
+                            if (!res.ok) {
+                              notify(res.error || t.inventory.categoryDuplicateError, 'error');
+                              return;
+                            }
                             setEditingCat(null);
                             notify('Kategoriya yangilandi', 'success');
                           }}
@@ -1905,14 +1961,7 @@ export const CatalogPage: React.FC = () => {
                           {db.categories.length > 1 && (
                             <button
                               type="button"
-                              onClick={async () => {
-                                const res = await deleteCategory(c.id);
-                                if (!res.ok) notify(res.error || "O'chirib bo'lmadi", 'error');
-                                else {
-                                  if (categoryFilter === c.id) setCategoryFilter('all');
-                                  notify(`"${c.nameUz}" o'chirildi`, 'info');
-                                }
-                              }}
+                              onClick={() => setCatDeleteConfirm(c)}
                               className="w-8 h-8 rounded-lg border border-slate-200 dark:border-slate-700 inline-flex items-center justify-center text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40"
                               title="O'chirish"
                             >
@@ -1945,6 +1994,7 @@ export const CatalogPage: React.FC = () => {
                 onClick={() => {
                   setCatManagerOpen(false);
                   setEditingCat(null);
+                  setCatDeleteConfirm(null);
                 }}
                 className="h-9 px-4 rounded-lg bg-slate-900 dark:bg-slate-800 text-white font-semibold"
               >

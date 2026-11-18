@@ -60,6 +60,7 @@ export interface User extends BaseEntity {
   phone: string;
   password: string;
   pin: string;
+  googleEmail?: string;
   roleId: RoleId;
   assignedStoreIds: string[];
   customPermissions?: Permission[];
@@ -165,6 +166,7 @@ export interface PurchaseReceipt extends BaseEntity {
   number: string;
   supplierId: string;
   warehouseId: string;
+  categoryId?: string;
   items: PurchaseReceiptItem[];
   totalAmount: number;
   paidAmount: number;
@@ -468,6 +470,7 @@ export interface Employee extends BaseEntity {
   userId: string;
   name: string;
   phone: string;
+  googleEmail?: string;
   roleId: RoleId;
   baseSalary: number;
   commissionPercent: number;
@@ -523,12 +526,57 @@ export interface AuditLog extends BaseEntity {
   details?: string;
 }
 
+export type OfflineSyncOperationType =
+  | 'sale'
+  | 'sale_deferred'
+  | 'sale_pay_deferred'
+  | 'sale_delete_deferred'
+  | 'return'
+  | 'cash_op'
+  | 'shift_open'
+  | 'shift_close'
+  | 'category'
+  | 'category_delete'
+  | 'categories_reset'
+  | 'product'
+  | 'product_delete'
+  | 'bulk_prices'
+  | 'quick_stock'
+  | 'import_products'
+  | 'purchase_receipt'
+  | 'purchase_order'
+  | 'purchase_order_status'
+  | 'transfer'
+  | 'transfer_receive'
+  | 'write_off'
+  | 'stocktake'
+  | 'stocktake_apply'
+  | 'supplier'
+  | 'supplier_debt_pay'
+  | 'customer'
+  | 'debt_pay'
+  | 'promo'
+  | 'expense'
+  | 'finance_transfer'
+  | 'account'
+  | 'employee'
+  | 'employee_delete'
+  | 'target'
+  | 'online_order'
+  | 'online_order_status'
+  | 'store'
+  | 'store_delete'
+  | 'warehouse'
+  | 'settings'
+  | 'roles';
+
 export interface OfflineSyncItem {
   id: string;
-  type: 'sale' | 'return' | 'cash_op';
+  type: OfflineSyncOperationType;
   payload: unknown;
   createdAt: string;
   attempts: number;
+  idempotencyKey?: string;
 }
 
 export interface AppSettings {

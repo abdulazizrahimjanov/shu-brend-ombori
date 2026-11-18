@@ -462,12 +462,12 @@ export const SettingsPage: React.FC = () => {
               />
             </div>
             <div>
-              <label className="block font-medium text-slate-500 mb-1">Yangi 4-xonali PIN-kod</label>
+              <label className="block font-medium text-slate-500 mb-1">Yangi PIN-kod (4–6 raqam)</label>
               <input
-                maxLength={4}
+                maxLength={6}
                 inputMode="numeric"
                 value={newPin}
-                onChange={(e) => setNewPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                onChange={(e) => setNewPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
                 className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 font-mono tracking-widest"
               />
             </div>
@@ -540,13 +540,13 @@ export const SettingsPage: React.FC = () => {
               />
             </div>
             <div>
-              <label className="block font-medium text-slate-500 mb-1">Yangi 4-xonali PIN-kod</label>
+              <label className="block font-medium text-slate-500 mb-1">Yangi PIN-kod (4–6 raqam)</label>
               <input
-                maxLength={4}
+                maxLength={6}
                 inputMode="numeric"
                 value={staffNewPin}
-                onChange={(e) => setStaffNewPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
-                placeholder="1234"
+                onChange={(e) => setStaffNewPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                placeholder="•••••"
                 className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 font-mono tracking-widest"
               />
             </div>

@@ -131,7 +131,11 @@ export const StorefrontPage: React.FC<{ publicStandalone?: boolean; onBackToLogi
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           {publicStandalone && (
-            <img src="/icon.svg" alt="Logo" className="w-8 h-8 rounded-lg" />
+            <img
+              src="/assets/aistudio/IMG_20261007_140535_653_64e97dff.jpg"
+              alt="SHU BREND OMBOR"
+              className="w-9 h-9 rounded-lg object-cover border border-slate-200 dark:border-slate-800"
+            />
           )}
           {canManageOrders ? (
             <div className="flex items-center gap-1 p-1 bg-slate-200/70 dark:bg-slate-800 rounded-lg">

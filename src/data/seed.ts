@@ -194,9 +194,10 @@ export function createSeedDatabase(): DatabaseSnapshot {
     {
       id: 'usr-owner',
       name: 'Sardorbek Karimov',
-      phone: '+998901112233',
-      password: '123456',
-      pin: '1111',
+      phone: '+998889260404',
+      password: '51111',
+      pin: '51111',
+      googleEmail: 'a1sanjar73@gmail.com',
       roleId: 'owner',
       assignedStoreIds: [store1Id, store2Id],
       isActive: true,

@@ -1408,14 +1408,13 @@ export const POSPage: React.FC = () => {
               <input
                 type="password"
                 inputMode="numeric"
-                maxLength={4}
+                maxLength={6}
                 autoFocus
                 value={managerPinVal}
-                onChange={(e) => setManagerPinVal(e.target.value)}
-                placeholder="••••"
-                className="w-full h-11 text-center font-mono text-lg tracking-[0.5em] rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950"
+                onChange={(e) => setManagerPinVal(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                placeholder="•••••"
+                className="w-full h-11 text-center font-mono text-lg tracking-[0.4em] rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950"
               />
-              <p className="text-[11px] text-slate-400">Demo menejer PIN: 1111, 2222 yoki 3333</p>
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"

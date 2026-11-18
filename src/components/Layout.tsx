@@ -69,6 +69,10 @@ export const Layout: React.FC = () => {
   const db = useAppStore((s) => s.db);
   const currentUser = useAppStore((s) => s.getCurrentUser());
   const can = useAppStore((s) => s.can);
+  const canAccessStore = useAppStore((s) => s.canAccessStore);
+  const isOnline = useAppStore((s) => s.isOnline);
+  const syncStatus = useAppStore((s) => s.syncStatus);
+  const cloudConnected = useAppStore((s) => s.cloudConnected);
   const activeStoreId = useAppStore((s) => s.activeStoreId);
   const setActiveStoreId = useAppStore((s) => s.setActiveStoreId);
   const language = useAppStore((s) => s.language);
@@ -144,9 +148,16 @@ export const Layout: React.FC = () => {
     };
   })();
 
+  const accessibleStores = useMemo(
+    () => (db ? db.stores.filter((s) => canAccessStore(s.id)) : []),
+    [db, canAccessStore, currentUser]
+  );
+  const canViewAllStores = currentUser?.roleId === 'owner' || currentUser?.roleId === 'admin';
   const activeStore = db?.stores.find((s) => s.id === activeStoreId);
   const activeStoreLabel =
-    activeStoreId === 'all' ? t.common.allStores : activeStore?.name ?? db?.stores[0]?.name ?? t.common.store;
+    activeStoreId === 'all' && canViewAllStores
+      ? t.common.allStores
+      : activeStore?.name ?? accessibleStores[0]?.name ?? db?.stores[0]?.name ?? t.common.store;
 
   const handlePinSwitch = (e: React.FormEvent) => {
     e.preventDefault();
@@ -170,7 +181,11 @@ export const Layout: React.FC = () => {
       {/* Desktop Sidebar */}
       <aside className="no-print hidden lg:flex lg:w-64 lg:flex-col lg:fixed lg:inset-y-0 border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 z-30">
         <div className="h-14 px-5 flex items-center gap-2.5 border-b border-slate-200 dark:border-slate-800 shrink-0">
-          <img src="/icon.svg" alt="SHU BREND OMBOR" className="w-7 h-7 rounded-md shrink-0" />
+          <img
+            src="/assets/aistudio/IMG_20261007_140535_653_64e97dff.jpg"
+            alt="SHU BREND OMBOR"
+            className="w-8 h-8 rounded-lg object-cover border border-slate-200 dark:border-slate-700 shrink-0"
+          />
           <span className="font-display text-sm font-bold tracking-tight text-slate-900 dark:text-white whitespace-nowrap truncate">
             SHU BREND OMBOR
           </span>
@@ -282,7 +297,36 @@ export const Layout: React.FC = () => {
             </div>
 
             <div className="flex items-center gap-2 shrink-0">
-              {db && db.stores.length > 0 && (
+              <div
+                className={`hidden sm:inline-flex items-center gap-1.5 px-2.5 h-8 rounded-lg border text-[11px] font-medium whitespace-nowrap ${
+                  !isOnline
+                    ? 'border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300'
+                    : syncStatus === 'syncing'
+                    ? 'border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300'
+                    : 'border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300'
+                }`}
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                    !isOnline
+                      ? 'bg-amber-500'
+                      : syncStatus === 'syncing'
+                      ? 'bg-blue-500 animate-pulse'
+                      : 'bg-emerald-500'
+                  }`}
+                />
+                <span>
+                  {!isOnline
+                    ? t.common.offlineShort
+                    : syncStatus === 'syncing'
+                    ? t.common.syncing
+                    : cloudConnected
+                    ? t.common.cloudSynced
+                    : t.common.internetAvailable}
+                </span>
+              </div>
+
+              {accessibleStores.length > 0 && (
                 <div className="hidden md:flex items-center gap-1.5 border border-slate-200 dark:border-slate-700 rounded-xl px-2.5 h-9 bg-slate-50 dark:bg-slate-950">
                   <span
                     className="w-2 h-2 rounded-full shrink-0"
@@ -294,8 +338,10 @@ export const Layout: React.FC = () => {
                     aria-label={t.common.store}
                     className="bg-transparent text-xs font-medium text-slate-700 dark:text-slate-200 focus:outline-none"
                   >
-                    <option value="all" className="dark:bg-slate-900">{t.common.allStores}</option>
-                    {db.stores.map((s) => (
+                    {canViewAllStores && (
+                      <option value="all" className="dark:bg-slate-900">{t.common.allStores}</option>
+                    )}
+                    {accessibleStores.map((s) => (
                       <option key={s.id} value={s.id} className="dark:bg-slate-900">
                         {s.name}
                       </option>
@@ -484,23 +530,25 @@ export const Layout: React.FC = () => {
 
               {storeSwitchOpen && db && (
                 <div className="px-3 py-2 bg-white dark:bg-slate-900 space-y-1">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setActiveStoreId('all');
-                      setStoreSwitchOpen(false);
-                      setAvatarSheetOpen(false);
-                    }}
-                    className={`w-full px-3 py-2.5 rounded-xl text-left text-xs font-semibold flex items-center justify-between ${
-                      activeStoreId === 'all'
-                        ? 'bg-blue-50 dark:bg-blue-950/60 text-blue-600 dark:text-blue-400'
-                        : 'text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
-                    }`}
-                  >
-                    <span>{t.common.allStores}</span>
-                    {activeStoreId === 'all' && <Check className="w-4 h-4" />}
-                  </button>
-                  {db.stores.map((s) => (
+                  {canViewAllStores && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActiveStoreId('all');
+                        setStoreSwitchOpen(false);
+                        setAvatarSheetOpen(false);
+                      }}
+                      className={`w-full px-3 py-2.5 rounded-xl text-left text-xs font-semibold flex items-center justify-between ${
+                        activeStoreId === 'all'
+                          ? 'bg-blue-50 dark:bg-blue-950/60 text-blue-600 dark:text-blue-400'
+                          : 'text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
+                      }`}
+                    >
+                      <span>{t.common.allStores}</span>
+                      {activeStoreId === 'all' && <Check className="w-4 h-4" />}
+                    </button>
+                  )}
+                  {accessibleStores.map((s) => (
                     <button
                       key={s.id}
                       type="button"
@@ -635,16 +683,13 @@ export const Layout: React.FC = () => {
                 <input
                   type="password"
                   inputMode="numeric"
-                  maxLength={4}
+                  maxLength={6}
                   autoFocus
                   value={pinValue}
-                  onChange={(e) => setPinValue(e.target.value)}
-                  className="w-full h-12 text-center text-xl tracking-[0.5em] font-mono rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 focus:outline-none focus:ring-2 focus:ring-blue-600"
-                  placeholder="••••"
+                  onChange={(e) => setPinValue(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  className="w-full h-12 text-center text-xl tracking-[0.4em] font-mono rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  placeholder="•••••"
                 />
-                <p className="mt-2 text-[11px] text-slate-400">
-                  Demo PIN: 1111 (Egasi), 2222 (Admin), 3333 (Menejer), 4444 (Kassir), 5555 (Omborchi)
-                </p>
               </div>
               {pinError && <p className="text-xs text-red-600 font-medium">{pinError}</p>}
               <button
@@ -716,15 +761,15 @@ export const Layout: React.FC = () => {
                 />
               </div>
               <div>
-                <label className="block text-slate-500 mb-1">Yangi 4-xonali PIN-kod</label>
+                <label className="block text-slate-500 mb-1">Yangi PIN-kod (4–6 raqam)</label>
                 <input
                   type="text"
                   inputMode="numeric"
-                  maxLength={4}
+                  maxLength={6}
                   value={newPinInput}
-                  onChange={(e) => setNewPinInput(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                  onChange={(e) => setNewPinInput(e.target.value.replace(/\D/g, '').slice(0, 6))}
                   className="w-full h-10 px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-sm font-mono tracking-widest text-center"
-                  placeholder="1234"
+                  placeholder="•••••"
                 />
               </div>
               {credError && <p className="text-xs text-red-600 font-medium">{credError}</p>}

@@ -51,6 +51,7 @@ export const TransactionDetailPage: React.FC = () => {
   const navigate = useNavigate();
 
   const db = useAppStore((s) => s.db);
+  const currentUser = useAppStore((s) => s.getCurrentUser());
   const language = useAppStore((s) => s.language);
   const payDeferredTransaction = useAppStore((s) => s.payDeferredTransaction);
   const deleteDeferredTransaction = useAppStore((s) => s.deleteDeferredTransaction);
@@ -278,7 +279,7 @@ export const TransactionDetailPage: React.FC = () => {
       storeId: sale.storeId,
       createdAt: nowIso,
       updatedAt: nowIso,
-      createdBy: 'usr-cashier',
+      createdBy: currentUser?.id ?? 'system',
     });
     setOverrideCustomerId(created.id);
     setNewCustomerModalOpen(false);
