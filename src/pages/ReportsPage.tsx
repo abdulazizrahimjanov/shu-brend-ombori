@@ -38,6 +38,17 @@ export const ReportsPage: React.FC = () => {
     });
   }, [db, dateFrom, dateTo, activeStoreId]);
 
+  const filteredReturns = useMemo(() => {
+    if (!db) return [];
+    const fromMs = new Date(dateFrom).getTime();
+    const toMs = new Date(dateTo + 'T23:59:59').getTime();
+    return db.returns.filter((r) => {
+      if (activeStoreId !== 'all' && r.storeId !== activeStoreId) return false;
+      const tMs = new Date(r.createdAt).getTime();
+      return tMs >= fromMs && tMs <= toMs;
+    });
+  }, [db, dateFrom, dateTo, activeStoreId]);
+
   const paymentSummary = useMemo(() => {
     const map = new Map<string, number>();
     filteredSales.forEach((s) =>
@@ -45,11 +56,14 @@ export const ReportsPage: React.FC = () => {
         map.set(p.method, (map.get(p.method) ?? 0) + p.amount);
       })
     );
+    filteredReturns.forEach((r) => {
+      map.set(r.refundMethod, Math.max(0, (map.get(r.refundMethod) ?? 0) - r.totalRefund));
+    });
     return [...map.entries()].map(([method, amount]) => ({
       name: t.pos.methods[method as keyof typeof t.pos.methods] || method,
       amount,
     }));
-  }, [filteredSales, t]);
+  }, [filteredSales, filteredReturns, t]);
 
   const abcRows = useMemo(() => {
     if (!db) return [];
@@ -63,7 +77,19 @@ export const ReportsPage: React.FC = () => {
         prodStats.set(it.productId, cur);
       })
     );
-    const sorted = [...prodStats.values()].sort((a, b) => b.revenue - a.revenue);
+    filteredReturns.forEach((r) =>
+      r.items.forEach((ri) => {
+        const cur = prodStats.get(ri.productId);
+        if (cur) {
+          cur.qty = Math.max(0, cur.qty - ri.qty);
+          cur.revenue = Math.max(0, cur.revenue - ri.refundAmount);
+          cur.profit -= ri.refundAmount - ri.purchasePrice * ri.qty;
+        }
+      })
+    );
+    const sorted = [...prodStats.values()]
+      .filter((x) => x.qty > 0 || x.revenue > 0)
+      .sort((a, b) => b.revenue - a.revenue);
     const totalRev = sorted.reduce((sum, x) => sum + x.revenue, 0) || 1;
     let cum = 0;
     return sorted.map((x) => {
@@ -72,7 +98,7 @@ export const ReportsPage: React.FC = () => {
       const cls = cumPct <= 80 ? 'A' : cumPct <= 95 ? 'B' : 'C';
       return { ...x, sharePct: Math.round((x.revenue / totalRev) * 100), abc: cls };
     });
-  }, [db, filteredSales]);
+  }, [db, filteredSales, filteredReturns]);
 
   const valuationRows = useMemo(() => {
     if (!db) return [];
@@ -86,13 +112,18 @@ export const ReportsPage: React.FC = () => {
         costVal += q * v.purchasePrice;
         retailVal += q * v.retailPrice;
       });
-      const soldQty = filteredSales
+      const grossSold = filteredSales
         .flatMap((s) => s.items)
         .filter((it) => it.productId === p.id)
         .reduce((s, it) => s + it.qty, 0);
+      const returnedQty = filteredReturns
+        .flatMap((r) => r.items)
+        .filter((ri) => ri.productId === p.id)
+        .reduce((s, ri) => s + ri.qty, 0);
+      const soldQty = Math.max(0, grossSold - returnedQty);
       return { id: p.id, name: p.name, qty, costVal, retailVal, margin: retailVal - costVal, soldQty };
     });
-  }, [db, getVariantStock, filteredSales]);
+  }, [db, getVariantStock, filteredSales, filteredReturns]);
 
   if (!db) return null;
 
@@ -157,7 +188,11 @@ export const ReportsPage: React.FC = () => {
             onClick={() =>
               printHtmlDocument(
                 `<h2>SHU BREND OMBOR · Hisobot (${dateFrom} — ${dateTo})</h2>
-                 <p>Jami cheklar: ${filteredSales.length} · Jami tushum: ${formatMoney(filteredSales.reduce((s, x) => s + x.totalAmount, 0), { lang: language })}</p>`,
+                 <p>Jami cheklar: ${filteredSales.filter((s) => s.status !== 'returned').length} · Jami tushum (sof): ${formatMoney(
+                   filteredSales.reduce((s, x) => s + x.totalAmount, 0) -
+                     filteredReturns.reduce((s, r) => s + r.totalRefund, 0),
+                   { lang: language }
+                 )}</p>`,
                 'Hisobot'
               )
             }

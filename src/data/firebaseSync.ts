@@ -7,10 +7,11 @@ import {
   WriteBatch,
   collection,
   deleteDoc,
+  deleteField,
   doc,
   getDoc,
-  getDocFromServer,
   getDocs,
+  increment,
   onSnapshot,
   query,
   runTransaction,
@@ -20,7 +21,18 @@ import {
   where,
   writeBatch,
 } from 'firebase/firestore';
-import { firestoreDb, formatFirebaseErrorMessage, handleFirestoreError, OperationType } from '../firebase';
+import {
+  auth,
+  FIREBASE_API_KEY,
+  FIRESTORE_REST_BASE,
+  firestoreDb,
+  formatFirebaseErrorMessage,
+  handleFirestoreError,
+  isFirestoreInternalAssertionError,
+  isFirestoreWatchDisabled,
+  markFirestoreWatchDisabled,
+  OperationType,
+} from '../firebase';
 import {
   Account,
   AppSettings,
@@ -61,12 +73,114 @@ import {
 } from '../types/models';
 
 export const PRIMARY_WORKSPACE_ID = 'ws-shubrend-main';
-export const ADMIN_BOOTSTRAPPED_EMAILS = ['assdsh993@gmail.com', 'a1sanjar73@gmail.com'] as const;
+export const ADMIN_BOOTSTRAPPED_EMAILS = [
+  'assalomu408@gmail.com',
+  'assdsh993@gmail.com',
+  'a1sanjar73@gmail.com',
+] as const;
 export const ADMIN_BOOTSTRAPPED_EMAIL = ADMIN_BOOTSTRAPPED_EMAILS[0];
 
 export function isBootstrappedAdminEmail(email?: string | null): boolean {
-  const clean = String(email || '').trim().toLowerCase();
-  return (ADMIN_BOOTSTRAPPED_EMAILS as readonly string[]).includes(clean);
+  const normalized = (email || '').trim().toLowerCase();
+  return (ADMIN_BOOTSTRAPPED_EMAILS as readonly string[]).includes(normalized);
+}
+
+// Pure-JS FIPS 180-4 SHA-256 so hashing works synchronously in all browser/test contexts
+const SHA256_K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+function sha256HexSync(input: string): string {
+  const bytes = new TextEncoder().encode(input);
+  const bitLen = bytes.length * 8;
+  const withOneLen = bytes.length + 1;
+  const padLen = withOneLen % 64 <= 56 ? 56 - (withOneLen % 64) : 120 - (withOneLen % 64);
+  const totalLen = withOneLen + padLen + 8;
+  const buf = new Uint8Array(totalLen);
+  buf.set(bytes, 0);
+  buf[bytes.length] = 0x80;
+  const view = new DataView(buf.buffer);
+  view.setUint32(totalLen - 8, Math.floor(bitLen / 0x100000000), false);
+  view.setUint32(totalLen - 4, bitLen >>> 0, false);
+
+  const h = new Uint32Array([
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+  ]);
+  const w = new Uint32Array(64);
+  const rotr = (x: number, n: number) => (x >>> n) | (x << (32 - n));
+
+  for (let offset = 0; offset < totalLen; offset += 64) {
+    for (let i = 0; i < 16; i++) {
+      w[i] = view.getUint32(offset + i * 4, false);
+    }
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+
+    let [a, b, c, d, e, f, g, hh] = h;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const temp1 = (hh + S1 + ch + SHA256_K[i] + w[i]) >>> 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const temp2 = (S0 + maj) >>> 0;
+
+      hh = g;
+      g = f;
+      f = e;
+      e = (d + temp1) >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (temp1 + temp2) >>> 0;
+    }
+
+    h[0] = (h[0] + a) >>> 0;
+    h[1] = (h[1] + b) >>> 0;
+    h[2] = (h[2] + c) >>> 0;
+    h[3] = (h[3] + d) >>> 0;
+    h[4] = (h[4] + e) >>> 0;
+    h[5] = (h[5] + f) >>> 0;
+    h[6] = (h[6] + g) >>> 0;
+    h[7] = (h[7] + hh) >>> 0;
+  }
+
+  return Array.from(h)
+    .map((word) => word.toString(16).padStart(8, '0'))
+    .join('');
+}
+
+export async function sha256Hex(raw: string): Promise<string> {
+  const normalized = String(raw || '').trim().toLowerCase();
+  if (typeof crypto !== 'undefined' && crypto.subtle) {
+    try {
+      const data = new TextEncoder().encode(normalized);
+      const hashBuf = await crypto.subtle.digest('SHA-256', data);
+      return Array.from(new Uint8Array(hashBuf))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    } catch {
+      // Fallback to pure-JS implementation
+    }
+  }
+  return sha256HexSync(normalized);
+}
+
+export function hashStaffSecret(raw: string): string {
+  const clean = String(raw || '').trim();
+  if (!clean) return '';
+  return `sha256:${sha256HexSync(clean)}`;
 }
 
 const SECRET_INTEGRATION_KEYS = [
@@ -94,18 +208,6 @@ export interface WorkspaceContext {
   roleId: RoleId;
   assignedStoreIds: string[];
   staffId?: string;
-}
-
-export async function sha256Hex(raw: string): Promise<string> {
-  const normalized = String(raw || '').trim().toLowerCase();
-  const data = new TextEncoder().encode(normalized);
-  if (typeof crypto !== 'undefined' && crypto.subtle) {
-    const hashBuf = await crypto.subtle.digest('SHA-256', data);
-    return Array.from(new Uint8Array(hashBuf))
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('');
-  }
-  throw new Error('WebCrypto SHA-256 is unavailable in this environment');
 }
 
 export function sanitizeId(raw: string): string {
@@ -812,12 +914,21 @@ function serializeStaffCredential(
 ) {
   const staffId = sanitizeId(emp?.id || user.id);
   const googleEmail = (emp?.googleEmail || user.googleEmail || '').trim().toLowerCase();
+  const passwordHash = user.password?.trim()
+    ? hashStaffSecret(user.password)
+    : user.passwordHash || hashStaffSecret('123456');
+  const pinHash = user.pin?.trim()
+    ? hashStaffSecret(user.pin)
+    : user.pinHash || hashStaffSecret('0000');
+
   return {
     id: staffId,
     userId: sanitizeId(user.id),
     phone: clampStr(emp?.phone || user.phone, 40, ''),
-    password: clampStr(user.password, 120, '123456'),
-    pin: clampStr(user.pin, 10, '0000'),
+    passwordHash: clampStr(passwordHash, 256),
+    pinHash: clampStr(pinHash, 256),
+    hashAlgo: 'sha256' as const,
+    authMigrated: true,
     ...(googleEmail ? { googleEmail: clampStr(googleEmail, 200) } : {}),
     baseSalary: Math.max(0, Number(emp?.baseSalary) || 0),
     commissionPercent: Math.max(0, Number(emp?.commissionPercent) || 0),
@@ -840,13 +951,14 @@ function serializeStaffInvite(
 ) {
   const staffId = sanitizeId(emp?.id || user.id);
   const effectiveRoleId = clampStr(emp?.roleId || user.roleId, 64, 'cashier') as RoleId;
-  const effectiveRoleIdForInvite = effectiveRoleId === 'owner' ? 'admin' : effectiveRoleId;
+  const effectiveRoleIdForInvite = (effectiveRoleId === 'owner' ? 'admin' : effectiveRoleId) as RoleId;
   const rolePerms =
     user.customPermissions ?? roles.find((r) => r.id === effectiveRoleId)?.permissions ?? [];
   const storeList =
     Array.isArray(user.assignedStoreIds) && user.assignedStoreIds.length > 0
       ? user.assignedStoreIds.slice(0, 20).map(String)
       : [nonEmptyStr(emp?.storeId || user.storeId, 128, 'store-chilonzor')];
+
   return {
     id: emailHash,
     staffId,
@@ -969,7 +1081,7 @@ export async function bootstrapOrJoinWorkspace(
   const email = (fbUser.email || '').trim().toLowerCase();
   const displayName = nonEmptyStr(fbUser.displayName || email.split('@')[0] || 'Xodim', 120, 'Xodim');
 
-  // 1. Bootstrap platform admin record if bootstrapped owner email & resolve isPlatformAdmin
+  // 1. Bootstrap platform admin record if bootstrapped owner email or resolve existing admin record
   let isPlatformAdmin = isBootstrappedAdminEmail(email);
   const adminRef = doc(firestoreDb, 'admins', uid);
   if (isPlatformAdmin) {
@@ -1048,7 +1160,7 @@ export async function bootstrapOrJoinWorkspace(
   if (!wsSnap.exists()) {
     if (!isBootstrappedAdminEmail(email)) {
       throw new Error(
-        `Umumiy baza hali yaratilmagan. Avval do'kon egasi (${ADMIN_BOOTSTRAPPED_EMAILS[0]}) Google orqali kirishi kerak.`
+        `Umumiy baza hali yaratilmagan. Avval do'kon egasi (${ADMIN_BOOTSTRAPPED_EMAILS.join(' / ')}) Google orqali kirishi kerak.`
       );
     }
 
@@ -1202,6 +1314,10 @@ export async function bootstrapOrJoinWorkspace(
         } catch {
           // fallback if staffInvites doc does not exist yet
         }
+      }
+
+      if (!isOwner && inviteStoreIds.length === 0) {
+        inviteStoreIds = [localSnapshot.stores[0]?.id || 'store-chilonzor'];
       }
 
       const defaultPerms =
@@ -1359,7 +1475,7 @@ export async function migrateSnapshotToWorkspace(
     writer.add((b) => b.set(doc(firestoreDb, wsPath, 'promoCodes', sanitizeId(pr.id)), serializePromoCode(pr, ctx)));
   });
 
-  // Staff split: directory (non-PII) + credentials (admin-only PII) + invites (zero-PII role bindings)
+  // Staff split: directory (non-PII) + credentials (admin-only PII, hashed) + invites (zero-PII role bindings)
   const seenStaffUserIds = new Set<string>();
   const inviteEntries: { emailHash: string; data: ReturnType<typeof serializeStaffInvite> }[] = [];
 
@@ -1484,6 +1600,7 @@ export function hasCustomLocalMigrationCandidates(snapshot: DatabaseSnapshot): b
     checkList(snapshot.suppliers) ||
     checkList(snapshot.customers) ||
     checkList(snapshot.sales) ||
+    checkList(snapshot.returns) ||
     checkList(snapshot.purchaseReceipts) ||
     checkList(snapshot.purchaseOrders) ||
     checkList(snapshot.transfers) ||
@@ -1742,7 +1859,7 @@ export async function migrateLocalAdditionsToWorkspace(
     }
 
     if (newInviteEmails.length > 0) {
-      const mergedInvites = Array.from(new Set([...ctx.invitedEmails, ...newInviteEmails]));
+      const mergedInvites = Array.from(new Set([...ctx.invitedEmails, ...newInviteEmails])).slice(0, 50);
       writer.add((b) =>
         b.update(doc(firestoreDb, wsPath), {
           invitedEmails: mergedInvites,
@@ -1882,292 +1999,992 @@ async function propagateMembersIfNeeded(
   }
 }
 
-interface PendingQueueGuards {
-  upsertProducts: Set<string>;
-  deleteProducts: Set<string>;
-  upsertCategories: Set<string>;
-  deleteCategories: Set<string>;
-  resetCategories: boolean;
-  upsertBrands: Set<string>;
-  upsertCustomers: Set<string>;
-  upsertLoyaltyAccounts: Set<string>;
-  upsertSales: Set<string>;
-  deleteSales: Set<string>;
-  upsertReturns: Set<string>;
-  upsertStores: Set<string>;
-  deleteStores: Set<string>;
-  upsertWarehouses: Set<string>;
-  upsertSuppliers: Set<string>;
-  upsertDebts: Set<string>;
-  upsertExpenses: Set<string>;
-  upsertAccounts: Set<string>;
-  upsertPurchaseReceipts: Set<string>;
-  upsertPurchaseOrders: Set<string>;
-  upsertTransfers: Set<string>;
-  upsertWriteOffs: Set<string>;
-  upsertStocktakes: Set<string>;
-  upsertCashShifts: Set<string>;
-  upsertCashOperations: Set<string>;
-  upsertPromoCodes: Set<string>;
-  upsertTargets: Set<string>;
-  upsertOnlineOrders: Set<string>;
-  upsertAuditLogs: Set<string>;
-  upsertEmployees: Set<string>;
-  deleteEmployees: Set<string>;
-  hasPendingStockChanges: boolean;
-  hasPendingTransactions: boolean;
-  hasPendingLoyaltyTx: boolean;
-  hasPendingSettings: boolean;
-  hasPendingRoles: boolean;
+function mergePendingCollection<T extends { id: string; updatedAt?: string }>(
+  remoteItems: T[],
+  localItems: T[],
+  upsertIds: Set<string>,
+  deleteIds: Set<string> = new Set()
+): T[] {
+  if (upsertIds.size === 0 && deleteIds.size === 0) return remoteItems;
+  const localMap = new Map(localItems.map((it) => [it.id, it]));
+  const result: T[] = [];
+  const seen = new Set<string>();
+
+  for (const item of remoteItems) {
+    if (deleteIds.has(item.id)) continue;
+    seen.add(item.id);
+    if (upsertIds.has(item.id)) {
+      const localItem = localMap.get(item.id);
+      if (localItem) {
+        const localTs = String(localItem.updatedAt || '');
+        const remoteTs = String(item.updatedAt || '');
+        result.push(localTs >= remoteTs ? localItem : item);
+        continue;
+      }
+    }
+    result.push(item);
+  }
+
+  for (const id of upsertIds) {
+    if (!seen.has(id) && !deleteIds.has(id)) {
+      const localItem = localMap.get(id);
+      if (localItem) result.unshift(localItem);
+    }
+  }
+  return result;
 }
 
-function extractPendingQueueGuards(queue: OfflineSyncItem[]): PendingQueueGuards {
-  const g: PendingQueueGuards = {
-    upsertProducts: new Set(),
-    deleteProducts: new Set(),
-    upsertCategories: new Set(),
-    deleteCategories: new Set(),
-    resetCategories: false,
-    upsertBrands: new Set(),
-    upsertCustomers: new Set(),
-    upsertLoyaltyAccounts: new Set(),
-    upsertSales: new Set(),
-    deleteSales: new Set(),
-    upsertReturns: new Set(),
-    upsertStores: new Set(),
-    deleteStores: new Set(),
-    upsertWarehouses: new Set(),
-    upsertSuppliers: new Set(),
-    upsertDebts: new Set(),
-    upsertExpenses: new Set(),
-    upsertAccounts: new Set(),
-    upsertPurchaseReceipts: new Set(),
-    upsertPurchaseOrders: new Set(),
-    upsertTransfers: new Set(),
-    upsertWriteOffs: new Set(),
-    upsertStocktakes: new Set(),
-    upsertCashShifts: new Set(),
-    upsertCashOperations: new Set(),
-    upsertPromoCodes: new Set(),
-    upsertTargets: new Set(),
-    upsertOnlineOrders: new Set(),
-    upsertAuditLogs: new Set(),
-    upsertEmployees: new Set(),
-    deleteEmployees: new Set(),
-    hasPendingStockChanges: false,
-    hasPendingTransactions: false,
-    hasPendingLoyaltyTx: false,
-    hasPendingSettings: false,
-    hasPendingRoles: false,
-  };
+export function reconcilePendingOfflineEdits(
+  base: DatabaseSnapshot,
+  incoming: DatabaseSnapshot
+): DatabaseSnapshot {
+  if (!base.offlineQueue || base.offlineQueue.length === 0) return incoming;
 
-  for (const item of queue) {
-    const p = (item.payload || {}) as Record<string, unknown>;
-    if (p.auditId) g.upsertAuditLogs.add(String(p.auditId));
-    if (p.transactionId) g.hasPendingTransactions = true;
-    switch (item.type) {
-      case 'product':
-        if (p.productId) g.upsertProducts.add(String(p.productId));
-        break;
-      case 'product_delete':
-        if (p.productId) g.deleteProducts.add(String(p.productId));
-        g.hasPendingStockChanges = true;
-        break;
-      case 'bulk_prices':
-      case 'import_products':
-        if (Array.isArray(p.productIds)) {
-          p.productIds.forEach((id) => g.upsertProducts.add(String(id)));
-        }
-        if (item.type === 'import_products') g.hasPendingStockChanges = true;
-        break;
-      case 'quick_stock':
-        g.hasPendingStockChanges = true;
-        break;
+  const productUpserts = new Set<string>();
+  const productDeletes = new Set<string>();
+  const categoryUpserts = new Set<string>();
+  const categoryDeletes = new Set<string>();
+  const supplierUpserts = new Set<string>();
+  const customerUpserts = new Set<string>();
+  const loyaltyAccountUpserts = new Set<string>();
+  const loyaltyTxUpserts = new Set<string>();
+  const receiptUpserts = new Set<string>();
+  const poUpserts = new Set<string>();
+  const transferUpserts = new Set<string>();
+  const writeOffUpserts = new Set<string>();
+  const stocktakeUpserts = new Set<string>();
+  const saleUpserts = new Set<string>();
+  const saleDeletes = new Set<string>();
+  const returnUpserts = new Set<string>();
+  const shiftUpserts = new Set<string>();
+  const cashOpUpserts = new Set<string>();
+  const accountUpserts = new Set<string>();
+  const trxUpserts = new Set<string>();
+  const expenseUpserts = new Set<string>();
+  const debtUpserts = new Set<string>();
+  const promoUpserts = new Set<string>();
+  const targetUpserts = new Set<string>();
+  const targetDeletes = new Set<string>();
+  const orderUpserts = new Set<string>();
+  const auditUpserts = new Set<string>();
+  const storeUpserts = new Set<string>();
+  const storeDeletes = new Set<string>();
+  const whUpserts = new Set<string>();
+  const whDeletes = new Set<string>();
+  const pendingMovementIds = new Set<string>();
+  const deletedStockDocIds = new Set<string>();
+  let keepSettings = false;
+  let keepRoles = false;
+  let hasEmployeePending = false;
+
+  for (const q of base.offlineQueue) {
+    const p = (q.payload || {}) as Record<string, unknown>;
+    const addMoves = () => {
+      if (typeof p.movementId === 'string') pendingMovementIds.add(p.movementId);
+      if (Array.isArray(p.movementIds)) {
+        p.movementIds.forEach((id) => {
+          if (typeof id === 'string') pendingMovementIds.add(id);
+        });
+      }
+    };
+    const addAudit = () => {
+      if (typeof p.auditId === 'string') auditUpserts.add(p.auditId);
+    };
+    switch (q.type) {
       case 'category':
-        if (p.categoryId) g.upsertCategories.add(String(p.categoryId));
+        if (typeof p.categoryId === 'string') categoryUpserts.add(p.categoryId);
         break;
       case 'category_delete':
-        if (p.categoryId) g.deleteCategories.add(String(p.categoryId));
+        if (typeof p.categoryId === 'string') categoryDeletes.add(p.categoryId);
+        if (Array.isArray(p.reassignedProductIds)) {
+          p.reassignedProductIds.forEach((id) => {
+            if (typeof id === 'string') productUpserts.add(id);
+          });
+        }
         break;
       case 'categories_reset':
-        g.resetCategories = true;
+        base.categories.forEach((c) => categoryUpserts.add(c.id));
+        base.products.forEach((pr) => productUpserts.add(pr.id));
         break;
-      case 'customer':
-        if (p.customerId) g.upsertCustomers.add(String(p.customerId));
-        if (p.loyaltyAccountId) g.upsertLoyaltyAccounts.add(String(p.loyaltyAccountId));
+      case 'product':
+        if (typeof p.productId === 'string') productUpserts.add(p.productId);
+        addAudit();
         break;
-      case 'sale':
-      case 'sale_pay_deferred':
-        if (p.saleId) g.upsertSales.add(String(p.saleId));
-        if (p.customerId) {
-          g.upsertCustomers.add(String(p.customerId));
-          g.hasPendingLoyaltyTx = true;
+      case 'product_delete':
+        if (typeof p.productId === 'string') productDeletes.add(p.productId);
+        if (Array.isArray(p.deletedStockIds)) {
+          p.deletedStockIds.forEach((id) => {
+            if (typeof id === 'string') deletedStockDocIds.add(id);
+          });
         }
-        if (p.debtId) g.upsertDebts.add(String(p.debtId));
-        if (Array.isArray(p.loyaltyTxIds) && p.loyaltyTxIds.length > 0) g.hasPendingLoyaltyTx = true;
-        if (Array.isArray(p.accountIds)) {
-          p.accountIds.forEach((id) => g.upsertAccounts.add(String(id)));
+        addAudit();
+        break;
+      case 'bulk_prices':
+        if (Array.isArray(p.productIds)) {
+          p.productIds.forEach((id) => {
+            if (typeof id === 'string') productUpserts.add(id);
+          });
         }
-        g.hasPendingStockChanges = true;
+        addAudit();
         break;
-      case 'sale_deferred':
-        if (p.saleId) g.upsertSales.add(String(p.saleId));
+      case 'import_products':
+        if (Array.isArray(p.productIds)) {
+          p.productIds.forEach((id) => {
+            if (typeof id === 'string') productUpserts.add(id);
+          });
+        }
+        addMoves();
         break;
-      case 'sale_delete_deferred':
-        if (p.saleId) g.deleteSales.add(String(p.saleId));
-        break;
-      case 'return':
-        if (p.returnId) g.upsertReturns.add(String(p.returnId));
-        if (p.saleId) g.upsertSales.add(String(p.saleId));
-        if (p.shiftId) g.upsertCashShifts.add(String(p.shiftId));
-        if (p.accountId) g.upsertAccounts.add(String(p.accountId));
-        g.hasPendingStockChanges = true;
-        break;
-      case 'shift_open':
-      case 'shift_close':
-        if (p.shiftId) g.upsertCashShifts.add(String(p.shiftId));
-        break;
-      case 'cash_op':
-        if (p.opId) g.upsertCashOperations.add(String(p.opId));
-        if (p.shiftId) g.upsertCashShifts.add(String(p.shiftId));
+      case 'quick_stock':
+        addMoves();
         break;
       case 'purchase_receipt':
-        if (p.receiptId) g.upsertPurchaseReceipts.add(String(p.receiptId));
-        if (p.accountId) g.upsertAccounts.add(String(p.accountId));
-        g.hasPendingStockChanges = true;
+        if (typeof p.receiptId === 'string') {
+          receiptUpserts.add(p.receiptId);
+          const rec = base.purchaseReceipts.find((r) => r.id === p.receiptId);
+          if (rec) {
+            if (rec.supplierId) supplierUpserts.add(rec.supplierId);
+            rec.items.forEach((it) => productUpserts.add(it.productId));
+          }
+        }
+        if (typeof p.supplierId === 'string') supplierUpserts.add(p.supplierId);
+        if (typeof p.accountId === 'string') accountUpserts.add(p.accountId);
+        addMoves();
         break;
       case 'purchase_order':
       case 'purchase_order_status':
-        if (p.poId) g.upsertPurchaseOrders.add(String(p.poId));
+        if (typeof p.poId === 'string') poUpserts.add(p.poId);
         break;
       case 'transfer':
       case 'transfer_receive':
-        if (p.transferId) g.upsertTransfers.add(String(p.transferId));
-        g.hasPendingStockChanges = true;
+        if (typeof p.transferId === 'string') transferUpserts.add(p.transferId);
+        addMoves();
         break;
       case 'write_off':
-        if (p.writeOffId) g.upsertWriteOffs.add(String(p.writeOffId));
-        g.hasPendingStockChanges = true;
+        if (typeof p.writeOffId === 'string') writeOffUpserts.add(p.writeOffId);
+        addMoves();
+        addAudit();
         break;
       case 'stocktake':
       case 'stocktake_apply':
-        if (p.stocktakeId) g.upsertStocktakes.add(String(p.stocktakeId));
-        if (item.type === 'stocktake_apply') g.hasPendingStockChanges = true;
+        if (typeof p.stocktakeId === 'string') stocktakeUpserts.add(p.stocktakeId);
+        addMoves();
+        addAudit();
         break;
       case 'supplier':
-        if (p.supplierId) g.upsertSuppliers.add(String(p.supplierId));
+        if (typeof p.supplierId === 'string') supplierUpserts.add(p.supplierId);
         break;
       case 'supplier_debt_pay':
-        if (p.supplierId) g.upsertSuppliers.add(String(p.supplierId));
-        if (p.accountId) g.upsertAccounts.add(String(p.accountId));
-        g.hasPendingTransactions = true;
+        if (typeof p.supplierId === 'string') supplierUpserts.add(p.supplierId);
+        if (typeof p.accountId === 'string') accountUpserts.add(p.accountId);
+        if (typeof p.transactionId === 'string') trxUpserts.add(p.transactionId);
+        break;
+      case 'sale':
+      case 'sale_pay_deferred':
+      case 'sale_deferred':
+        if (typeof p.saleId === 'string') {
+          saleUpserts.add(p.saleId);
+          const localSale = base.sales.find((s) => s.id === p.saleId);
+          if (localSale) {
+            if (localSale.customerId) {
+              customerUpserts.add(localSale.customerId);
+              const loy = base.loyaltyAccounts.find((l) => l.customerId === localSale.customerId);
+              if (loy) loyaltyAccountUpserts.add(loy.id);
+            }
+            if (localSale.shiftId) shiftUpserts.add(localSale.shiftId);
+            if (localSale.promoCode) {
+              const promo = base.promoCodes.find(
+                (pr) => pr.code.toUpperCase() === localSale.promoCode?.toUpperCase()
+              );
+              if (promo) promoUpserts.add(promo.id);
+            }
+          }
+        }
+        if (typeof p.debtId === 'string') debtUpserts.add(p.debtId);
+        if (Array.isArray(p.loyaltyTxIds)) {
+          p.loyaltyTxIds.forEach((id) => {
+            if (typeof id === 'string') loyaltyTxUpserts.add(id);
+          });
+        }
+        if (Array.isArray(p.accountIds)) {
+          p.accountIds.forEach((id) => {
+            if (typeof id === 'string') accountUpserts.add(id);
+          });
+        }
+        addMoves();
+        addAudit();
+        break;
+      case 'sale_delete_deferred':
+        if (typeof p.saleId === 'string') saleDeletes.add(p.saleId);
+        break;
+      case 'return':
+        if (typeof p.returnId === 'string') returnUpserts.add(p.returnId);
+        if (typeof p.saleId === 'string') saleUpserts.add(p.saleId);
+        if (typeof p.shiftId === 'string') shiftUpserts.add(p.shiftId);
+        if (typeof p.accountId === 'string') accountUpserts.add(p.accountId);
+        addMoves();
+        addAudit();
+        break;
+      case 'shift_open':
+      case 'shift_close':
+        if (typeof p.shiftId === 'string') shiftUpserts.add(p.shiftId);
+        addAudit();
+        break;
+      case 'cash_op':
+        if (typeof p.opId === 'string') cashOpUpserts.add(p.opId);
+        if (typeof p.shiftId === 'string') shiftUpserts.add(p.shiftId);
+        break;
+      case 'customer':
+        if (typeof p.customerId === 'string') customerUpserts.add(p.customerId);
+        if (typeof p.loyaltyAccountId === 'string') loyaltyAccountUpserts.add(p.loyaltyAccountId);
         break;
       case 'debt_pay':
-        if (p.debtId) g.upsertDebts.add(String(p.debtId));
-        if (p.accountId) g.upsertAccounts.add(String(p.accountId));
-        g.hasPendingTransactions = true;
+        if (typeof p.debtId === 'string') debtUpserts.add(p.debtId);
+        if (typeof p.customerId === 'string') customerUpserts.add(p.customerId);
+        if (typeof p.accountId === 'string') accountUpserts.add(p.accountId);
+        if (typeof p.transactionId === 'string') trxUpserts.add(p.transactionId);
+        addAudit();
         break;
       case 'promo':
-        if (p.promoId) g.upsertPromoCodes.add(String(p.promoId));
+        if (typeof p.promoId === 'string') promoUpserts.add(p.promoId);
         break;
       case 'expense':
-        if (p.expenseId) g.upsertExpenses.add(String(p.expenseId));
-        if (p.accountId) g.upsertAccounts.add(String(p.accountId));
-        g.hasPendingTransactions = true;
+        if (typeof p.expenseId === 'string') expenseUpserts.add(p.expenseId);
+        if (typeof p.accountId === 'string') accountUpserts.add(p.accountId);
+        if (typeof p.transactionId === 'string') trxUpserts.add(p.transactionId);
         break;
       case 'finance_transfer':
-        if (p.fromAccountId) g.upsertAccounts.add(String(p.fromAccountId));
-        if (p.toAccountId) g.upsertAccounts.add(String(p.toAccountId));
-        g.hasPendingTransactions = true;
+        if (typeof p.fromAccountId === 'string') accountUpserts.add(p.fromAccountId);
+        if (typeof p.toAccountId === 'string') accountUpserts.add(p.toAccountId);
+        if (typeof p.transactionId === 'string') trxUpserts.add(p.transactionId);
         break;
       case 'account':
-        if (p.accountId) g.upsertAccounts.add(String(p.accountId));
+        if (typeof p.accountId === 'string') accountUpserts.add(p.accountId);
         break;
       case 'employee':
-        if (p.empId) g.upsertEmployees.add(String(p.empId));
+        hasEmployeePending = true;
         break;
       case 'employee_delete':
-        if (p.empId) g.deleteEmployees.add(String(p.empId));
+        hasEmployeePending = true;
+        if (Array.isArray(p.deletedTargetIds)) {
+          p.deletedTargetIds.forEach((id) => {
+            if (typeof id === 'string') targetDeletes.add(id);
+          });
+        }
         break;
       case 'target':
-        if (p.targetId) g.upsertTargets.add(String(p.targetId));
+        if (typeof p.targetId === 'string') targetUpserts.add(p.targetId);
         break;
       case 'online_order':
       case 'online_order_status':
-        if (p.orderId) g.upsertOnlineOrders.add(String(p.orderId));
-        if (item.type === 'online_order_status') g.hasPendingStockChanges = true;
+        if (typeof p.orderId === 'string') orderUpserts.add(p.orderId);
+        addMoves();
         break;
       case 'store':
-        if (p.storeId) g.upsertStores.add(String(p.storeId));
+        if (typeof p.storeId === 'string') storeUpserts.add(p.storeId);
         break;
       case 'store_delete':
-        if (p.storeId) g.deleteStores.add(String(p.storeId));
+        if (typeof p.storeId === 'string') storeDeletes.add(p.storeId);
+        if (typeof p.deletedWarehouseId === 'string') whDeletes.add(p.deletedWarehouseId);
         break;
       case 'warehouse':
-        if (p.warehouseId) g.upsertWarehouses.add(String(p.warehouseId));
+        if (typeof p.warehouseId === 'string') whUpserts.add(p.warehouseId);
         break;
       case 'settings':
-        g.hasPendingSettings = true;
+        keepSettings = true;
+        addAudit();
         break;
       case 'roles':
-        g.hasPendingRoles = true;
+        keepRoles = true;
         break;
     }
   }
-  return g;
+
+  // Reconcile pending stock items based on pending movements & product deletes
+  let reconciledStockItems = incoming.stockItems;
+  if (deletedStockDocIds.size > 0 || productDeletes.size > 0) {
+    reconciledStockItems = reconciledStockItems.filter(
+      (s) =>
+        !productDeletes.has(s.productId) &&
+        !deletedStockDocIds.has(stockItemDocId(s.warehouseId, s.variantId))
+    );
+  }
+  if (pendingMovementIds.size > 0) {
+    const pendingMoves = base.stockMovements.filter((m) => pendingMovementIds.has(m.id));
+    const affectedKeys = new Set(pendingMoves.map((m) => `${m.warehouseId}__${m.variantId}`));
+    const localStockMap = new Map(
+      base.stockItems.map((s) => [`${s.warehouseId}__${s.variantId}`, s])
+    );
+    const nextStockMap = new Map(
+      reconciledStockItems.map((s) => [`${s.warehouseId}__${s.variantId}`, s])
+    );
+    affectedKeys.forEach((k) => {
+      const localS = localStockMap.get(k);
+      if (localS) nextStockMap.set(k, localS);
+    });
+    reconciledStockItems = Array.from(nextStockMap.values());
+  }
+
+  return {
+    ...incoming,
+    settings: keepSettings ? base.settings : incoming.settings,
+    roles: keepRoles ? base.roles : incoming.roles,
+    users: hasEmployeePending ? base.users : incoming.users,
+    employees: hasEmployeePending ? base.employees : incoming.employees,
+    stores: mergePendingCollection(incoming.stores, base.stores, storeUpserts, storeDeletes),
+    warehouses: mergePendingCollection(incoming.warehouses, base.warehouses, whUpserts, whDeletes),
+    categories: mergePendingCollection(incoming.categories, base.categories, categoryUpserts, categoryDeletes),
+    products: mergePendingCollection(incoming.products, base.products, productUpserts, productDeletes),
+    suppliers: mergePendingCollection(incoming.suppliers, base.suppliers, supplierUpserts),
+    stockItems: reconciledStockItems,
+    stockMovements: mergePendingCollection(incoming.stockMovements, base.stockMovements, pendingMovementIds),
+    purchaseReceipts: mergePendingCollection(incoming.purchaseReceipts, base.purchaseReceipts, receiptUpserts),
+    purchaseOrders: mergePendingCollection(incoming.purchaseOrders, base.purchaseOrders, poUpserts),
+    transfers: mergePendingCollection(incoming.transfers, base.transfers, transferUpserts),
+    writeOffs: mergePendingCollection(incoming.writeOffs, base.writeOffs, writeOffUpserts),
+    stocktakes: mergePendingCollection(incoming.stocktakes, base.stocktakes, stocktakeUpserts),
+    sales: mergePendingCollection(incoming.sales, base.sales, saleUpserts, saleDeletes),
+    returns: mergePendingCollection(incoming.returns, base.returns, returnUpserts),
+    cashShifts: mergePendingCollection(incoming.cashShifts, base.cashShifts, shiftUpserts),
+    cashOperations: mergePendingCollection(incoming.cashOperations, base.cashOperations, cashOpUpserts),
+    accounts: mergePendingCollection(incoming.accounts, base.accounts, accountUpserts),
+    transactions: mergePendingCollection(incoming.transactions, base.transactions, trxUpserts),
+    expenses: mergePendingCollection(incoming.expenses, base.expenses, expenseUpserts),
+    customers: mergePendingCollection(incoming.customers, base.customers, customerUpserts),
+    loyaltyAccounts: mergePendingCollection(incoming.loyaltyAccounts, base.loyaltyAccounts, loyaltyAccountUpserts),
+    loyaltyTransactions: mergePendingCollection(incoming.loyaltyTransactions, base.loyaltyTransactions, loyaltyTxUpserts),
+    debts: mergePendingCollection(incoming.debts, base.debts, debtUpserts),
+    promoCodes: mergePendingCollection(incoming.promoCodes, base.promoCodes, promoUpserts),
+    targets: mergePendingCollection(incoming.targets, base.targets, targetUpserts, targetDeletes),
+    onlineOrders: mergePendingCollection(incoming.onlineOrders, base.onlineOrders, orderUpserts),
+    auditLogs: mergePendingCollection(incoming.auditLogs, base.auditLogs, auditUpserts),
+  };
 }
 
-function mergeCollectionWithPending<T extends { id: string; updatedAt?: string }>(
-  remote: T[] | undefined,
-  local: T[],
-  pendingUpserts: Set<string>,
-  pendingDeletes?: Set<string>
-): T[] {
-  if (!remote) return local;
-  if (pendingUpserts.size === 0 && (!pendingDeletes || pendingDeletes.size === 0)) {
-    return remote;
+export async function verifyWorkspaceServerSync(workspaceId: string): Promise<boolean> {
+  try {
+    const res = await restGetDocument(`workspaces/${sanitizeId(workspaceId)}`, 8000);
+    return res.exists;
+  } catch {
+    return false;
   }
-  const localById = new Map(local.map((it) => [it.id, it]));
-  const merged = new Map<string, T>();
-  for (const r of remote) {
-    if (pendingDeletes?.has(r.id)) continue;
-    const loc = localById.get(r.id);
-    if (loc && pendingUpserts.has(r.id)) {
-      const locTs = loc.updatedAt ? Date.parse(loc.updatedAt) : 0;
-      const remTs = r.updatedAt ? Date.parse(r.updatedAt) : 0;
-      merged.set(r.id, locTs >= remTs ? loc : r);
-    } else {
-      merged.set(r.id, r);
-    }
-  }
-  for (const id of pendingUpserts) {
-    if (pendingDeletes?.has(id)) continue;
-    if (!merged.has(id)) {
-      const loc = localById.get(id);
-      if (loc) merged.set(id, loc);
-    }
-  }
-  return Array.from(merged.values());
 }
 
 export async function checkWorkspaceSyncHealth(
-  ctx: WorkspaceContext
+  ctx: WorkspaceContext,
+  lang: 'uz' | 'ru' = 'uz'
 ): Promise<{ ok: boolean; error?: string }> {
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
     return {
       ok: false,
-      error: formatFirebaseErrorMessage(new Error('client is offline')),
+      error: lang === 'ru' ? 'Нет подключения к интернету' : "Internet aloqasi yo'q",
     };
   }
   try {
-    await getDocFromServer(doc(firestoreDb, 'workspaces', ctx.workspaceId));
+    const res = await restGetDocument(`workspaces/${sanitizeId(ctx.workspaceId)}`, 8000);
+    if (!res.exists) {
+      return {
+        ok: false,
+        error: lang === 'ru' ? 'Рабочая область не найдена' : 'Ish maydoni topilmadi',
+      };
+    }
     return { ok: true };
   } catch (err) {
     return {
       ok: false,
-      error: formatFirebaseErrorMessage(err),
+      error: formatFirebaseErrorMessage(err, lang),
     };
   }
+}
+
+// --- Firestore REST v1 Helpers (zero WatchStream target overhead) ---
+
+interface FirestoreRestValue {
+  nullValue?: unknown;
+  booleanValue?: boolean;
+  integerValue?: string;
+  doubleValue?: number;
+  timestampValue?: string;
+  stringValue?: string;
+  bytesValue?: string;
+  referenceValue?: string;
+  geoPointValue?: { latitude?: number; longitude?: number };
+  arrayValue?: { values?: FirestoreRestValue[] };
+  mapValue?: { fields?: Record<string, FirestoreRestValue> };
+}
+
+interface FirestoreRestDoc {
+  name: string;
+  fields?: Record<string, FirestoreRestValue>;
+  createTime?: string;
+  updateTime?: string;
+}
+
+function decodeRestValue(v: FirestoreRestValue | undefined): unknown {
+  if (!v || typeof v !== 'object') return null;
+  if ('nullValue' in v) return null;
+  if ('booleanValue' in v) return Boolean(v.booleanValue);
+  if ('integerValue' in v) {
+    const n = Number(v.integerValue);
+    return Number.isFinite(n) ? n : 0;
+  }
+  if ('doubleValue' in v) {
+    const n = Number(v.doubleValue);
+    return Number.isFinite(n) ? n : 0;
+  }
+  if ('timestampValue' in v) return String(v.timestampValue || '');
+  if ('stringValue' in v) return String(v.stringValue ?? '');
+  if ('bytesValue' in v) return String(v.bytesValue ?? '');
+  if ('referenceValue' in v) return String(v.referenceValue ?? '');
+  if ('geoPointValue' in v) return v.geoPointValue ?? null;
+  if ('arrayValue' in v) {
+    return Array.isArray(v.arrayValue?.values)
+      ? v.arrayValue.values.map((item) => decodeRestValue(item))
+      : [];
+  }
+  if ('mapValue' in v) {
+    const out: Record<string, unknown> = {};
+    const fields = v.mapValue?.fields || {};
+    for (const [k, val] of Object.entries(fields)) {
+      out[k] = decodeRestValue(val);
+    }
+    return out;
+  }
+  return null;
+}
+
+function decodeRestDocument(rawDoc: FirestoreRestDoc): Record<string, unknown> & { id: string } {
+  const parts = String(rawDoc.name || '').split('/');
+  const docId = parts[parts.length - 1] || '';
+  const fields = rawDoc.fields || {};
+  const decoded: Record<string, unknown> = {};
+  for (const [k, val] of Object.entries(fields)) {
+    decoded[k] = decodeRestValue(val);
+  }
+  return normalizeDocDates({
+    ...decoded,
+    id: String(decoded.id || docId),
+  });
+}
+
+async function fetchFirestoreRestWithAuth(
+  url: string,
+  init: RequestInit,
+  timeoutMs = 10000
+): Promise<Response> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Firebase Auth user not available');
+  }
+
+  const exec = async (forceRefresh: boolean): Promise<Response> => {
+    const token = await user.getIdToken(forceRefresh);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, {
+        ...init,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': FIREBASE_API_KEY,
+          Authorization: `Bearer ${token}`,
+          ...(init.headers || {}),
+        },
+        signal: controller.signal,
+        cache: 'no-store',
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  let res = await exec(false);
+  if (res.status === 401) {
+    res = await exec(true);
+  }
+  return res;
+}
+
+async function restGetDocument(
+  docPath: string,
+  timeoutMs = 10000
+): Promise<{ exists: boolean; data: (Record<string, unknown> & { id: string }) | null }> {
+  const res = await fetchFirestoreRestWithAuth(
+    `${FIRESTORE_REST_BASE}/${docPath}`,
+    { method: 'GET' },
+    timeoutMs
+  );
+  if (res.status === 404) {
+    return { exists: false, data: null };
+  }
+  if (!res.ok) {
+    const bodyText = await res.text().catch(() => '');
+    if (res.status === 403 || bodyText.includes('PERMISSION_DENIED')) {
+      throw new Error('Missing or insufficient permissions.');
+    }
+    throw new Error(`Firestore REST GET ${docPath} failed (${res.status}): ${bodyText}`);
+  }
+  const json = (await res.json()) as FirestoreRestDoc;
+  return { exists: true, data: decodeRestDocument(json) };
+}
+
+type RestFieldFilter = {
+  field: string;
+  op: 'EQUAL' | 'ARRAY_CONTAINS';
+  value: string;
+};
+
+async function restRunQuery(
+  parentDocPath: string,
+  collectionId: string,
+  filter?: RestFieldFilter,
+  timeoutMs = 12000
+): Promise<(Record<string, unknown> & { id: string })[]> {
+  const structuredQuery: Record<string, unknown> = {
+    from: [{ collectionId }],
+  };
+  if (filter) {
+    structuredQuery.where = {
+      fieldFilter: {
+        field: { fieldPath: filter.field },
+        op: filter.op,
+        value: { stringValue: filter.value },
+      },
+    };
+  }
+  const url = parentDocPath
+    ? `${FIRESTORE_REST_BASE}/${parentDocPath}:runQuery`
+    : `${FIRESTORE_REST_BASE}:runQuery`;
+
+  const res = await fetchFirestoreRestWithAuth(
+    url,
+    {
+      method: 'POST',
+      body: JSON.stringify({ structuredQuery }),
+    },
+    timeoutMs
+  );
+  if (!res.ok) {
+    const bodyText = await res.text().catch(() => '');
+    if (res.status === 403 || bodyText.includes('PERMISSION_DENIED')) {
+      throw new Error('Missing or insufficient permissions.');
+    }
+    throw new Error(`Firestore REST runQuery ${collectionId} failed (${res.status}): ${bodyText}`);
+  }
+  const rows = (await res.json()) as { document?: FirestoreRestDoc }[];
+  if (!Array.isArray(rows)) return [];
+  const docs: (Record<string, unknown> & { id: string })[] = [];
+  for (const row of rows) {
+    if (row?.document) {
+      docs.push(decodeRestDocument(row.document));
+    }
+  }
+  return docs;
+}
+
+const WORKSPACE_WIDE_READ_COLS = new Set(['stores', 'warehouses', 'categories', 'brands']);
+
+function buildSnapshotFromBucket(
+  base: DatabaseSnapshot,
+  bucket: SyncBucket
+): DatabaseSnapshot {
+  const next: DatabaseSnapshot = {
+    ...base,
+    version: bucket.workspaceMeta?.version ?? base.version,
+    roles: bucket.workspaceMeta?.roles?.length ? bucket.workspaceMeta.roles : base.roles,
+    settings: {
+      ...(bucket.workspaceMeta?.settings ?? base.settings),
+      integrations: {
+        ...(bucket.workspaceMeta?.settings?.integrations ?? base.settings.integrations),
+        ...(bucket.privateIntegrations ?? {}),
+      },
+    },
+    stores: bucket.stores ?? base.stores,
+    warehouses: bucket.warehouses ?? base.warehouses,
+    categories: bucket.categories ?? base.categories,
+    brands: bucket.brands ?? base.brands,
+    products: bucket.products ?? base.products,
+    suppliers: bucket.suppliers ?? base.suppliers,
+    stockItems: bucket.stockItems ?? base.stockItems,
+    stockMovements: bucket.stockMovements ?? base.stockMovements,
+    purchaseReceipts: bucket.purchaseReceipts ?? base.purchaseReceipts,
+    purchaseOrders: bucket.purchaseOrders ?? base.purchaseOrders,
+    transfers: bucket.transfers ?? base.transfers,
+    writeOffs: bucket.writeOffs ?? base.writeOffs,
+    stocktakes: bucket.stocktakes ?? base.stocktakes,
+    sales: bucket.sales ?? base.sales,
+    returns: bucket.returns ?? base.returns,
+    cashShifts: bucket.cashShifts ?? base.cashShifts,
+    cashOperations: bucket.cashOperations ?? base.cashOperations,
+    accounts: bucket.accounts ?? base.accounts,
+    transactions: bucket.transactions ?? base.transactions,
+    expenses: bucket.expenses ?? base.expenses,
+    customers: bucket.customers ?? base.customers,
+    loyaltyAccounts: bucket.loyaltyAccounts ?? base.loyaltyAccounts,
+    loyaltyTransactions: bucket.loyaltyTransactions ?? base.loyaltyTransactions,
+    debts: bucket.debts ?? base.debts,
+    promoCodes: bucket.promoCodes ?? base.promoCodes,
+    targets: bucket.targets ?? base.targets,
+    onlineOrders: bucket.onlineOrders ?? base.onlineOrders,
+    auditLogs: bucket.auditLogs ?? base.auditLogs,
+    offlineQueue: base.offlineQueue,
+  };
+
+  if (bucket.staffDirectory) {
+    const credById = new Map<string, Record<string, unknown>>();
+    (bucket.staffCredentials || []).forEach((c) => credById.set(c.id, c));
+
+    const nextUsers: User[] = [];
+    const nextEmployees: Employee[] = [];
+
+    bucket.staffDirectory.forEach((dir) => {
+      const cred = credById.get(dir.id);
+      const existingLocalUser = base.users.find((u) => u.id === dir.userId);
+      const existingLocalEmp = base.employees.find((e) => e.id === dir.id || e.userId === dir.userId);
+
+      const userId = String(dir.userId || dir.id);
+      const roleId = String(dir.roleId || 'cashier') as RoleId;
+      const storeId = String(dir.storeId || next.stores[0]?.id || 'store-chilonzor');
+      const createdAt = toIsoString(dir.createdAt, existingLocalUser?.createdAt);
+      const updatedAt = toIsoString(dir.updatedAt, existingLocalUser?.updatedAt);
+
+      const remotePasswordHash = cred?.passwordHash ? String(cred.passwordHash) : existingLocalUser?.passwordHash;
+      const remotePinHash = cred?.pinHash ? String(cred.pinHash) : existingLocalUser?.pinHash;
+      const legacyPlainPass = cred?.password ? String(cred.password) : '';
+      const legacyPlainPin = cred?.pin ? String(cred.pin) : '';
+
+      const localPassMatchesRemote =
+        Boolean(existingLocalUser?.password) &&
+        (!remotePasswordHash || hashStaffSecret(existingLocalUser!.password) === remotePasswordHash);
+      const localPinMatchesRemote =
+        Boolean(existingLocalUser?.pin) &&
+        (!remotePinHash || hashStaffSecret(existingLocalUser!.pin) === remotePinHash);
+
+      const mergedUser: User = {
+        id: userId,
+        name: String(dir.name || 'Xodim'),
+        phone: cred ? String(cred.phone || '') : existingLocalUser?.phone || '',
+        password: legacyPlainPass || (localPassMatchesRemote ? existingLocalUser!.password : ''),
+        pin: legacyPlainPin || (localPinMatchesRemote ? existingLocalUser!.pin : ''),
+        ...(remotePasswordHash ? { passwordHash: remotePasswordHash } : {}),
+        ...(remotePinHash ? { pinHash: remotePinHash } : {}),
+        ...(cred?.hashAlgo
+          ? { hashAlgo: cred.hashAlgo as User['hashAlgo'] }
+          : existingLocalUser?.hashAlgo
+          ? { hashAlgo: existingLocalUser.hashAlgo }
+          : {}),
+        ...(typeof cred?.authMigrated === 'boolean'
+          ? { authMigrated: cred.authMigrated }
+          : existingLocalUser?.authMigrated !== undefined
+          ? { authMigrated: existingLocalUser.authMigrated }
+          : {}),
+        googleEmail: cred?.googleEmail
+          ? String(cred.googleEmail)
+          : existingLocalUser?.googleEmail,
+        roleId,
+        assignedStoreIds: Array.isArray(dir.assignedStoreIds)
+          ? (dir.assignedStoreIds as string[])
+          : [storeId],
+        ...(Array.isArray(dir.customPermissions)
+          ? { customPermissions: dir.customPermissions as Permission[] }
+          : {}),
+        isActive: Boolean(dir.isActive),
+        ...(dir.avatarColor ? { avatarColor: String(dir.avatarColor) } : {}),
+        storeId,
+        createdAt,
+        updatedAt,
+        createdBy: String(dir.createdBy || ''),
+      };
+      nextUsers.push(mergedUser);
+
+      const mergedEmp: Employee = {
+        id: dir.id,
+        userId,
+        name: mergedUser.name,
+        phone: mergedUser.phone,
+        googleEmail: mergedUser.googleEmail,
+        roleId,
+        baseSalary: cred ? Number(cred.baseSalary || 0) : existingLocalEmp?.baseSalary ?? 0,
+        commissionPercent: cred
+          ? Number(cred.commissionPercent || 0)
+          : existingLocalEmp?.commissionPercent ?? 0,
+        schedule: String(dir.schedule || ''),
+        hiredAt: cred ? String(cred.hiredAt || createdAt) : existingLocalEmp?.hiredAt || createdAt,
+        storeId,
+        createdAt,
+        updatedAt,
+        createdBy: String(dir.createdBy || ''),
+      };
+      nextEmployees.push(mergedEmp);
+    });
+
+    if (nextUsers.length > 0) {
+      next.users = nextUsers;
+      next.employees = nextEmployees;
+    }
+  }
+
+  return reconcilePendingOfflineEdits(base, next);
+}
+
+interface SubcolSpec {
+  colName: string;
+  assign: (bucket: SyncBucket, items: unknown[]) => void;
+  adminOnly?: boolean;
+  sortDescCreatedAt?: boolean;
+  sortCategories?: boolean;
+  mapItem?: (raw: Record<string, unknown>) => unknown;
+}
+
+const SUBCOLLECTION_SPECS: SubcolSpec[] = [
+  { colName: 'stores', assign: (b, items) => { b.stores = items as Store[]; } },
+  { colName: 'warehouses', assign: (b, items) => { b.warehouses = items as Warehouse[]; } },
+  {
+    colName: 'categories',
+    sortCategories: true,
+    assign: (b, items) => {
+      const list = items as Category[];
+      list.sort((a, c) => (a.sortOrder ?? 0) - (c.sortOrder ?? 0));
+      b.categories = list;
+    },
+  },
+  { colName: 'brands', assign: (b, items) => { b.brands = items as Brand[]; } },
+  { colName: 'products', sortDescCreatedAt: true, assign: (b, items) => { b.products = items as Product[]; } },
+  { colName: 'suppliers', sortDescCreatedAt: true, assign: (b, items) => { b.suppliers = items as Supplier[]; } },
+  { colName: 'stockItems', assign: (b, items) => { b.stockItems = items as StockItem[]; } },
+  { colName: 'stockMovements', sortDescCreatedAt: true, assign: (b, items) => { b.stockMovements = items as StockMovement[]; } },
+  { colName: 'purchaseReceipts', sortDescCreatedAt: true, assign: (b, items) => { b.purchaseReceipts = items as PurchaseReceipt[]; } },
+  { colName: 'purchaseOrders', sortDescCreatedAt: true, assign: (b, items) => { b.purchaseOrders = items as PurchaseOrder[]; } },
+  { colName: 'transfers', sortDescCreatedAt: true, assign: (b, items) => { b.transfers = items as Transfer[]; } },
+  { colName: 'writeOffs', sortDescCreatedAt: true, assign: (b, items) => { b.writeOffs = items as WriteOff[]; } },
+  { colName: 'stocktakes', sortDescCreatedAt: true, assign: (b, items) => { b.stocktakes = items as Stocktake[]; } },
+  { colName: 'sales', sortDescCreatedAt: true, assign: (b, items) => { b.sales = items as Sale[]; } },
+  { colName: 'returns', sortDescCreatedAt: true, assign: (b, items) => { b.returns = items as Return[]; } },
+  { colName: 'cashShifts', sortDescCreatedAt: true, assign: (b, items) => { b.cashShifts = items as CashShift[]; } },
+  { colName: 'cashOperations', sortDescCreatedAt: true, assign: (b, items) => { b.cashOperations = items as CashOperation[]; } },
+  { colName: 'accounts', assign: (b, items) => { b.accounts = items as Account[]; } },
+  { colName: 'transactions', sortDescCreatedAt: true, assign: (b, items) => { b.transactions = items as Transaction[]; } },
+  { colName: 'expenses', sortDescCreatedAt: true, assign: (b, items) => { b.expenses = items as Expense[]; } },
+  { colName: 'customers', sortDescCreatedAt: true, assign: (b, items) => { b.customers = items as Customer[]; } },
+  { colName: 'loyaltyAccounts', assign: (b, items) => { b.loyaltyAccounts = items as LoyaltyAccount[]; } },
+  { colName: 'loyaltyTransactions', sortDescCreatedAt: true, assign: (b, items) => { b.loyaltyTransactions = items as LoyaltyTransaction[]; } },
+  { colName: 'debts', sortDescCreatedAt: true, assign: (b, items) => { b.debts = items as Debt[]; } },
+  { colName: 'promoCodes', sortDescCreatedAt: true, assign: (b, items) => { b.promoCodes = items as PromoCode[]; } },
+  { colName: 'staffDirectory', assign: (b, items) => { b.staffDirectory = items as (Record<string, unknown> & { id: string })[]; } },
+  { colName: 'targets', assign: (b, items) => { b.targets = items as Target[]; } },
+  { colName: 'onlineOrders', sortDescCreatedAt: true, assign: (b, items) => { b.onlineOrders = items as OnlineOrder[]; } },
+  {
+    colName: 'auditLogs',
+    sortDescCreatedAt: true,
+    assign: (b, items) => { b.auditLogs = items as AuditLog[]; },
+    mapItem: (raw) =>
+      ({
+        ...raw,
+        summary: String(raw.details || raw.action || ''),
+        details: raw.details ? String(raw.details) : undefined,
+      }) as unknown as AuditLog,
+  },
+];
+
+const CORE_WATCH_COLS = new Set(['products', 'stockItems', 'sales', 'onlineOrders']);
+
+async function fetchSubcollectionViaRest(
+  ctx: WorkspaceContext,
+  spec: SubcolSpec
+): Promise<{ items: unknown[]; tracker: { id: string; memberUids?: string[] }[] }> {
+  const wsPath = `workspaces/${ctx.workspaceId}`;
+  const isWorkspaceWide = WORKSPACE_WIDE_READ_COLS.has(spec.colName);
+
+  const filters: (RestFieldFilter | undefined)[] = (() => {
+    if (spec.adminOnly) {
+      return [
+        ctx.isPlatformAdmin || ctx.isWsAdmin
+          ? undefined
+          : { field: 'adminUids', op: 'ARRAY_CONTAINS', value: ctx.uid },
+      ];
+    }
+    if (isWorkspaceWide) {
+      return [
+        ctx.isPlatformAdmin
+          ? undefined
+          : { field: 'memberUids', op: 'ARRAY_CONTAINS', value: ctx.uid },
+      ];
+    }
+    if (ctx.isPlatformAdmin || ctx.isWsAdmin) {
+      return [undefined];
+    }
+    const allowedStores = Array.from(new Set(ctx.assignedStoreIds || [])).filter(Boolean).slice(0, 10);
+    return allowedStores.map((sId) => ({ field: 'storeId', op: 'EQUAL', value: sId }));
+  })();
+
+  if (filters.length === 0) {
+    return { items: [], tracker: [] };
+  }
+
+  const mergedMap = new Map<string, { item: unknown; memberUids?: string[] }>();
+  for (const flt of filters) {
+    const docs = await restRunQuery(wsPath, spec.colName, flt, 12000);
+    for (const raw of docs) {
+      const memberUids = Array.isArray(raw.memberUids) ? (raw.memberUids as string[]) : undefined;
+      const item = spec.mapItem ? spec.mapItem(raw) : raw;
+      mergedMap.set(raw.id, { item, memberUids });
+    }
+  }
+
+  const tracker: { id: string; memberUids?: string[] }[] = [];
+  const items: unknown[] = [];
+  mergedMap.forEach((entry, docId) => {
+    tracker.push({ id: docId, memberUids: entry.memberUids });
+    items.push(entry.item);
+  });
+
+  if (spec.sortDescCreatedAt) {
+    items.sort((a, b) =>
+      String((b as Record<string, unknown>).createdAt || '').localeCompare(
+        String((a as Record<string, unknown>).createdAt || '')
+      )
+    );
+  }
+
+  return { items, tracker };
+}
+
+let activeRestHydration: Promise<boolean> | null = null;
+
+export async function hydrateWorkspaceViaRest(
+  ctx: WorkspaceContext,
+  getBaseSnapshot: () => DatabaseSnapshot | null,
+  onHydrate: (snapshot: DatabaseSnapshot, updatedMeta?: Partial<WorkspaceContext>) => void,
+  options?: { secondaryOnly?: boolean; onFatalError?: (err: Error) => void }
+): Promise<boolean> {
+  if (activeRestHydration) {
+    return activeRestHydration;
+  }
+
+  const run = async (): Promise<boolean> => {
+    const wsPath = `workspaces/${ctx.workspaceId}`;
+    const bucket: SyncBucket = {};
+    const rawMemberTracking: Record<string, { id: string; memberUids?: string[] }[]> = {};
+    let memberMetaUpdate: Partial<WorkspaceContext> | undefined;
+
+    try {
+      const [wsDocRes, memberDocRes, privDocRes] = await Promise.all([
+        restGetDocument(wsPath, 10000),
+        restGetDocument(`${wsPath}/members/${ctx.uid}`, 10000),
+        ctx.isWsAdmin
+          ? restGetDocument(`${wsPath}/privateSettings/integrations`, 10000).catch(() => ({ exists: false, data: null }))
+          : Promise.resolve({ exists: false, data: null }),
+      ]);
+
+      if (memberDocRes.exists && memberDocRes.data) {
+        const md = memberDocRes.data;
+        if (md.isActive === false) {
+          const suspErr = new Error(
+            "Sizning xodim hisobingiz faolsizlantirilgan. Administrator bilan bog'laning."
+          );
+          options?.onFatalError?.(suspErr);
+          return false;
+        }
+        const roleId = (md.roleId as RoleId) || ctx.roleId;
+        const assignedStoreIds = Array.isArray(md.assignedStoreIds) ? (md.assignedStoreIds as string[]) : [];
+        const isWsAdmin =
+          ctx.isPlatformAdmin ||
+          ctx.ownerUid === ctx.uid ||
+          isBootstrappedAdminEmail(ctx.email) ||
+          roleId === 'owner' ||
+          roleId === 'admin';
+        memberMetaUpdate = { roleId, assignedStoreIds, isWsAdmin };
+      }
+
+      if (wsDocRes.exists && wsDocRes.data) {
+        const d = wsDocRes.data;
+        bucket.workspaceMeta = {
+          ownerUid: String(d.ownerUid || ctx.ownerUid),
+          memberUids: Array.isArray(d.memberUids) ? (d.memberUids as string[]) : ctx.memberUids,
+          adminUids: Array.isArray(d.adminUids) ? (d.adminUids as string[]) : ctx.adminUids,
+          invitedEmails: Array.isArray(d.invitedEmails) ? (d.invitedEmails as string[]) : ctx.invitedEmails,
+          roles: Array.isArray(d.roles) ? (d.roles as Role[]) : undefined,
+          settings: d.settings as AppSettings | undefined,
+          version: typeof d.version === 'number' ? d.version : undefined,
+        };
+      }
+
+      if (privDocRes.exists && privDocRes.data) {
+        bucket.privateIntegrations = privDocRes.data.integrations as AppSettings['integrations'];
+      }
+
+      const specsToFetch: SubcolSpec[] = [
+        ...SUBCOLLECTION_SPECS.filter(
+          (s) => !options?.secondaryOnly || !CORE_WATCH_COLS.has(s.colName)
+        ),
+        ...(ctx.isWsAdmin
+          ? [
+              {
+                colName: 'staffCredentials',
+                adminOnly: true,
+                assign: (b: SyncBucket, items: unknown[]) => {
+                  b.staffCredentials = items as (Record<string, unknown> & { id: string })[];
+                },
+              } as SubcolSpec,
+            ]
+          : []),
+      ];
+
+      // Fetch in throttled batches of 6 concurrent REST calls
+      const CONCURRENCY = 6;
+      for (let i = 0; i < specsToFetch.length; i += CONCURRENCY) {
+        const chunk = specsToFetch.slice(i, i + CONCURRENCY);
+        const results = await Promise.all(
+          chunk.map(async (spec) => {
+            const res = await fetchSubcollectionViaRest(ctx, spec);
+            return { spec, res };
+          })
+        );
+        for (const { spec, res } of results) {
+          rawMemberTracking[spec.colName] = res.tracker;
+          spec.assign(bucket, res.items);
+        }
+      }
+
+      const base = getBaseSnapshot();
+      if (!base) return false;
+
+      const hydrated = buildSnapshotFromBucket(base, bucket);
+      const mergedMeta: Partial<WorkspaceContext> | undefined =
+        bucket.workspaceMeta || memberMetaUpdate
+          ? {
+              ...(bucket.workspaceMeta
+                ? {
+                    ownerUid: bucket.workspaceMeta.ownerUid,
+                    memberUids: bucket.workspaceMeta.memberUids,
+                    adminUids: bucket.workspaceMeta.adminUids,
+                    invitedEmails: bucket.workspaceMeta.invitedEmails,
+                  }
+                : {}),
+              ...(memberMetaUpdate || {}),
+            }
+          : undefined;
+
+      onHydrate(hydrated, mergedMeta);
+
+      if (ctx.isWsAdmin && bucket.workspaceMeta?.memberUids) {
+        void propagateMembersIfNeeded(
+          ctx.workspaceId,
+          bucket.workspaceMeta.memberUids,
+          rawMemberTracking
+        );
+      }
+
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  activeRestHydration = run().finally(() => {
+    activeRestHydration = null;
+  });
+  return activeRestHydration;
 }
 
 export function subscribeWorkspaceRealtime(
@@ -2176,11 +2993,28 @@ export function subscribeWorkspaceRealtime(
   onHydrate: (snapshot: DatabaseSnapshot, updatedMeta?: Partial<WorkspaceContext>) => void,
   onFatalError: (err: Error) => void
 ): () => void {
+  if (isFirestoreWatchDisabled()) {
+    return () => {};
+  }
+
   const bucket: SyncBucket = {};
-  const rawMemberTracking: Record<string, { id: string; memberUids?: string[] }[]> = {};
   const unsubs: (() => void)[] = [];
+  const staggerTimers: ReturnType<typeof setTimeout>[] = [];
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
+  let secondaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
+
+  const scheduleSecondaryRefresh = () => {
+    if (disposed) return;
+    if (secondaryRefreshTimer) clearTimeout(secondaryRefreshTimer);
+    secondaryRefreshTimer = setTimeout(() => {
+      if (disposed) return;
+      void hydrateWorkspaceViaRest(ctx, getBaseSnapshot, onHydrate, {
+        secondaryOnly: true,
+        onFatalError,
+      });
+    }, 1200);
+  };
 
   const scheduleFlush = () => {
     if (disposed) return;
@@ -2189,157 +3023,7 @@ export function subscribeWorkspaceRealtime(
       const base = getBaseSnapshot();
       if (!base || disposed) return;
 
-      const guards = extractPendingQueueGuards(base.offlineQueue);
-
-      const next: DatabaseSnapshot = {
-        ...base,
-        version: bucket.workspaceMeta?.version ?? base.version,
-        roles:
-          !guards.hasPendingRoles && bucket.workspaceMeta?.roles?.length
-            ? bucket.workspaceMeta.roles
-            : base.roles,
-        settings: guards.hasPendingSettings
-          ? base.settings
-          : {
-              ...(bucket.workspaceMeta?.settings ?? base.settings),
-              integrations: {
-                ...(bucket.workspaceMeta?.settings?.integrations ?? base.settings.integrations),
-                ...(bucket.privateIntegrations ?? {}),
-              },
-            },
-        stores: mergeCollectionWithPending(bucket.stores, base.stores, guards.upsertStores, guards.deleteStores),
-        warehouses: mergeCollectionWithPending(bucket.warehouses, base.warehouses, guards.upsertWarehouses),
-        categories: guards.resetCategories
-          ? base.categories
-          : mergeCollectionWithPending(bucket.categories, base.categories, guards.upsertCategories, guards.deleteCategories),
-        brands: mergeCollectionWithPending(bucket.brands, base.brands, guards.upsertBrands),
-        products: mergeCollectionWithPending(bucket.products, base.products, guards.upsertProducts, guards.deleteProducts),
-        suppliers: mergeCollectionWithPending(bucket.suppliers, base.suppliers, guards.upsertSuppliers),
-        stockItems: guards.hasPendingStockChanges ? base.stockItems : (bucket.stockItems ?? base.stockItems),
-        stockMovements: guards.hasPendingStockChanges
-          ? base.stockMovements
-          : (bucket.stockMovements ?? base.stockMovements),
-        purchaseReceipts: mergeCollectionWithPending(bucket.purchaseReceipts, base.purchaseReceipts, guards.upsertPurchaseReceipts),
-        purchaseOrders: mergeCollectionWithPending(bucket.purchaseOrders, base.purchaseOrders, guards.upsertPurchaseOrders),
-        transfers: mergeCollectionWithPending(bucket.transfers, base.transfers, guards.upsertTransfers),
-        writeOffs: mergeCollectionWithPending(bucket.writeOffs, base.writeOffs, guards.upsertWriteOffs),
-        stocktakes: mergeCollectionWithPending(bucket.stocktakes, base.stocktakes, guards.upsertStocktakes),
-        sales: mergeCollectionWithPending(bucket.sales, base.sales, guards.upsertSales, guards.deleteSales),
-        returns: mergeCollectionWithPending(bucket.returns, base.returns, guards.upsertReturns),
-        cashShifts: mergeCollectionWithPending(bucket.cashShifts, base.cashShifts, guards.upsertCashShifts),
-        cashOperations: mergeCollectionWithPending(bucket.cashOperations, base.cashOperations, guards.upsertCashOperations),
-        accounts: mergeCollectionWithPending(bucket.accounts, base.accounts, guards.upsertAccounts),
-        transactions: guards.hasPendingTransactions ? base.transactions : (bucket.transactions ?? base.transactions),
-        expenses: mergeCollectionWithPending(bucket.expenses, base.expenses, guards.upsertExpenses),
-        customers: mergeCollectionWithPending(bucket.customers, base.customers, guards.upsertCustomers),
-        loyaltyAccounts: mergeCollectionWithPending(bucket.loyaltyAccounts, base.loyaltyAccounts, guards.upsertLoyaltyAccounts),
-        loyaltyTransactions: guards.hasPendingLoyaltyTx
-          ? base.loyaltyTransactions
-          : (bucket.loyaltyTransactions ?? base.loyaltyTransactions),
-        debts: mergeCollectionWithPending(bucket.debts, base.debts, guards.upsertDebts),
-        promoCodes: mergeCollectionWithPending(bucket.promoCodes, base.promoCodes, guards.upsertPromoCodes),
-        targets: mergeCollectionWithPending(bucket.targets, base.targets, guards.upsertTargets),
-        onlineOrders: mergeCollectionWithPending(bucket.onlineOrders, base.onlineOrders, guards.upsertOnlineOrders),
-        auditLogs: mergeCollectionWithPending(bucket.auditLogs, base.auditLogs, guards.upsertAuditLogs),
-        offlineQueue: base.offlineQueue,
-      };
-
-      // Merge staffDirectory + staffCredentials (or non-PII staffDirectory) into users & employees
-      if (bucket.staffDirectory) {
-        const credById = new Map<string, Record<string, unknown>>();
-        (bucket.staffCredentials || []).forEach((c) => credById.set(c.id, c));
-
-        const nextUsers: User[] = [];
-        const nextEmployees: Employee[] = [];
-        const seenEmpIds = new Set<string>();
-        const seenUserIds = new Set<string>();
-
-        bucket.staffDirectory.forEach((dir) => {
-          if (guards.deleteEmployees.has(dir.id)) return;
-          const cred = credById.get(dir.id);
-          const existingLocalUser = base.users.find((u) => u.id === dir.userId);
-          const existingLocalEmp = base.employees.find((e) => e.id === dir.id || e.userId === dir.userId);
-
-          if (guards.upsertEmployees.has(dir.id) && existingLocalEmp && existingLocalUser) {
-            seenEmpIds.add(existingLocalEmp.id);
-            seenUserIds.add(existingLocalUser.id);
-            nextEmployees.push(existingLocalEmp);
-            nextUsers.push(existingLocalUser);
-            return;
-          }
-
-          const userId = String(dir.userId || dir.id);
-          const roleId = String(dir.roleId || 'cashier') as RoleId;
-          const storeId = String(dir.storeId || next.stores[0]?.id || 'store-chilonzor');
-          const createdAt = toIsoString(dir.createdAt, existingLocalUser?.createdAt);
-          const updatedAt = toIsoString(dir.updatedAt, existingLocalUser?.updatedAt);
-
-          const mergedUser: User = {
-            id: userId,
-            name: String(dir.name || 'Xodim'),
-            phone: cred ? String(cred.phone || '') : existingLocalUser?.phone || '',
-            password: cred ? String(cred.password || '') : existingLocalUser?.password || '',
-            pin: cred ? String(cred.pin || '') : existingLocalUser?.pin || '',
-            googleEmail: cred?.googleEmail
-              ? String(cred.googleEmail)
-              : existingLocalUser?.googleEmail,
-            roleId,
-            assignedStoreIds: Array.isArray(dir.assignedStoreIds)
-              ? (dir.assignedStoreIds as string[])
-              : [storeId],
-            ...(Array.isArray(dir.customPermissions)
-              ? { customPermissions: dir.customPermissions as Permission[] }
-              : {}),
-            isActive: Boolean(dir.isActive),
-            ...(dir.avatarColor ? { avatarColor: String(dir.avatarColor) } : {}),
-            storeId,
-            createdAt,
-            updatedAt,
-            createdBy: String(dir.createdBy || ctx.ownerUid),
-          };
-          nextUsers.push(mergedUser);
-          seenUserIds.add(userId);
-
-          const mergedEmp: Employee = {
-            id: dir.id,
-            userId,
-            name: mergedUser.name,
-            phone: mergedUser.phone,
-            googleEmail: mergedUser.googleEmail,
-            roleId,
-            baseSalary: cred ? Number(cred.baseSalary || 0) : existingLocalEmp?.baseSalary ?? 0,
-            commissionPercent: cred
-              ? Number(cred.commissionPercent || 0)
-              : existingLocalEmp?.commissionPercent ?? 0,
-            schedule: String(dir.schedule || ''),
-            hiredAt: cred ? String(cred.hiredAt || createdAt) : existingLocalEmp?.hiredAt || createdAt,
-            storeId,
-            createdAt,
-            updatedAt,
-            createdBy: String(dir.createdBy || ctx.ownerUid),
-          };
-          nextEmployees.push(mergedEmp);
-          seenEmpIds.add(dir.id);
-        });
-
-        for (const empId of guards.upsertEmployees) {
-          if (guards.deleteEmployees.has(empId) || seenEmpIds.has(empId)) continue;
-          const locEmp = base.employees.find((e) => e.id === empId);
-          if (locEmp) {
-            nextEmployees.push(locEmp);
-            const locUsr = base.users.find((u) => u.id === locEmp.userId);
-            if (locUsr && !seenUserIds.has(locUsr.id)) {
-              nextUsers.push(locUsr);
-            }
-          }
-        }
-
-        if (nextUsers.length > 0) {
-          next.users = nextUsers;
-          next.employees = nextEmployees;
-        }
-      }
-
+      const reconciled = buildSnapshotFromBucket(base, bucket);
       const metaUpdate: Partial<WorkspaceContext> | undefined = bucket.workspaceMeta
         ? {
             ownerUid: bucket.workspaceMeta.ownerUid,
@@ -2349,271 +3033,205 @@ export function subscribeWorkspaceRealtime(
           }
         : undefined;
 
-      onHydrate(next, metaUpdate);
-
-      if (ctx.isWsAdmin && bucket.workspaceMeta?.memberUids) {
-        void propagateMembersIfNeeded(
-          ctx.workspaceId,
-          bucket.workspaceMeta.memberUids,
-          rawMemberTracking
-        );
-      }
-    }, 60);
+      onHydrate(reconciled, metaUpdate);
+    }, 80);
   };
 
   const wsPath = `workspaces/${ctx.workspaceId}`;
 
-  // 1. Workspace Root Listener
-  unsubs.push(
-    onSnapshot(
-      doc(firestoreDb, 'workspaces', ctx.workspaceId),
-      (snap) => {
-        if (!snap.exists()) return;
-        const d = snap.data({ serverTimestamps: 'estimate' });
-        bucket.workspaceMeta = {
-          ownerUid: String(d.ownerUid || ctx.ownerUid),
-          memberUids: Array.isArray(d.memberUids) ? d.memberUids : ctx.memberUids,
-          adminUids: Array.isArray(d.adminUids) ? d.adminUids : ctx.adminUids,
-          invitedEmails: Array.isArray(d.invitedEmails) ? d.invitedEmails : ctx.invitedEmails,
-          roles: Array.isArray(d.roles) ? (d.roles as Role[]) : undefined,
-          settings: d.settings as AppSettings | undefined,
-          version: typeof d.version === 'number' ? d.version : undefined,
-        };
-        scheduleFlush();
-      },
-      (err) => {
-        try {
-          handleFirestoreError(err, OperationType.GET, wsPath);
-        } catch (wrapped) {
-          onFatalError(wrapped as Error);
-        }
-      }
-    )
-  );
-
-  // 2. Own Membership Listener (live RBAC updates)
-  unsubs.push(
-    onSnapshot(
-      doc(firestoreDb, 'workspaces', ctx.workspaceId, 'members', ctx.uid),
-      (snap) => {
-        if (!snap.exists()) return;
-        const md = snap.data({ serverTimestamps: 'estimate' });
-        if (md.isActive === false) {
-          onFatalError(new Error("Sizning xodim hisobingiz faolsizlantirilgan. Administrator bilan bog'laning."));
-          return;
-        }
-        const roleId = (md.roleId as RoleId) || ctx.roleId;
-        const assignedStoreIds = Array.isArray(md.assignedStoreIds) ? md.assignedStoreIds : [];
-        const isWsAdmin =
-          ctx.ownerUid === ctx.uid ||
-          isBootstrappedAdminEmail(ctx.email) ||
-          roleId === 'owner' ||
-          roleId === 'admin';
-        const baseSnap = getBaseSnapshot();
-        if (baseSnap) {
-          onHydrate(baseSnap, {
-            roleId,
-            assignedStoreIds,
-            isWsAdmin,
-            ...(md.staffId ? { staffId: String(md.staffId) } : {}),
-          });
-        }
-      },
-      (err) => {
-        try {
-          handleFirestoreError(err, OperationType.GET, `${wsPath}/members/${ctx.uid}`);
-        } catch (wrapped) {
-          onFatalError(wrapped as Error);
-        }
-      }
-    )
-  );
-
-  // Helper to attach subcollection listeners cleanly
-  const watchCol = <T extends object>(
-    colName: string,
-    assign: (items: T[]) => void,
-    options?: { adminOnly?: boolean; sortDescCreatedAt?: boolean; mapItem?: (raw: Record<string, unknown>) => T }
-  ) => {
-    const colPath = `${wsPath}/${colName}`;
-    const colRef = collection(firestoreDb, 'workspaces', ctx.workspaceId, colName);
-    const q = ctx.isPlatformAdmin
-      ? colRef
-      : options?.adminOnly
-      ? query(colRef, where('adminUids', 'array-contains', ctx.uid))
-      : query(colRef, where('memberUids', 'array-contains', ctx.uid));
-
-    unsubs.push(
-      onSnapshot(
-        q,
-        (snap) => {
-          const tracker: { id: string; memberUids?: string[] }[] = [];
-          const items = snap.docs.map((d) => {
-            const raw = d.data({ serverTimestamps: 'estimate' }) as Record<string, unknown>;
-            tracker.push({
-              id: d.id,
-              memberUids: Array.isArray(raw.memberUids) ? (raw.memberUids as string[]) : undefined,
-            });
-            const normalized = normalizeDocDates({ ...raw, id: d.id });
-            return options?.mapItem ? options.mapItem(normalized) : (normalized as unknown as T);
-          });
-          if (options?.sortDescCreatedAt) {
-            items.sort((a, b) =>
-              String((b as unknown as Record<string, unknown>).createdAt || '').localeCompare(
-                String((a as unknown as Record<string, unknown>).createdAt || '')
-              )
-            );
-          }
-          rawMemberTracking[colName] = tracker;
-          assign(items);
-          scheduleFlush();
-        },
-        (err) => {
-          try {
-            handleFirestoreError(err, OperationType.LIST, colPath);
-          } catch (wrapped) {
-            onFatalError(wrapped as Error);
-          }
-        }
-      )
-    );
+  const handleListenerError = (err: unknown, op: OperationType, path: string) => {
+    if (isFirestoreInternalAssertionError(err)) {
+      markFirestoreWatchDisabled();
+      return;
+    }
+    try {
+      handleFirestoreError(err, op, path);
+    } catch (wrapped) {
+      onFatalError(wrapped as Error);
+    }
   };
 
-  watchCol<Store>('stores', (items) => {
-    bucket.stores = items;
-  });
-  watchCol<Warehouse>('warehouses', (items) => {
-    bucket.warehouses = items;
-  });
-  watchCol<Category>('categories', (items) => {
-    items.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
-    bucket.categories = items;
-  });
-  watchCol<Brand>('brands', (items) => {
-    bucket.brands = items;
-  });
-  watchCol<Product>('products', (items) => {
-    bucket.products = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<Supplier>('suppliers', (items) => {
-    bucket.suppliers = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<StockItem>('stockItems', (items) => {
-    bucket.stockItems = items;
-  });
-  watchCol<StockMovement>('stockMovements', (items) => {
-    bucket.stockMovements = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<PurchaseReceipt>('purchaseReceipts', (items) => {
-    bucket.purchaseReceipts = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<PurchaseOrder>('purchaseOrders', (items) => {
-    bucket.purchaseOrders = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<Transfer>('transfers', (items) => {
-    bucket.transfers = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<WriteOff>('writeOffs', (items) => {
-    bucket.writeOffs = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<Stocktake>('stocktakes', (items) => {
-    bucket.stocktakes = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<Sale>('sales', (items) => {
-    bucket.sales = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<Return>('returns', (items) => {
-    bucket.returns = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<CashShift>('cashShifts', (items) => {
-    bucket.cashShifts = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<CashOperation>('cashOperations', (items) => {
-    bucket.cashOperations = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<Account>('accounts', (items) => {
-    bucket.accounts = items;
-  });
-  watchCol<Transaction>('transactions', (items) => {
-    bucket.transactions = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<Expense>('expenses', (items) => {
-    bucket.expenses = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<Customer>('customers', (items) => {
-    bucket.customers = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<LoyaltyAccount>('loyaltyAccounts', (items) => {
-    bucket.loyaltyAccounts = items;
-  });
-  watchCol<LoyaltyTransaction>('loyaltyTransactions', (items) => {
-    bucket.loyaltyTransactions = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<Debt>('debts', (items) => {
-    bucket.debts = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<PromoCode>('promoCodes', (items) => {
-    bucket.promoCodes = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<Record<string, unknown> & { id: string }>('staffDirectory', (items) => {
-    bucket.staffDirectory = items;
-  });
-  watchCol<Target>('targets', (items) => {
-    bucket.targets = items;
-  });
-  watchCol<OnlineOrder>('onlineOrders', (items) => {
-    bucket.onlineOrders = items;
-  }, { sortDescCreatedAt: true });
-  watchCol<AuditLog>(
-    'auditLogs',
-    (items) => {
-      bucket.auditLogs = items;
-    },
-    {
-      sortDescCreatedAt: true,
-      mapItem: (raw) =>
-        ({
-          ...raw,
-          summary: String(raw.details || raw.action || ''),
-          details: raw.details ? String(raw.details) : undefined,
-        }) as unknown as AuditLog,
+  const scheduleAttach = (delayMs: number, fn: () => void) => {
+    if (disposed || isFirestoreWatchDisabled()) return;
+    if (delayMs <= 0) {
+      fn();
+      return;
     }
-  );
+    const handle = setTimeout(() => {
+      if (disposed || isFirestoreWatchDisabled()) return;
+      fn();
+    }, delayMs);
+    staggerTimers.push(handle);
+  };
 
-  // Admin-only split PII & integration secrets
-  if (ctx.isWsAdmin) {
-    watchCol<Record<string, unknown> & { id: string }>(
-      'staffCredentials',
-      (items) => {
-        bucket.staffCredentials = items;
-      },
-      { adminOnly: true }
-    );
-
+  // Stagger only 6 core operational Watch listeners (eliminates 33-target simultaneous burst ca9 bug)
+  // 1. Workspace Root Listener (settings, roles, memberUids)
+  scheduleAttach(0, () => {
+    let firstSnap = true;
     unsubs.push(
       onSnapshot(
-        doc(firestoreDb, 'workspaces', ctx.workspaceId, 'privateSettings', 'integrations'),
+        doc(firestoreDb, 'workspaces', ctx.workspaceId),
         (snap) => {
-          if (!snap.exists()) return;
+          if (!snap.exists() || disposed) return;
           const d = snap.data({ serverTimestamps: 'estimate' });
-          bucket.privateIntegrations = d.integrations as AppSettings['integrations'];
+          bucket.workspaceMeta = {
+            ownerUid: String(d.ownerUid || ctx.ownerUid),
+            memberUids: Array.isArray(d.memberUids) ? d.memberUids : ctx.memberUids,
+            adminUids: Array.isArray(d.adminUids) ? d.adminUids : ctx.adminUids,
+            invitedEmails: Array.isArray(d.invitedEmails) ? d.invitedEmails : ctx.invitedEmails,
+            roles: Array.isArray(d.roles) ? (d.roles as Role[]) : undefined,
+            settings: d.settings as AppSettings | undefined,
+            version: typeof d.version === 'number' ? d.version : undefined,
+          };
           scheduleFlush();
-        },
-        (err) => {
-          try {
-            handleFirestoreError(err, OperationType.GET, `${wsPath}/privateSettings/integrations`);
-          } catch (wrapped) {
-            onFatalError(wrapped as Error);
+          if (firstSnap) {
+            firstSnap = false;
+          } else {
+            scheduleSecondaryRefresh();
           }
-        }
+        },
+        (err) => handleListenerError(err, OperationType.GET, wsPath)
       )
     );
-  }
+  });
+
+  // 2. Own Membership Listener (live RBAC & suspension enforcement)
+  let lastMemberSig = `${ctx.roleId}|${ctx.isWsAdmin}|${(ctx.assignedStoreIds || []).join(',')}`;
+  scheduleAttach(160, () => {
+    unsubs.push(
+      onSnapshot(
+        doc(firestoreDb, 'workspaces', ctx.workspaceId, 'members', ctx.uid),
+        (snap) => {
+          if (!snap.exists() || disposed) return;
+          const md = snap.data({ serverTimestamps: 'estimate' });
+          if (md.isActive === false) {
+            onFatalError(new Error("Sizning xodim hisobingiz faolsizlantirilgan. Administrator bilan bog'laning."));
+            return;
+          }
+          const roleId = (md.roleId as RoleId) || ctx.roleId;
+          const assignedStoreIds = Array.isArray(md.assignedStoreIds) ? md.assignedStoreIds : [];
+          const isWsAdmin =
+            ctx.isPlatformAdmin ||
+            ctx.ownerUid === ctx.uid ||
+            isBootstrappedAdminEmail(ctx.email) ||
+            roleId === 'owner' ||
+            roleId === 'admin';
+          const nextSig = `${roleId}|${isWsAdmin}|${assignedStoreIds.join(',')}`;
+          if (nextSig !== lastMemberSig) {
+            lastMemberSig = nextSig;
+            const baseSnap = getBaseSnapshot();
+            if (baseSnap) {
+              onHydrate(baseSnap, { roleId, assignedStoreIds, isWsAdmin });
+            }
+          }
+        },
+        (err) => handleListenerError(err, OperationType.GET, `${wsPath}/members/${ctx.uid}`)
+      )
+    );
+  });
+
+  // Helper for staggered core operational collection listeners
+  const watchCoreCol = <T extends object>(
+    delayMs: number,
+    colName: string,
+    assign: (items: T[]) => void,
+    options?: { sortDescCreatedAt?: boolean; refreshSecondaryOnDelta?: boolean }
+  ) => {
+    scheduleAttach(delayMs, () => {
+      const colPath = `${wsPath}/${colName}`;
+      const colRef = collection(firestoreDb, 'workspaces', ctx.workspaceId, colName);
+      const queries = (() => {
+        if (ctx.isPlatformAdmin || ctx.isWsAdmin) {
+          return [colRef];
+        }
+        const allowedStores = Array.from(new Set(ctx.assignedStoreIds || [])).filter(Boolean).slice(0, 10);
+        return allowedStores.map((sId) => query(colRef, where('storeId', '==', sId)));
+      })();
+
+      if (queries.length === 0) {
+        assign([]);
+        scheduleFlush();
+        return;
+      }
+
+      const docsByQueryIdx = new Map<number, Map<string, T>>();
+      let initialPending = queries.length;
+      const emitMerged = () => {
+        if (disposed) return;
+        const mergedMap = new Map<string, T>();
+        docsByQueryIdx.forEach((m) => {
+          m.forEach((val, docId) => mergedMap.set(docId, val));
+        });
+        const items: T[] = Array.from(mergedMap.values());
+        if (options?.sortDescCreatedAt) {
+          items.sort((a, b) =>
+            String((b as unknown as Record<string, unknown>).createdAt || '').localeCompare(
+              String((a as unknown as Record<string, unknown>).createdAt || '')
+            )
+          );
+        }
+        assign(items);
+        scheduleFlush();
+        if (options?.refreshSecondaryOnDelta) {
+          if (initialPending > 0) {
+            initialPending -= 1;
+          } else {
+            scheduleSecondaryRefresh();
+          }
+        }
+      };
+
+      queries.forEach((q, qIdx) => {
+        unsubs.push(
+          onSnapshot(
+            q,
+            (snap) => {
+              if (disposed) return;
+              const localMap = new Map<string, T>();
+              snap.docs.forEach((d) => {
+                const raw = d.data({ serverTimestamps: 'estimate' }) as Record<string, unknown>;
+                const normalized = normalizeDocDates({ ...raw, id: d.id });
+                localMap.set(d.id, normalized as unknown as T);
+              });
+              docsByQueryIdx.set(qIdx, localMap);
+              emitMerged();
+            },
+            (err) => handleListenerError(err, OperationType.LIST, colPath)
+          )
+        );
+      });
+    });
+  };
+
+  // 3-6. High-churn live operational collections (staggered)
+  watchCoreCol<Product>(320, 'products', (items) => {
+    bucket.products = items;
+  }, { sortDescCreatedAt: true, refreshSecondaryOnDelta: true });
+
+  watchCoreCol<StockItem>(480, 'stockItems', (items) => {
+    bucket.stockItems = items;
+  });
+
+  watchCoreCol<Sale>(640, 'sales', (items) => {
+    bucket.sales = items;
+  }, { sortDescCreatedAt: true, refreshSecondaryOnDelta: true });
+
+  watchCoreCol<OnlineOrder>(800, 'onlineOrders', (items) => {
+    bucket.onlineOrders = items;
+  }, { sortDescCreatedAt: true, refreshSecondaryOnDelta: true });
 
   return () => {
     disposed = true;
     if (flushTimer) clearTimeout(flushTimer);
-    unsubs.forEach((fn) => fn());
+    if (secondaryRefreshTimer) clearTimeout(secondaryRefreshTimer);
+    staggerTimers.forEach((t) => clearTimeout(t));
+    unsubs.forEach((fn) => {
+      try {
+        fn();
+      } catch {
+        // ignore listener unsubscribe errors
+      }
+    });
   };
 }
 
@@ -2663,48 +3281,36 @@ export async function pushSyncItemToFirestore(
       qtyDelta: number;
       movement?: StockMovement;
     }[],
-    options?: { skipSyncMarker?: boolean }
+    markFinalOp = false
   ) => {
+    const stockPhaseId = markFinalOp ? opId : sanitizeId(`${opId}__stock`);
+    const phaseOpRef = markFinalOp ? syncedOpRef : doc(firestoreDb, wsPath, 'syncedOps', stockPhaseId);
     try {
       await runTransaction(firestoreDb, async (tx) => {
-        const opSnap = await tx.get(syncedOpRef);
+        const opSnap = await tx.get(phaseOpRef);
         if (opSnap.exists()) return;
 
-        // Read all affected stockItems and movements first (Firestore transactions require all reads before writes)
+        // Read all affected stockItems first (Firestore transactions require all reads before writes)
         const reads: {
           entry: (typeof entries)[number];
           ref: ReturnType<typeof doc>;
           exists: boolean;
           currentQty: number;
-          movRef: ReturnType<typeof doc> | null;
-          movExists: boolean;
         }[] = [];
 
         for (const entry of entries) {
           const stkId = stockItemDocId(entry.warehouseId, entry.variantId);
           const ref = doc(firestoreDb, wsPath, 'stockItems', stkId);
           const snap = await tx.get(ref);
-          let movRef: ReturnType<typeof doc> | null = null;
-          let movExists = false;
-          if (entry.movement) {
-            movRef = doc(firestoreDb, wsPath, 'stockMovements', sanitizeId(entry.movement.id));
-            const movSnap = await tx.get(movRef);
-            movExists = movSnap.exists();
-          }
           reads.push({
             entry,
             ref,
             exists: snap.exists(),
             currentQty: snap.exists() ? Number(snap.data().qty || 0) : 0,
-            movRef,
-            movExists,
           });
         }
 
         for (const r of reads) {
-          // Idempotency guard: if this movement was already committed in an earlier attempt, skip double-applying delta
-          if (r.movExists) continue;
-
           const nextQty = Number((r.currentQty + r.entry.qtyDelta).toFixed(3));
           const stkId = stockItemDocId(r.entry.warehouseId, r.entry.variantId);
           if (r.exists) {
@@ -2729,25 +3335,26 @@ export async function pushSyncItemToFirestore(
             );
           }
 
-          if (r.entry.movement && r.movRef) {
+          if (r.entry.movement) {
             const mov = { ...r.entry.movement, qtyAfter: nextQty };
-            tx.set(r.movRef, serializeStockMovement(mov, tenantCtx));
+            tx.set(
+              doc(firestoreDb, wsPath, 'stockMovements', sanitizeId(mov.id)),
+              serializeStockMovement(mov, tenantCtx)
+            );
           }
         }
 
-        if (!options?.skipSyncMarker) {
-          tx.set(syncedOpRef, {
-            id: opId,
-            opType: clampStr(item.type, 80),
-            actorUid: ctx.uid,
-            storeId: storeIdForOp,
-            ownerUid: ctx.ownerUid,
-            memberUids: Array.from(new Set([ctx.ownerUid, ...ctx.memberUids])).slice(0, 50),
-            createdBy: ctx.uid,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-        }
+        tx.set(phaseOpRef, {
+          id: stockPhaseId,
+          opType: clampStr(markFinalOp ? item.type : `${item.type}_stock`, 80),
+          actorUid: ctx.uid,
+          storeId: storeIdForOp,
+          ownerUid: ctx.ownerUid,
+          memberUids: Array.from(new Set([ctx.ownerUid, ...ctx.memberUids])).slice(0, 50),
+          createdBy: ctx.uid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
       });
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, `${wsPath}/stockItems`);
@@ -2767,7 +3374,6 @@ export async function pushSyncItemToFirestore(
           batch.update(ref, {
             nameUz: nonEmptyStr(cat.nameUz, 120, 'Kategoriya'),
             nameRu: nonEmptyStr(cat.nameRu, 120, cat.nameUz),
-            ...(cat.parentId ? { parentId: clampStr(cat.parentId, 128) } : {}),
             sortOrder: Number(cat.sortOrder) || 0,
             updatedAt: serverTimestamp(),
           });
@@ -2803,7 +3409,6 @@ export async function pushSyncItemToFirestore(
       case 'categories_reset': {
         const writer = new ChunkedBatchWriter();
         const existingSnap = await getDocs(collection(firestoreDb, wsPath, 'categories'));
-        const existingIds = new Set(existingSnap.docs.map((d) => d.id));
         const newIds = new Set(snapshot.categories.map((c) => sanitizeId(c.id)));
         existingSnap.docs.forEach((d) => {
           if (!newIds.has(d.id)) {
@@ -2811,21 +3416,9 @@ export async function pushSyncItemToFirestore(
           }
         });
         snapshot.categories.forEach((c) => {
-          const cid = sanitizeId(c.id);
-          const ref = doc(firestoreDb, wsPath, 'categories', cid);
-          if (existingIds.has(cid)) {
-            writer.add((b) =>
-              b.update(ref, {
-                nameUz: nonEmptyStr(c.nameUz, 120, 'Kategoriya'),
-                nameRu: nonEmptyStr(c.nameRu, 120, c.nameUz),
-                ...(c.parentId ? { parentId: clampStr(c.parentId, 128) } : {}),
-                sortOrder: Number(c.sortOrder) || 0,
-                updatedAt: serverTimestamp(),
-              })
-            );
-          } else {
-            writer.add((b) => b.set(ref, serializeCategory(c, tenantCtx)));
-          }
+          writer.add((b) =>
+            b.set(doc(firestoreDb, wsPath, 'categories', sanitizeId(c.id)), serializeCategory(c, tenantCtx))
+          );
         });
         snapshot.products.forEach((p) => {
           writer.add((b) =>
@@ -2927,16 +3520,19 @@ export async function pushSyncItemToFirestore(
         const movementId = String(payload.movementId || '');
         const mov = snapshot.stockMovements.find((m) => m.id === movementId);
         if (!mov) return;
-        await applyStockDeltasInTx([
-          {
-            productId: mov.productId,
-            variantId: mov.variantId,
-            warehouseId: mov.warehouseId,
-            storeId: mov.storeId,
-            qtyDelta: mov.qtyDelta,
-            movement: mov,
-          },
-        ]);
+        await applyStockDeltasInTx(
+          [
+            {
+              productId: mov.productId,
+              variantId: mov.variantId,
+              warehouseId: mov.warehouseId,
+              storeId: mov.storeId,
+              qtyDelta: mov.qtyDelta,
+              movement: mov,
+            },
+          ],
+          true
+        );
         return;
       }
 
@@ -2944,12 +3540,27 @@ export async function pushSyncItemToFirestore(
         const productIds = Array.isArray(payload.productIds) ? (payload.productIds as string[]) : [];
         const movementIds = Array.isArray(payload.movementIds) ? (payload.movementIds as string[]) : [];
         const writer = new ChunkedBatchWriter();
-        productIds.forEach((pid) => {
+        for (const pid of productIds) {
           const prod = snapshot.products.find((p) => p.id === pid);
-          if (prod) {
-            writer.add((b) => b.set(doc(firestoreDb, wsPath, 'products', sanitizeId(prod.id)), serializeProduct(prod, tenantCtx)));
+          if (!prod) continue;
+          const ref = doc(firestoreDb, wsPath, 'products', sanitizeId(prod.id));
+          const serialized = serializeProduct(prod, tenantCtx);
+          const existingSnap = item.attempts > 0 ? await getDoc(ref) : null;
+          if (existingSnap?.exists()) {
+            const {
+              id: _id,
+              ownerUid: _o,
+              createdBy: _cb,
+              createdAt: _ca,
+              storeId: _s,
+              memberUids: _m,
+              ...updatable
+            } = serialized;
+            writer.add((b) => b.update(ref, { ...updatable, updatedAt: serverTimestamp() }));
+          } else {
+            writer.add((b) => b.set(ref, serialized));
           }
-        });
+        }
         await writer.commitAll(`${wsPath}/products`);
         const entries = movementIds
           .map((mid) => snapshot.stockMovements.find((m) => m.id === mid))
@@ -2963,12 +3574,11 @@ export async function pushSyncItemToFirestore(
             movement: m!,
           }));
         if (entries.length > 0) {
-          await applyStockDeltasInTx(entries);
-        } else {
-          const b = writeBatch(firestoreDb);
-          markSyncedInBatch(b);
-          await b.commit();
+          await applyStockDeltasInTx(entries, false);
         }
+        const b = writeBatch(firestoreDb);
+        markSyncedInBatch(b);
+        await b.commit();
         return;
       }
 
@@ -2981,7 +3591,7 @@ export async function pushSyncItemToFirestore(
           .map((id) => snapshot.stockMovements.find((m) => m.id === id))
           .filter(Boolean) as StockMovement[];
 
-        // Update stock atomically first (keep syncedOp for final batch)
+        // Update stock atomically first
         if (movements.length > 0) {
           await applyStockDeltasInTx(
             movements.map((m) => ({
@@ -2991,8 +3601,7 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            })),
-            { skipSyncMarker: true }
+            }))
           );
         }
 
@@ -3014,16 +3623,18 @@ export async function pushSyncItemToFirestore(
 
         const sup = snapshot.suppliers.find((s) => s.id === pr.supplierId);
         if (sup) {
+          const supDelta = typeof payload.supplierDebtDelta === 'number' ? payload.supplierDebtDelta : null;
           batch.update(doc(firestoreDb, wsPath, 'suppliers', sanitizeId(sup.id)), {
-            debtBalance: sup.debtBalance,
+            debtBalance: supDelta !== null ? increment(supDelta) : sup.debtBalance,
             updatedAt: serverTimestamp(),
           });
         }
         if (payload.accountId) {
           const acc = snapshot.accounts.find((a) => a.id === String(payload.accountId));
           if (acc) {
+            const accDelta = typeof payload.accountDelta === 'number' ? payload.accountDelta : null;
             batch.update(doc(firestoreDb, wsPath, 'accounts', sanitizeId(acc.id)), {
-              balance: acc.balance,
+              balance: accDelta !== null ? increment(accDelta) : acc.balance,
               updatedAt: serverTimestamp(),
             });
           }
@@ -3076,8 +3687,7 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            })),
-            { skipSyncMarker: true }
+            }))
           );
         }
         const batch = writeBatch(firestoreDb);
@@ -3105,8 +3715,7 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            })),
-            { skipSyncMarker: true }
+            }))
           );
         }
         const batch = writeBatch(firestoreDb);
@@ -3138,8 +3747,7 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            })),
-            { skipSyncMarker: true }
+            }))
           );
         }
         const batch = writeBatch(firestoreDb);
@@ -3196,8 +3804,7 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            })),
-            { skipSyncMarker: true }
+            }))
           );
         }
         const batch = writeBatch(firestoreDb);
@@ -3249,14 +3856,16 @@ export async function pushSyncItemToFirestore(
         const trx = snapshot.transactions.find((t) => t.id === String(payload.transactionId || ''));
         const batch = writeBatch(firestoreDb);
         if (sup) {
+          const supDelta = typeof payload.supplierDebtDelta === 'number' ? payload.supplierDebtDelta : null;
           batch.update(doc(firestoreDb, wsPath, 'suppliers', sanitizeId(sup.id)), {
-            debtBalance: sup.debtBalance,
+            debtBalance: supDelta !== null ? increment(supDelta) : sup.debtBalance,
             updatedAt: serverTimestamp(),
           });
         }
         if (acc) {
+          const accDelta = typeof payload.accountDelta === 'number' ? payload.accountDelta : null;
           batch.update(doc(firestoreDb, wsPath, 'accounts', sanitizeId(acc.id)), {
-            balance: acc.balance,
+            balance: accDelta !== null ? increment(accDelta) : acc.balance,
             updatedAt: serverTimestamp(),
           });
         }
@@ -3288,8 +3897,7 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            })),
-            { skipSyncMarker: true }
+            }))
           );
         }
 
@@ -3303,6 +3911,17 @@ export async function pushSyncItemToFirestore(
               payments: sale.payments,
               paidAmount: sale.paidAmount,
               debtAmount: sale.debtAmount,
+              totalAmount: sale.totalAmount,
+              vatAmount: sale.vatAmount,
+              loyaltyPointsSpent: sale.loyaltyPointsSpent,
+              loyaltyPointsEarned: sale.loyaltyPointsEarned,
+              cashierId: sale.cashierId,
+              cashierName: sale.cashierName,
+              offlineCreated: false,
+              syncedAt: new Date().toISOString(),
+              ...(sale.customerId !== undefined ? { customerId: sale.customerId } : {}),
+              ...(sale.customerName !== undefined ? { customerName: sale.customerName } : {}),
+              ...(sale.shiftId !== undefined ? { shiftId: sale.shiftId } : {}),
               ...(sale.cashGiven !== undefined ? { cashGiven: sale.cashGiven } : {}),
               ...(sale.changeAmount !== undefined ? { changeAmount: sale.changeAmount } : {}),
               ...(sale.paidAt ? { paidAt: sale.paidAt } : {}),
@@ -3316,21 +3935,25 @@ export async function pushSyncItemToFirestore(
         if (sale.customerId) {
           const cust = snapshot.customers.find((c) => c.id === sale.customerId);
           if (cust) {
+            const spentDelta = typeof payload.customerSpentDelta === 'number' ? payload.customerSpentDelta : null;
+            const ordersDelta = typeof payload.customerOrdersDelta === 'number' ? payload.customerOrdersDelta : null;
+            const cDebtDelta = typeof payload.customerDebtDelta === 'number' ? payload.customerDebtDelta : null;
             batch.update(doc(firestoreDb, wsPath, 'customers', sanitizeId(cust.id)), {
-              totalSpent: cust.totalSpent,
-              ordersCount: cust.ordersCount,
+              totalSpent: spentDelta !== null ? increment(spentDelta) : cust.totalSpent,
+              ordersCount: ordersDelta !== null ? increment(ordersDelta) : cust.ordersCount,
               ...(cust.lastPurchaseAt ? { lastPurchaseAt: cust.lastPurchaseAt } : {}),
               segment: cust.segment,
-              debtBalance: cust.debtBalance,
+              debtBalance: cDebtDelta !== null ? increment(cDebtDelta) : cust.debtBalance,
               updatedAt: serverTimestamp(),
             });
           }
           const loy = snapshot.loyaltyAccounts.find((l) => l.customerId === sale.customerId);
           if (loy) {
+            const loyDelta = typeof payload.loyaltyPointsDelta === 'number' ? payload.loyaltyPointsDelta : null;
             batch.update(doc(firestoreDb, wsPath, 'loyaltyAccounts', sanitizeId(loy.id)), {
               tier: loy.tier,
               cashbackPercent: loy.cashbackPercent,
-              pointsBalance: loy.pointsBalance,
+              pointsBalance: loyDelta !== null ? increment(loyDelta) : loy.pointsBalance,
               ...(loy.expiresAt ? { expiresAt: loy.expiresAt } : {}),
               updatedAt: serverTimestamp(),
             });
@@ -3358,8 +3981,9 @@ export async function pushSyncItemToFirestore(
         if (sale.promoCode) {
           const promo = snapshot.promoCodes.find((p) => p.code.toUpperCase() === sale.promoCode?.toUpperCase());
           if (promo) {
+            const promoDelta = typeof payload.promoUsedDelta === 'number' ? payload.promoUsedDelta : null;
             batch.update(doc(firestoreDb, wsPath, 'promoCodes', sanitizeId(promo.id)), {
-              usedCount: promo.usedCount,
+              usedCount: promoDelta !== null ? increment(promoDelta) : promo.usedCount,
               updatedAt: serverTimestamp(),
             });
           }
@@ -3368,22 +3992,31 @@ export async function pushSyncItemToFirestore(
         if (sale.shiftId) {
           const sh = snapshot.cashShifts.find((s) => s.id === sale.shiftId);
           if (sh) {
+            const sDeltas = (payload.shiftDeltas || null) as
+              | { cashSales?: number; cardSales?: number; otherSales?: number; expectedCash?: number }
+              | null;
             batch.update(doc(firestoreDb, wsPath, 'cashShifts', sanitizeId(sh.id)), {
-              cashSalesTotal: sh.cashSalesTotal,
-              cardSalesTotal: sh.cardSalesTotal,
-              otherSalesTotal: sh.otherSalesTotal,
-              expectedCash: sh.expectedCash,
+              cashSalesTotal:
+                typeof sDeltas?.cashSales === 'number' ? increment(sDeltas.cashSales) : sh.cashSalesTotal,
+              cardSalesTotal:
+                typeof sDeltas?.cardSales === 'number' ? increment(sDeltas.cardSales) : sh.cardSalesTotal,
+              otherSalesTotal:
+                typeof sDeltas?.otherSales === 'number' ? increment(sDeltas.otherSales) : sh.otherSalesTotal,
+              expectedCash:
+                typeof sDeltas?.expectedCash === 'number' ? increment(sDeltas.expectedCash) : sh.expectedCash,
               updatedAt: serverTimestamp(),
             });
           }
         }
 
         const accountIds = Array.isArray(payload.accountIds) ? (payload.accountIds as string[]) : [];
+        const accountDeltas = (payload.accountDeltas || null) as Record<string, number> | null;
         accountIds.forEach((accId) => {
           const acc = snapshot.accounts.find((a) => a.id === accId);
           if (acc) {
+            const delta = accountDeltas && typeof accountDeltas[accId] === 'number' ? accountDeltas[accId] : null;
             batch.update(doc(firestoreDb, wsPath, 'accounts', sanitizeId(acc.id)), {
-              balance: acc.balance,
+              balance: delta !== null ? increment(delta) : acc.balance,
               updatedAt: serverTimestamp(),
             });
           }
@@ -3437,8 +4070,7 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            })),
-            { skipSyncMarker: true }
+            }))
           );
         }
 
@@ -3454,9 +4086,10 @@ export async function pushSyncItemToFirestore(
         if (payload.shiftId) {
           const sh = snapshot.cashShifts.find((s) => s.id === String(payload.shiftId));
           if (sh) {
+            const refundDelta = typeof payload.shiftCashRefundDelta === 'number' ? payload.shiftCashRefundDelta : null;
             batch.update(doc(firestoreDb, wsPath, 'cashShifts', sanitizeId(sh.id)), {
-              cashRefundsTotal: sh.cashRefundsTotal,
-              expectedCash: sh.expectedCash,
+              cashRefundsTotal: refundDelta !== null ? increment(refundDelta) : sh.cashRefundsTotal,
+              expectedCash: refundDelta !== null ? increment(-refundDelta) : sh.expectedCash,
               updatedAt: serverTimestamp(),
             });
           }
@@ -3464,8 +4097,9 @@ export async function pushSyncItemToFirestore(
         if (payload.accountId) {
           const acc = snapshot.accounts.find((a) => a.id === String(payload.accountId));
           if (acc) {
+            const accDelta = typeof payload.accountDelta === 'number' ? payload.accountDelta : null;
             batch.update(doc(firestoreDb, wsPath, 'accounts', sanitizeId(acc.id)), {
-              balance: acc.balance,
+              balance: accDelta !== null ? increment(accDelta) : acc.balance,
               updatedAt: serverTimestamp(),
             });
           }
@@ -3524,10 +4158,13 @@ export async function pushSyncItemToFirestore(
         batch.set(doc(firestoreDb, wsPath, 'cashOperations', sanitizeId(cop.id)), serializeCashOperation(cop, tenantCtx));
         const sh = snapshot.cashShifts.find((s) => s.id === cop.shiftId);
         if (sh) {
+          const inDelta = typeof payload.shiftCashInDelta === 'number' ? payload.shiftCashInDelta : null;
+          const outDelta = typeof payload.shiftCashOutDelta === 'number' ? payload.shiftCashOutDelta : null;
+          const expDelta = typeof payload.shiftExpectedCashDelta === 'number' ? payload.shiftExpectedCashDelta : null;
           batch.update(doc(firestoreDb, wsPath, 'cashShifts', sanitizeId(sh.id)), {
-            cashInTotal: sh.cashInTotal,
-            cashOutTotal: sh.cashOutTotal,
-            expectedCash: sh.expectedCash,
+            cashInTotal: inDelta !== null ? increment(inDelta) : sh.cashInTotal,
+            cashOutTotal: outDelta !== null ? increment(outDelta) : sh.cashOutTotal,
+            expectedCash: expDelta !== null ? increment(expDelta) : sh.expectedCash,
             updatedAt: serverTimestamp(),
           });
         }
@@ -3586,16 +4223,18 @@ export async function pushSyncItemToFirestore(
         });
         const cust = snapshot.customers.find((c) => c.id === debt.customerId);
         if (cust) {
+          const cDebtDelta = typeof payload.customerDebtDelta === 'number' ? payload.customerDebtDelta : null;
           batch.update(doc(firestoreDb, wsPath, 'customers', sanitizeId(cust.id)), {
-            debtBalance: cust.debtBalance,
+            debtBalance: cDebtDelta !== null ? increment(cDebtDelta) : cust.debtBalance,
             updatedAt: serverTimestamp(),
           });
         }
         if (payload.accountId) {
           const acc = snapshot.accounts.find((a) => a.id === String(payload.accountId));
           if (acc) {
+            const accDelta = typeof payload.accountDelta === 'number' ? payload.accountDelta : null;
             batch.update(doc(firestoreDb, wsPath, 'accounts', sanitizeId(acc.id)), {
-              balance: acc.balance,
+              balance: accDelta !== null ? increment(accDelta) : acc.balance,
               updatedAt: serverTimestamp(),
             });
           }
@@ -3653,8 +4292,9 @@ export async function pushSyncItemToFirestore(
         batch.set(doc(firestoreDb, wsPath, 'expenses', sanitizeId(exp.id)), serializeExpense(exp, tenantCtx));
         const acc = snapshot.accounts.find((a) => a.id === exp.accountId);
         if (acc) {
+          const accDelta = typeof payload.accountDelta === 'number' ? payload.accountDelta : null;
           batch.update(doc(firestoreDb, wsPath, 'accounts', sanitizeId(acc.id)), {
-            balance: acc.balance,
+            balance: accDelta !== null ? increment(accDelta) : acc.balance,
             updatedAt: serverTimestamp(),
           });
         }
@@ -3675,14 +4315,16 @@ export async function pushSyncItemToFirestore(
         const trx = snapshot.transactions.find((t) => t.id === String(payload.transactionId || ''));
         const batch = writeBatch(firestoreDb);
         if (fromAcc) {
+          const fromDelta = typeof payload.fromDelta === 'number' ? payload.fromDelta : null;
           batch.update(doc(firestoreDb, wsPath, 'accounts', sanitizeId(fromAcc.id)), {
-            balance: fromAcc.balance,
+            balance: fromDelta !== null ? increment(fromDelta) : fromAcc.balance,
             updatedAt: serverTimestamp(),
           });
         }
         if (toAcc) {
+          const toDelta = typeof payload.toDelta === 'number' ? payload.toDelta : null;
           batch.update(doc(firestoreDb, wsPath, 'accounts', sanitizeId(toAcc.id)), {
-            balance: toAcc.balance,
+            balance: toDelta !== null ? increment(toDelta) : toAcc.balance,
             updatedAt: serverTimestamp(),
           });
         }
@@ -3743,6 +4385,19 @@ export async function pushSyncItemToFirestore(
             uid: ctx.uid,
           });
           if (credSnap.exists()) {
+            const existingCred = credSnap.data();
+            // Strip legacy plaintext password/pin in an isolated rule-compliant update before writing metadata fields
+            if ('password' in existingCred || 'pin' in existingCred) {
+              await updateDoc(credRef, {
+                password: deleteField(),
+                pin: deleteField(),
+                passwordHash: credSer.passwordHash,
+                pinHash: credSer.pinHash,
+                hashAlgo: 'sha256',
+                authMigrated: true,
+                updatedAt: serverTimestamp(),
+              });
+            }
             const { id: _id, userId: _u, ownerUid: _o, createdBy: _cb, createdAt: _ca, ...updatable } = credSer;
             batch.update(credRef, { ...updatable, updatedAt: serverTimestamp() });
           } else {
@@ -3781,7 +4436,6 @@ export async function pushSyncItemToFirestore(
               batch.set(invRef, invSer);
             }
           }
-
           if (prevEmail && prevEmail !== cleanEmail) {
             const oldHash = await sha256Hex(prevEmail);
             batch.delete(doc(firestoreDb, wsPath, 'staffInvites', oldHash));
@@ -3864,6 +4518,12 @@ export async function pushSyncItemToFirestore(
         const staffId = sanitizeId(String(payload.empId || ''));
         const batch = writeBatch(firestoreDb);
         batch.delete(doc(firestoreDb, wsPath, 'staffDirectory', staffId));
+        const deletedTargetIds = Array.isArray(payload.deletedTargetIds)
+          ? (payload.deletedTargetIds as string[])
+          : [];
+        deletedTargetIds.forEach((tid) => {
+          batch.delete(doc(firestoreDb, wsPath, 'targets', sanitizeId(tid)));
+        });
         if (ctx.isWsAdmin) {
           const credRef = doc(firestoreDb, wsPath, 'staffCredentials', staffId);
           let deletedEmail =
@@ -3980,8 +4640,7 @@ export async function pushSyncItemToFirestore(
               storeId: m.storeId,
               qtyDelta: m.qtyDelta,
               movement: m,
-            })),
-            { skipSyncMarker: true }
+            }))
           );
         }
         const batch = writeBatch(firestoreDb);
@@ -4153,15 +4812,21 @@ export async function clearWorkspaceOperationalData(
   const deletableCollections = [
     'products',
     'stockItems',
+    'stockMovements',
     'purchaseReceipts',
     'purchaseOrders',
     'transfers',
+    'writeOffs',
     'stocktakes',
     'sales',
+    'returns',
     'cashShifts',
+    'cashOperations',
+    'transactions',
     'expenses',
     'customers',
     'loyaltyAccounts',
+    'loyaltyTransactions',
     'debts',
     'promoCodes',
     'onlineOrders',

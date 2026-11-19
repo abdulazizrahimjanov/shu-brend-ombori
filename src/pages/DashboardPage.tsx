@@ -47,23 +47,43 @@ export const DashboardPage: React.FC = () => {
 
     const storeSales = db.sales.filter(
       (s) =>
-        s.status !== 'returned' &&
         s.status !== 'deferred' &&
         (activeStoreId === 'all' || s.storeId === activeStoreId)
     );
+    const storeReturns = db.returns.filter(
+      (r) => activeStoreId === 'all' || r.storeId === activeStoreId
+    );
+    const saleById = new Map(db.sales.map((s) => [s.id, s]));
 
     const curSales = storeSales.filter((s) => new Date(s.createdAt) >= startCurrent);
     const prevSales = storeSales.filter(
       (s) => new Date(s.createdAt) >= startPrev && new Date(s.createdAt) < startCurrent
     );
+    const curReturns = storeReturns.filter((r) => new Date(r.createdAt) >= startCurrent);
+    const prevReturns = storeReturns.filter(
+      (r) => new Date(r.createdAt) >= startPrev && new Date(r.createdAt) < startCurrent
+    );
 
-    const revenue = curSales.reduce((sum, s) => sum + s.totalAmount, 0);
-    const prevRevenue = prevSales.reduce((sum, s) => sum + s.totalAmount, 0);
-    const cost = curSales.reduce((sum, s) => sum + s.costTotal, 0);
+    const sumReturnCost = (rets: typeof curReturns) =>
+      rets.reduce(
+        (sum, r) => sum + r.items.reduce((s2, ri) => s2 + ri.purchasePrice * ri.qty, 0),
+        0
+      );
+
+    const revenue =
+      curSales.reduce((sum, s) => sum + s.totalAmount, 0) -
+      curReturns.reduce((sum, r) => sum + r.totalRefund, 0);
+    const prevRevenue =
+      prevSales.reduce((sum, s) => sum + s.totalAmount, 0) -
+      prevReturns.reduce((sum, r) => sum + r.totalRefund, 0);
+    const cost =
+      curSales.reduce((sum, s) => sum + s.costTotal, 0) - sumReturnCost(curReturns);
+    const prevCost =
+      prevSales.reduce((sum, s) => sum + s.costTotal, 0) - sumReturnCost(prevReturns);
     const profit = revenue - cost;
-    const prevProfit = prevRevenue - prevSales.reduce((sum, s) => sum + s.costTotal, 0);
-    const count = curSales.length;
-    const prevCount = prevSales.length;
+    const prevProfit = prevRevenue - prevCost;
+    const count = curSales.filter((s) => s.status !== 'returned').length;
+    const prevCount = prevSales.filter((s) => s.status !== 'returned').length;
     const avgCheck = count > 0 ? Math.round(revenue / count) : 0;
     const prevAvgCheck = prevCount > 0 ? Math.round(prevRevenue / prevCount) : 0;
 
@@ -84,8 +104,15 @@ export const DashboardPage: React.FC = () => {
         hourBuckets[idx].total += s.totalAmount;
       }
     });
+    curReturns.forEach((r) => {
+      const h = new Date(r.createdAt).getHours();
+      const idx = h - 9;
+      if (idx >= 0 && idx < hourBuckets.length) {
+        hourBuckets[idx].total = Math.max(0, hourBuckets[idx].total - r.totalRefund);
+      }
+    });
 
-    // Top Products
+    // Top Products (net of returns)
     const prodMap = new Map<string, { name: string; qty: number; total: number }>();
     curSales.forEach((s) =>
       s.items.forEach((it) => {
@@ -95,15 +122,36 @@ export const DashboardPage: React.FC = () => {
         prodMap.set(it.productId, prev);
       })
     );
-    const topProducts = [...prodMap.values()].sort((a, b) => b.total - a.total).slice(0, 5);
+    curReturns.forEach((r) =>
+      r.items.forEach((ri) => {
+        const prev = prodMap.get(ri.productId);
+        if (prev) {
+          prev.qty = Math.max(0, prev.qty - ri.qty);
+          prev.total = Math.max(0, prev.total - ri.refundAmount);
+        }
+      })
+    );
+    const topProducts = [...prodMap.values()]
+      .filter((x) => x.qty > 0 || x.total > 0)
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 5);
 
-    // Top Cashiers
+    // Top Cashiers (net of returns)
     const cashierMap = new Map<string, { name: string; count: number; total: number }>();
     curSales.forEach((s) => {
       const prev = cashierMap.get(s.cashierId) ?? { name: s.cashierName, count: 0, total: 0 };
-      prev.count += 1;
+      if (s.status !== 'returned') prev.count += 1;
       prev.total += s.totalAmount;
       cashierMap.set(s.cashierId, prev);
+    });
+    curReturns.forEach((r) => {
+      const orig = saleById.get(r.saleId);
+      if (orig) {
+        const prev = cashierMap.get(orig.cashierId);
+        if (prev) {
+          prev.total = Math.max(0, prev.total - r.totalRefund);
+        }
+      }
     });
     const topCashiers = [...cashierMap.values()].sort((a, b) => b.total - a.total).slice(0, 4);
 

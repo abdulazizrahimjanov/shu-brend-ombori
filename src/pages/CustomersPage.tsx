@@ -47,6 +47,7 @@ export const CustomersPage: React.FC = () => {
   const [promoOpen, setPromoOpen] = useState(false);
   const [promoCodeVal, setPromoCodeVal] = useState('');
   const [promoDiscountVal, setPromoDiscountVal] = useState(10);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const filtered = useMemo(() => {
     if (!db) return [];
@@ -341,13 +342,24 @@ export const CustomersPage: React.FC = () => {
             </select>
             <button
               type="button"
+              disabled={isSubmitting}
               onClick={async () => {
-                await repayDebt(repayTarget.id, repayAmount, repayMethod);
-                notify("Qarz to'lovi qabul qilindi", 'success');
-                setRepayTarget(null);
-                setSelectedCustomer(null);
+                if (isSubmitting) return;
+                if (!Number.isFinite(repayAmount) || repayAmount <= 0 || repayAmount > repayTarget.remainingAmount) {
+                  notify(`To'lov summasi 1 dan ${repayTarget.remainingAmount} gacha bo'lishi kerak`, 'error');
+                  return;
+                }
+                setIsSubmitting(true);
+                try {
+                  await repayDebt(repayTarget.id, repayAmount, repayMethod);
+                  notify("Qarz to'lovi qabul qilindi", 'success');
+                  setRepayTarget(null);
+                  setSelectedCustomer(null);
+                } finally {
+                  setIsSubmitting(false);
+                }
               }}
-              className="w-full h-10 rounded-lg bg-teal-700 text-white text-xs font-semibold"
+              className="w-full h-10 rounded-lg bg-teal-700 disabled:opacity-50 text-white text-xs font-semibold"
             >
               Tasdiqlash
             </button>
@@ -420,28 +432,39 @@ export const CustomersPage: React.FC = () => {
               <input type="number" value={promoDiscountVal} onChange={(e) => setPromoDiscountVal(Number(e.target.value))} className="w-16 h-9 px-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono" />
               <button
                 type="button"
+                disabled={isSubmitting}
                 onClick={async () => {
+                  if (isSubmitting) return;
                   if (!promoCodeVal.trim()) return;
-                  const nowIso = new Date().toISOString();
-                  const p: PromoCode = {
-                    id: uid('promo'),
-                    code: promoCodeVal.trim(),
-                    discountType: 'percent',
-                    discountValue: promoDiscountVal,
-                    minOrderAmount: 100000,
-                    maxUses: 100,
-                    usedCount: 0,
-                    isActive: true,
-                    storeId: db.stores[0].id,
-                    createdAt: nowIso,
-                    updatedAt: nowIso,
-                    createdBy: 'usr-owner',
-                  };
-                  await upsertPromoCode(p);
-                  setPromoCodeVal('');
-                  notify('Promokod yaratildi', 'success');
+                  if (!Number.isFinite(promoDiscountVal) || promoDiscountVal <= 0 || promoDiscountVal > 100) {
+                    notify("Chegirma foizi 1 dan 100 gacha bo'lishi kerak", 'error');
+                    return;
+                  }
+                  setIsSubmitting(true);
+                  try {
+                    const nowIso = new Date().toISOString();
+                    const p: PromoCode = {
+                      id: uid('promo'),
+                      code: promoCodeVal.trim(),
+                      discountType: 'percent',
+                      discountValue: promoDiscountVal,
+                      minOrderAmount: 100000,
+                      maxUses: 100,
+                      usedCount: 0,
+                      isActive: true,
+                      storeId: db.stores[0].id,
+                      createdAt: nowIso,
+                      updatedAt: nowIso,
+                      createdBy: 'usr-owner',
+                    };
+                    await upsertPromoCode(p);
+                    setPromoCodeVal('');
+                    notify('Promokod yaratildi', 'success');
+                  } finally {
+                    setIsSubmitting(false);
+                  }
                 }}
-                className="px-3 h-9 rounded-lg bg-teal-700 text-white text-xs font-semibold"
+                className="px-3 h-9 rounded-lg bg-teal-700 disabled:opacity-50 text-white text-xs font-semibold"
               >
                 +
               </button>

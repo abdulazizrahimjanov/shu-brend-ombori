@@ -336,7 +336,7 @@ export const CatalogPage: React.FC = () => {
     if (!editingProduct || !editingProduct.name.trim()) return;
     const res = await upsertProduct(editingProduct);
     if (!res.ok) {
-      notify(res.error || 'Mahsulot saqlashda xatolik', 'error');
+      notify(res.error || 'Bu mahsulot allaqachon mavjud', 'error');
       return;
     }
 
@@ -368,28 +368,39 @@ export const CatalogPage: React.FC = () => {
       if (!result) return;
       const img = new Image();
       img.onload = () => {
-        const maxSide = 640;
-        let { width, height } = img;
-        if (width > maxSide || height > maxSide) {
-          if (width >= height) {
-            height = Math.round((height * maxSide) / width);
-            width = maxSide;
-          } else {
-            width = Math.round((width * maxSide) / height);
-            height = maxSide;
-          }
-        }
+        const attempts: [number, number][] = [
+          [640, 0.78],
+          [560, 0.68],
+          [480, 0.56],
+          [400, 0.46],
+          [320, 0.36],
+        ];
         const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
         const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(img, 0, 0, width, height);
-          const compressed = canvas.toDataURL('image/jpeg', 0.8);
-          setEditingProduct((prev) => (prev ? { ...prev, photoUrl: compressed } : prev));
-        } else {
-          setEditingProduct((prev) => (prev ? { ...prev, photoUrl: result } : prev));
+        if (!ctx) {
+          setEditingProduct((prev) => (prev ? { ...prev, photoUrl: result.slice(0, 140000) } : prev));
+          return;
         }
+        let compressed = '';
+        for (const [maxSide, quality] of attempts) {
+          let { width, height } = img;
+          if (width > maxSide || height > maxSide) {
+            if (width >= height) {
+              height = Math.max(1, Math.round((height * maxSide) / width));
+              width = maxSide;
+            } else {
+              width = Math.max(1, Math.round((width * maxSide) / height));
+              height = maxSide;
+            }
+          }
+          canvas.width = width;
+          canvas.height = height;
+          ctx.clearRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0, width, height);
+          compressed = canvas.toDataURL('image/jpeg', quality);
+          if (compressed.length <= 140000) break;
+        }
+        setEditingProduct((prev) => (prev ? { ...prev, photoUrl: compressed } : prev));
       };
       img.onerror = () => {
         setEditingProduct((prev) => (prev ? { ...prev, photoUrl: result } : prev));
@@ -433,58 +444,71 @@ export const CatalogPage: React.FC = () => {
       const nowIso = new Date().toISOString();
       const storeId = activeStoreId !== 'all' ? activeStoreId : db.stores[0]?.id ?? 'store-chilonzor';
       const whId = getWarehouseForStore(storeId);
-      const newProducts: Product[] = [];
+      const groupedMap = new Map<string, Product>();
       const stocks: { productId: string; variantId: string; warehouseId: string; qty: number; unitCost: number }[] = [];
 
       rows.forEach((r, idx) => {
         const name = String(r['Nomi'] || r['Name'] || r['name'] || `Import Tovar ${idx + 1}`).trim();
-        const retailPrice = Number(r['SotuvNarxi'] || r['Price'] || r['price'] || 100000);
-        const purchasePrice = Number(r['Tannarx'] || r['Cost'] || r['cost'] || Math.round(retailPrice * 0.65));
-        const qty = Number(r['Qoldiq'] || r['Qty'] || r['qty'] || 0);
+        const nameKey = name.toLowerCase();
+        const retailRaw = Number(r['SotuvNarxi'] || r['Price'] || r['price'] || 100000);
+        const retailPrice = Number.isFinite(retailRaw) && retailRaw > 0 ? retailRaw : 100000;
+        const purchaseRaw = Number(r['Tannarx'] || r['Cost'] || r['cost'] || Math.round(retailPrice * 0.65));
+        const purchasePrice = Number.isFinite(purchaseRaw) && purchaseRaw >= 0 ? purchaseRaw : Math.round(retailPrice * 0.65);
+        const qtyRaw = Number(r['Qoldiq'] || r['Qty'] || r['qty'] || 0);
+        const qty = Number.isFinite(qtyRaw) && qtyRaw > 0 ? qtyRaw : 0;
         const barcode = String(r['ShtrixKod'] || r['Barcode'] || '').trim() || generateEAN13();
-        const sku = String(r['SKU'] || r['sku'] || `IMP-${Date.now().toString().slice(-4)}-${idx}`);
-        const pId = uid('prod');
+        const sku = String(r['SKU'] || r['sku'] || `IMP-${Date.now().toString().slice(-4)}-${idx}`).trim();
+
+        let existingProd = groupedMap.get(nameKey);
+        if (!existingProd) {
+          const pId = uid('prod');
+          existingProd = {
+            id: pId,
+            name,
+            categoryId: db.categories[0]?.id ?? 'cat-shirts',
+            unit: 'dona',
+            tags: ['Import'],
+            isPublishedOnline: true,
+            variants: [],
+            storeId,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            createdBy: currentUser?.id ?? 'system',
+          };
+          groupedMap.set(nameKey, existingProd);
+        }
+
         const vId = uid('var');
-        newProducts.push({
-          id: pId,
-          name,
-          categoryId: db.categories[0]?.id ?? 'cat-shirts',
-          unit: 'dona',
-          tags: ['Import'],
-          isPublishedOnline: true,
-          variants: [
-            {
-              id: vId,
-              productId: pId,
-              sku,
-              size: String(r['Olcham'] || r['Size'] || 'Standart'),
-              color: String(r['Rang'] || r['Color'] || ''),
-              purchasePrice,
-              retailPrice,
-              wholesalePrice: Math.round(retailPrice * 0.85),
-              minStock: 5,
-              barcodes: [barcode],
-              storeId,
-              createdAt: nowIso,
-              updatedAt: nowIso,
-              createdBy: currentUser?.id ?? 'system',
-            },
-          ],
+        existingProd.variants.push({
+          id: vId,
+          productId: existingProd.id,
+          sku,
+          size: String(r['Olcham'] || r['Size'] || 'Standart').trim(),
+          color: String(r['Rang'] || r['Color'] || '').trim(),
+          purchasePrice,
+          retailPrice,
+          wholesalePrice: Math.round(retailPrice * 0.85),
+          minStock: 5,
+          barcodes: [barcode],
           storeId,
           createdAt: nowIso,
           updatedAt: nowIso,
           createdBy: currentUser?.id ?? 'system',
         });
+
         if (qty > 0) {
-          stocks.push({ productId: pId, variantId: vId, warehouseId: whId, qty, unitCost: purchasePrice });
+          stocks.push({ productId: existingProd.id, variantId: vId, warehouseId: whId, qty, unitCost: purchasePrice });
         }
       });
 
-      const { imported, skipped } = await importProducts(newProducts, stocks);
-      if (skipped > 0) {
-        notify(`${imported} ta mahsulot import qilindi, ${skipped} ta takroriy o'tkazib yuborildi`, imported > 0 ? 'success' : 'info');
+      const newProducts = Array.from(groupedMap.values());
+      const res = await importProducts(newProducts, stocks);
+      if (res.added === 0) {
+        notify("Barcha mahsulotlar takroriy bo'lgani uchun import qilinmadi", 'error');
+      } else if (res.skipped > 0) {
+        notify(`${res.added} ta qo'shildi, ${res.skipped} ta takroriy mahsulot o'tkazib yuborildi`, 'info');
       } else {
-        notify(`${imported} ta mahsulot import qilindi`, 'success');
+        notify(`${res.added} ta mahsulot import qilindi`, 'success');
       }
     } catch {
       notify("Import faylini o'qishda xatolik", 'error');

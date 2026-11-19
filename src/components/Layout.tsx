@@ -28,6 +28,7 @@ import {
   Check,
   ChevronRight,
   Cloud,
+  RefreshCw,
 } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
 import { useT } from '../i18n';
@@ -74,11 +75,13 @@ export const Layout: React.FC = () => {
   const isOnline = useAppStore((s) => s.isOnline);
   const syncStatus = useAppStore((s) => s.syncStatus);
   const cloudConnected = useAppStore((s) => s.cloudConnected);
-  const firebaseEmail = useAppStore((s) => s.firebaseEmail);
+  const cloudConnecting = useAppStore((s) => s.cloudConnecting);
   const cloudError = useAppStore((s) => s.cloudError);
+  const firebaseEmail = useAppStore((s) => s.firebaseEmail);
   const lastSyncAt = useAppStore((s) => s.lastSyncAt);
-  const checkAndSyncNow = useAppStore((s) => s.checkAndSyncNow);
-  const clearCloudError = useAppStore((s) => s.clearCloudError);
+  const pendingQueueCount = useAppStore((s) => s.db?.offlineQueue.length ?? 0);
+  const forceSyncNow = useAppStore((s) => s.forceSyncNow);
+  const loginWithGoogle = useAppStore((s) => s.loginWithGoogle);
   const activeStoreId = useAppStore((s) => s.activeStoreId);
   const setActiveStoreId = useAppStore((s) => s.setActiveStoreId);
   const language = useAppStore((s) => s.language);
@@ -88,7 +91,6 @@ export const Layout: React.FC = () => {
   const switchUserByPin = useAppStore((s) => s.switchUserByPin);
   const updateUserCredentials = useAppStore((s) => s.updateUserCredentials);
   const setShowOnboarding = useAppStore((s) => s.setShowOnboarding);
-  const loginWithGoogle = useAppStore((s) => s.loginWithGoogle);
   const logout = useAppStore((s) => s.logout);
   const toasts = useAppStore((s) => s.toasts);
   const dismissToast = useAppStore((s) => s.dismissToast);
@@ -306,55 +308,71 @@ export const Layout: React.FC = () => {
             <div className="flex items-center gap-2 shrink-0">
               <button
                 type="button"
-                onClick={() => {
+                disabled={cloudConnecting || syncStatus === 'syncing'}
+                onClick={async () => {
                   if (!cloudConnected && isOnline) {
-                    void loginWithGoogle().then((res) => {
-                      if (!res.ok && res.error) notify(res.error, 'error');
-                    });
-                  } else {
-                    void checkAndSyncNow();
+                    const res = await loginWithGoogle({ linkOnly: true });
+                    if (res.ok) notify(t.common.cloudSynced, 'success');
+                    else if (res.error) notify(res.error, 'error');
+                    return;
+                  }
+                  const res = await forceSyncNow();
+                  if (res.ok) {
+                    notify(
+                      res.synced > 0
+                        ? `${res.synced} ta yozuv sinxronlandi`
+                        : "Firebase bazasi bilan sinxron holatda",
+                      'success'
+                    );
+                  } else if (res.error) {
+                    notify(res.error, 'error');
                   }
                 }}
-                title={
-                  !cloudConnected
-                    ? "Bulutli sinxronlash uchun Google orqali kiring"
-                    : lastSyncAt
-                    ? `Oxirgi tekshiruv: ${new Date(lastSyncAt).toLocaleTimeString()}`
-                    : 'Sinxronlash holatini tekshirish'
-                }
-                className={`inline-flex items-center gap-1.5 px-2 sm:px-2.5 h-8 rounded-lg border text-[11px] font-medium whitespace-nowrap transition-opacity hover:opacity-80 ${
+                title={cloudError || (lastSyncAt ? `${t.common.lastSyncedLabel}: ${new Date(lastSyncAt).toLocaleTimeString()}` : t.common.syncNow)}
+                className={`inline-flex items-center gap-1.5 px-2 sm:px-2.5 h-8 rounded-lg border text-[11px] font-medium whitespace-nowrap transition-colors ${
                   !isOnline
                     ? 'border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300'
+                    : syncStatus === 'syncing' || cloudConnecting
+                    ? 'border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300'
                     : cloudError
                     ? 'border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/50 text-red-700 dark:text-red-300'
-                    : syncStatus === 'syncing'
-                    ? 'border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300'
-                    : !cloudConnected
-                    ? 'border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300'
-                    : 'border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300'
+                    : cloudConnected
+                    ? 'border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300'
+                    : 'border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200'
                 }`}
               >
                 <span
                   className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                     !isOnline
                       ? 'bg-amber-500'
+                      : syncStatus === 'syncing' || cloudConnecting
+                      ? 'bg-blue-500 animate-pulse'
                       : cloudError
                       ? 'bg-red-500'
-                      : syncStatus === 'syncing'
-                      ? 'bg-blue-500 animate-pulse'
-                      : !cloudConnected
-                      ? 'bg-amber-500'
-                      : 'bg-emerald-500'
+                      : cloudConnected
+                      ? 'bg-emerald-500'
+                      : 'bg-slate-400'
                   }`}
                 />
-                <span>
+                <span className="hidden sm:inline">
                   {!isOnline
-                    ? t.common.offlineShort
-                    : syncStatus === 'syncing'
+                    ? `${t.common.offlineShort}${pendingQueueCount > 0 ? ` (${pendingQueueCount})` : ''}`
+                    : syncStatus === 'syncing' || cloudConnecting
                     ? t.common.syncing
+                    : cloudError
+                    ? t.common.syncNow
                     : cloudConnected
                     ? t.common.cloudSynced
-                    : t.common.localOnlyShort}
+                    : t.common.cloudNotLinked}
+                </span>
+                <span className="sm:hidden">
+                  {!isOnline
+                    ? 'Offline'
+                    : syncStatus === 'syncing' || cloudConnecting
+                    ? '...'
+                    : cloudConnected
+                    ? '15s'
+                    : 'Cloud'}
                 </span>
               </button>
 
@@ -449,33 +467,6 @@ export const Layout: React.FC = () => {
               </button>
             </div>
           </header>
-        )}
-
-        {/* Firebase Cloud Error Banner (shown only if Firebase encounters an error) */}
-        {cloudError && (
-          <div className="no-print mx-3 sm:mx-4 lg:mx-6 mt-3 flex items-center justify-between gap-3 rounded-xl border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/40 px-3.5 py-2.5 text-xs text-red-700 dark:text-red-300">
-            <div className="flex items-center gap-2 min-w-0">
-              <AlertCircle className="w-4 h-4 shrink-0 text-red-600 dark:text-red-400" />
-              <span className="truncate">{cloudError}</span>
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={() => void checkAndSyncNow()}
-                className="px-2.5 py-1 rounded-lg bg-red-600 text-white font-semibold hover:bg-red-700"
-              >
-                {t.common.syncNow}
-              </button>
-              <button
-                type="button"
-                onClick={clearCloudError}
-                aria-label={t.common.close}
-                className="p-1 rounded-lg hover:bg-red-100 dark:hover:bg-red-900/40"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          </div>
         )}
 
         {/* Page Content */}
@@ -636,36 +627,6 @@ export const Layout: React.FC = () => {
                 type="button"
                 onClick={() => {
                   setAvatarSheetOpen(false);
-                  if (!cloudConnected && isOnline) {
-                    void loginWithGoogle().then((res) => {
-                      if (!res.ok && res.error) notify(res.error, 'error');
-                    });
-                  } else {
-                    void checkAndSyncNow();
-                  }
-                }}
-                className="w-full px-4 py-3.5 flex items-center justify-between text-sm font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800/60"
-              >
-                <span className="flex items-center gap-3 min-w-0">
-                  <Cloud className={`w-4 h-4 shrink-0 ${cloudConnected ? 'text-emerald-600' : 'text-amber-500'}`} />
-                  <span className="truncate text-left">
-                    <span className="block text-sm font-semibold">
-                      {cloudConnected ? t.common.cloudSynced : t.common.localOnlyShort}
-                    </span>
-                    <span className="block text-[11px] font-normal text-slate-500 truncate">
-                      {cloudConnected
-                        ? firebaseEmail || 'Firebase Firestore'
-                        : 'Google orqali bulutga ulash'}
-                    </span>
-                  </span>
-                </span>
-                <ChevronRight className="w-4 h-4 text-slate-400 shrink-0" />
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  setAvatarSheetOpen(false);
                   setPinModalOpen(true);
                 }}
                 className="w-full px-4 py-3.5 flex items-center justify-between text-sm font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800/60"
@@ -694,6 +655,36 @@ export const Layout: React.FC = () => {
                   <span>Parol va PIN-kodni almashtirish</span>
                 </span>
                 <ChevronRight className="w-4 h-4 text-slate-400" />
+              </button>
+
+              <button
+                type="button"
+                onClick={async () => {
+                  if (!cloudConnected) {
+                    const res = await loginWithGoogle({ linkOnly: true });
+                    if (res.ok) notify(t.common.cloudSynced, 'success');
+                    else if (res.error) notify(res.error, 'error');
+                  } else {
+                    const res = await forceSyncNow();
+                    if (res.ok) notify("Firebase bazasi bilan sinxronlandi", 'success');
+                    else if (res.error) notify(res.error, 'error');
+                  }
+                }}
+                className="w-full px-4 py-3.5 flex items-center justify-between text-sm font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800/60"
+              >
+                <span className="flex items-center gap-3 min-w-0">
+                  {cloudConnected ? (
+                    <RefreshCw className={`w-4 h-4 text-emerald-600 shrink-0 ${syncStatus === 'syncing' ? 'animate-spin' : ''}`} />
+                  ) : (
+                    <Cloud className="w-4 h-4 text-amber-600 shrink-0" />
+                  )}
+                  <span className="truncate">
+                    {cloudConnected
+                      ? `${t.common.cloudSynced}${firebaseEmail ? ` (${firebaseEmail})` : ''}`
+                      : t.common.connectCloud}
+                  </span>
+                </span>
+                <ChevronRight className="w-4 h-4 text-slate-400 shrink-0" />
               </button>
 
               <button

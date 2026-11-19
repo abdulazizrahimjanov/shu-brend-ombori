@@ -11,14 +11,10 @@ import {
 import {
   Firestore,
   FirestoreSettings,
-  doc,
   enableNetwork,
-  getDocFromServer,
   getFirestore,
   initializeFirestore,
   memoryLocalCache,
-  persistentLocalCache,
-  persistentMultipleTabManager,
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
@@ -48,6 +44,9 @@ export interface FirestoreErrorInfo {
   };
 }
 
+export const FIRESTORE_REST_BASE = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents`;
+export const FIREBASE_API_KEY = firebaseConfig.apiKey;
+
 const app: FirebaseApp = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 export const auth: Auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
@@ -58,106 +57,77 @@ const baseFirestoreSettings: FirestoreSettings = {
   ignoreUndefinedProperties: true,
   ...(isBrowser
     ? {
-        experimentalForceLongPolling: true,
-        experimentalLongPollingOptions: { timeoutSeconds: 10 },
+        experimentalAutoDetectLongPolling: true,
       }
     : {}),
 };
 
-const configuredDbId =
-  firebaseConfig.firestoreDatabaseId && firebaseConfig.firestoreDatabaseId !== '(default)'
-    ? firebaseConfig.firestoreDatabaseId
-    : undefined;
-
 let firestoreInstance: Firestore;
 try {
-  firestoreInstance = configuredDbId
-    ? initializeFirestore(
-        app,
-        {
-          ...baseFirestoreSettings,
-          localCache: persistentLocalCache({
-            tabManager: persistentMultipleTabManager(),
-          }),
-        },
-        configuredDbId
-      )
-    : initializeFirestore(app, {
-        ...baseFirestoreSettings,
-        localCache: persistentLocalCache({
-          tabManager: persistentMultipleTabManager(),
-        }),
-      });
+  // Offline persistence & queue are handled by LocalIndexedDBRepository;
+  // memoryLocalCache avoids multi-tab IndexedDB targetId (ca9/b815) desyncs across reloads.
+  firestoreInstance = initializeFirestore(
+    app,
+    {
+      ...baseFirestoreSettings,
+      localCache: memoryLocalCache(),
+    },
+    firebaseConfig.firestoreDatabaseId
+  );
 } catch {
-  try {
-    firestoreInstance = configuredDbId
-      ? initializeFirestore(
-          app,
-          {
-            ...baseFirestoreSettings,
-            localCache: memoryLocalCache(),
-          },
-          configuredDbId
-        )
-      : initializeFirestore(app, {
-          ...baseFirestoreSettings,
-          localCache: memoryLocalCache(),
-        });
-  } catch {
-    firestoreInstance = configuredDbId
-      ? getFirestore(app, configuredDbId)
-      : getFirestore(app);
-  }
+  firestoreInstance = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 }
 
 export const firestoreDb: Firestore = firestoreInstance;
 
-export function formatFirebaseErrorMessage(error: unknown, lang: 'uz' | 'ru' = 'uz'): string {
-  const raw = error instanceof Error ? error.message : String(error || '');
-  const low = raw.toLowerCase();
+let firestoreWatchDisabled = false;
+const watchDisabledCallbacks = new Set<() => void>();
 
-  if (low.includes('auth/unauthorized-domain')) {
-    return lang === 'ru'
-      ? 'Этот домен не разрешен в Firebase Authentication (Authorized domains).'
-      : "Ushbu domen Firebase Authentication (Authorized domains) ro'yxatiga qo'shilmagan.";
-  }
-  if (low.includes('auth/operation-not-allowed')) {
-    return lang === 'ru'
-      ? 'Вход через Google не включен в Firebase Console.'
-      : 'Firebase Console da Google orqali kirish (Sign-in method) yoqilmagan.';
-  }
-  if (low.includes('auth/popup-blocked')) {
-    return lang === 'ru'
-      ? 'Браузер заблокировал всплывающее окно Google.'
-      : "Brauzer Google kirish oynasini blokladi. Qalqib chiquvchi oynalarga ruxsat bering.";
-  }
-  if (low.includes('auth/popup-closed-by-user')) {
-    return lang === 'ru'
-      ? 'Окно входа Google было закрыто.'
-      : 'Google kirish oynasi yopildi.';
-  }
-  if (low.includes('auth/network-request-failed') || low.includes('the client is offline') || low.includes('unavailable')) {
-    return lang === 'ru'
-      ? 'Нет связи с сервером Firebase. Изменения сохраняются локально и синхронизируются при восстановлении сети.'
-      : "Firebase serveri bilan aloqa uzildi. O'zgarishlar qurilmada saqlanmoqda va internet tiklanganda sinxronlanadi.";
-  }
-  if (low.includes('permission-denied') || low.includes('missing or insufficient permissions')) {
-    return lang === 'ru'
-      ? 'Нет прав доступа к Cloud Firestore. Проверьте правила безопасности или приглашение сотрудника.'
-      : "Cloud Firestore ruxsati yetarli emas. Xodimlar ro'yxatidagi Google emailingizni yoki Firestore Rules ni tekshiring.";
-  }
-  if (low.includes('resource-exhausted') || low.includes('quota')) {
-    return lang === 'ru'
-      ? 'Превышена квота Firebase. Попробуйте позже.'
-      : 'Firebase kvotasi tugadi. Keyinroq qayta urinib ko‘ring.';
-  }
-  if (low.includes('failed-precondition') || low.includes('database') && low.includes('not found')) {
-    return lang === 'ru'
-      ? 'База данных Cloud Firestore еще не создана или не настроена.'
-      : "Cloud Firestore ma'lumotlar bazasi hali yaratilmagan yoki sozlanmagan.";
-  }
+export function isFirestoreWatchDisabled(): boolean {
+  return firestoreWatchDisabled;
+}
 
-  return raw || (lang === 'ru' ? 'Ошибка подключения к Firebase' : 'Firebase bilan ishlashda xatolik yuz berdi');
+export function onFirestoreWatchDisabled(cb: () => void): () => void {
+  watchDisabledCallbacks.add(cb);
+  return () => {
+    watchDisabledCallbacks.delete(cb);
+  };
+}
+
+export function isFirestoreInternalAssertionError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '');
+  return (
+    msg.includes('INTERNAL ASSERTION FAILED') ||
+    msg.includes('(ID: ca9)') ||
+    msg.includes('(ID: b815)')
+  );
+}
+
+export function markFirestoreWatchDisabled(): void {
+  if (firestoreWatchDisabled) return;
+  firestoreWatchDisabled = true;
+  watchDisabledCallbacks.forEach((cb) => {
+    try {
+      cb();
+    } catch {
+      // ignore listener cleanup errors
+    }
+  });
+}
+
+if (typeof window !== 'undefined') {
+  const handleGlobalWatchAssertion = (rawErr: unknown, preventDefault: () => void) => {
+    if (isFirestoreInternalAssertionError(rawErr)) {
+      preventDefault();
+      markFirestoreWatchDisabled();
+    }
+  };
+  window.addEventListener('error', (event) => {
+    handleGlobalWatchAssertion(event.error ?? event.message, () => event.preventDefault());
+  });
+  window.addEventListener('unhandledrejection', (event) => {
+    handleGlobalWatchAssertion(event.reason, () => event.preventDefault());
+  });
 }
 
 export function handleFirestoreError(
@@ -165,6 +135,9 @@ export function handleFirestoreError(
   operationType: OperationType,
   path: string | null
 ): never {
+  if (isFirestoreInternalAssertionError(error)) {
+    markFirestoreWatchDisabled();
+  }
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
@@ -188,6 +161,7 @@ export function handleFirestoreError(
 }
 
 export async function ensureFirestoreNetwork(): Promise<void> {
+  if (firestoreWatchDisabled) return;
   if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
   try {
     await enableNetwork(firestoreDb);
@@ -196,101 +170,140 @@ export async function ensureFirestoreNetwork(): Promise<void> {
   }
 }
 
-let testedForUid: string | null | undefined = undefined;
-let lastConnectionOk = false;
-
-function isConnectionFailure(error: unknown): boolean {
-  const raw = error instanceof Error ? error.message : String(error || '');
-  const low = raw.toLowerCase();
-  return (
-    low.includes('permission-denied') ||
-    low.includes('missing or insufficient permissions') ||
-    low.includes('permission') ||
-    low.includes('the client is offline') ||
-    low.includes('client is offline') ||
-    low.includes('unavailable') ||
-    low.includes('failed-precondition') ||
-    low.includes('not-found') ||
-    low.includes('unauthenticated')
-  );
+function extractRawErrorMessage(error: unknown): { code: string; message: string } {
+  const raw = error instanceof Error ? error.message : String(error ?? '');
+  const codeProp =
+    typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code?: unknown }).code ?? '')
+      : '';
+  try {
+    const parsed = JSON.parse(raw) as { error?: string };
+    if (parsed && typeof parsed.error === 'string') {
+      return { code: codeProp, message: parsed.error };
+    }
+  } catch {
+    // not JSON
+  }
+  return { code: codeProp, message: raw };
 }
 
-export async function testConnection(): Promise<boolean> {
+export function formatFirebaseError(error: unknown, lang: 'uz' | 'ru' = 'uz'): string {
+  const { code, message } = extractRawErrorMessage(error);
+  const low = `${code} ${message}`.toLowerCase();
+
+  if (low.includes('auth/unauthorized-domain')) {
+    const host = typeof window !== 'undefined' ? window.location.hostname : '';
+    return lang === 'ru'
+      ? `Домен (${host}) не добавлен в Firebase Authentication -> Authorized domains.`
+      : `Ushbu domen (${host}) Firebase Authentication -> Authorized domains ro'yxatiga kiritilmagan.`;
+  }
+  if (low.includes('auth/popup-blocked')) {
+    return lang === 'ru'
+      ? 'Браузер заблокировал всплывающее окно Google входа. Разрешите всплывающие окна.'
+      : "Brauzer Google kirish oynasini blokladi. Qalqib chiquvchi oynalarga (Pop-up) ruxsat bering.";
+  }
+  if (low.includes('auth/popup-closed-by-user') || low.includes('auth/cancelled-popup-request')) {
+    return lang === 'ru'
+      ? 'Окно входа через Google было закрыто.'
+      : "Google orqali kirish oynasi yopildi.";
+  }
+  if (low.includes('auth/operation-not-allowed')) {
+    return lang === 'ru'
+      ? 'В Firebase Console не включён Google Sign-In.'
+      : "Firebase Console'da Google orqali kirish (Sign-in provider) yoqilmagan.";
+  }
+  if (low.includes('auth/network-request-failed')) {
+    return lang === 'ru'
+      ? 'Ошибка сети при подключении к Google/Firebase. Проверьте интернет.'
+      : "Internet aloqasi uzilgan. Google/Firebase bilan bog'lanib bo'lmadi.";
+  }
+  if (low.includes('permission-denied') || low.includes('insufficient permissions') || low.includes('missing or insufficient')) {
+    if (message.includes('Google hisobingiz') || message.includes('Umumiy baza')) {
+      return message;
+    }
+    return lang === 'ru'
+      ? 'Недостаточно прав доступа в Firebase (Firestore Security Rules).'
+      : "Firebase ma'lumotlar bazasiga yozish/o'qish uchun ruxsat yetarli emas.";
+  }
+  if (low.includes('unavailable') || low.includes('client is offline') || low.includes('network')) {
+    return lang === 'ru'
+      ? 'Сервер Firebase временно недоступен. Изменения сохранены локально и синхронизируются при восстановлении связи.'
+      : "Firebase serveri bilan aloqa vaqtincha uzildi. O'zgarishlar qurilmada saqlandi va aloqa tiklanganda yuboriladi.";
+  }
+  if (low.includes('resource-exhausted')) {
+    return lang === 'ru'
+      ? 'Превышен лимит запросов или размер данных Firebase.'
+      : "Firebase so'rovlar limiti yoki hujjat hajmi chegarasidan oshdi.";
+  }
+  if (message.trim()) return message;
+  return lang === 'ru'
+    ? 'Произошла ошибка подключения к облачной базе Firebase.'
+    : "Firebase bulutli bazasi bilan ishlashda xatolik yuz berdi.";
+}
+
+export const formatFirebaseErrorMessage = formatFirebaseError;
+
+async function fetchRestProbe(timeoutMs = 8000): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch('https://firestore.googleapis.com/$discovery/rest?version=v1', {
+      method: 'GET',
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function probeFirestoreConnection(
+  lang: 'uz' | 'ru' = 'uz'
+): Promise<{ ok: boolean; error?: string; code?: string }> {
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-    lastConnectionOk = false;
-    return false;
-  }
-
-  const currentUid = auth.currentUser?.uid ?? null;
-  if (lastConnectionOk && testedForUid === currentUid) {
-    return true;
-  }
-
-  // /test/connection rule requires isSignedIn() — without an authenticated user it cannot pass Firestore checks
-  if (!auth.currentUser) {
-    lastConnectionOk = false;
-    testedForUid = null;
-    return false;
+    return {
+      ok: false,
+      code: 'offline',
+      error:
+        lang === 'ru'
+          ? 'Нет подключения к интернету (офлайн).'
+          : 'Internet aloqasi mavjud emas (oflayn rejim).',
+    };
   }
 
   const probe = async () => {
-    await ensureFirestoreNetwork();
-    await getDocFromServer(doc(firestoreDb, 'test', 'connection'));
+    const res = await fetchRestProbe(8000);
+    if (res.ok) {
+      return;
+    }
+    throw new Error(`firestore-rest-status-${res.status}`);
   };
 
   try {
     await probe();
-    testedForUid = currentUid;
-    lastConnectionOk = true;
-    return true;
+    return { ok: true };
   } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error || '');
-    if (msg.toLowerCase().includes('the client is offline')) {
-      await new Promise((r) => setTimeout(r, 1200));
-      try {
-        await probe();
-        testedForUid = currentUid;
-        lastConnectionOk = true;
-        return true;
-      } catch (retryErr) {
-        lastConnectionOk = false;
-        testedForUid = currentUid;
-        console.error('Firestore connection test failed:', retryErr);
-        return false;
-      }
+    await new Promise((r) => setTimeout(r, 900));
+    try {
+      await probe();
+      return { ok: true };
+    } catch (retryErr) {
+      const retryInfo = extractRawErrorMessage(retryErr || error);
+      return {
+        ok: false,
+        code: retryInfo.code || 'unavailable',
+        error: formatFirebaseError(new Error('network unavailable'), lang),
+      };
     }
-    if (isConnectionFailure(error)) {
-      lastConnectionOk = false;
-      testedForUid = currentUid;
-      console.warn('Firestore connection check rejected:', msg);
-      return false;
-    }
-    lastConnectionOk = false;
-    testedForUid = currentUid;
-    console.warn('Firestore connection check error:', msg);
-    return false;
   }
 }
 
-export async function probeFirestoreConnection(workspaceId?: string): Promise<boolean> {
-  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-    return false;
+export async function testConnection(): Promise<boolean> {
+  const res = await probeFirestoreConnection('uz');
+  if (!res.ok) {
+    console.error('Please check your Firebase configuration or network connection.');
   }
-  if (!auth.currentUser) {
-    return false;
-  }
-  try {
-    await ensureFirestoreNetwork();
-    const targetRef = workspaceId
-      ? doc(firestoreDb, 'workspaces', workspaceId)
-      : doc(firestoreDb, 'test', 'connection');
-    await getDocFromServer(targetRef);
-    return true;
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error || '');
-    console.warn('Firestore server probe failed:', msg);
-    return false;
-  }
+  return res.ok;
 }
 
 export async function signInWithGooglePopup(): Promise<FirebaseUser> {
@@ -309,3 +322,4 @@ export async function signOutFirebase(): Promise<void> {
 export function watchAuthState(cb: (user: FirebaseUser | null) => void): () => void {
   return onAuthStateChanged(auth, cb);
 }
+

@@ -29,6 +29,7 @@ export const FinancePage: React.FC = () => {
   const [trfTo, setTrfTo] = useState('');
   const [trfAmount, setTrfAmount] = useState(1000000);
   const [trfNote, setTrfNote] = useState('Inkassatsiya');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const pnl = useMemo(() => {
     if (!db) return { revenue: 0, cogs: 0, gross: 0, expenses: 0, net: 0, cashIn: 0, cashOut: 0 };
@@ -41,10 +42,14 @@ export const FinancePage: React.FC = () => {
 
     const sales = db.sales.filter(
       (s) =>
-        s.status !== 'returned' &&
         s.status !== 'deferred' &&
         (activeStoreId === 'all' || s.storeId === activeStoreId) &&
         new Date(s.createdAt).getTime() >= cutoff
+    );
+    const returns = db.returns.filter(
+      (r) =>
+        (activeStoreId === 'all' || r.storeId === activeStoreId) &&
+        new Date(r.createdAt).getTime() >= cutoff
     );
     const expenses = db.expenses.filter(
       (e) =>
@@ -52,13 +57,19 @@ export const FinancePage: React.FC = () => {
         new Date(e.date).getTime() >= cutoff
     );
 
-    const revenue = sales.reduce((sum, s) => sum + s.totalAmount, 0);
-    const cogs = sales.reduce((sum, s) => sum + s.costTotal, 0);
+    const retRevenue = returns.reduce((sum, r) => sum + r.totalRefund, 0);
+    const retCogs = returns.reduce(
+      (sum, r) => sum + r.items.reduce((s2, ri) => s2 + ri.purchasePrice * ri.qty, 0),
+      0
+    );
+
+    const revenue = sales.reduce((sum, s) => sum + s.totalAmount, 0) - retRevenue;
+    const cogs = sales.reduce((sum, s) => sum + s.costTotal, 0) - retCogs;
     const gross = revenue - cogs;
     const expTotal = expenses.reduce((sum, e) => sum + e.amount, 0);
     const net = gross - expTotal;
     const cashIn = sales.reduce((sum, s) => sum + s.paidAmount, 0);
-    const cashOut = expTotal;
+    const cashOut = expTotal + retRevenue;
     return { revenue, cogs, gross, expenses: expTotal, net, cashIn, cashOut };
   }, [db, period, activeStoreId]);
 
@@ -265,7 +276,7 @@ export const FinancePage: React.FC = () => {
               <option value="taxes">Soliqlar</option>
               <option value="other">Boshqa</option>
             </select>
-            <input type="number" value={expAmount} onChange={(e) => setExpAmount(Number(e.target.value))} className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-sm font-mono" />
+            <input type="number" min={1} value={expAmount} onChange={(e) => setExpAmount(Number(e.target.value))} className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-sm font-mono" />
             <input value={expDesc} onChange={(e) => setExpDesc(e.target.value)} placeholder="Tavsif" className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs" />
             <label className="inline-flex items-center gap-2 text-xs">
               <input type="checkbox" checked={expRecurring} onChange={(e) => setExpRecurring(e.target.checked)} />
@@ -273,21 +284,32 @@ export const FinancePage: React.FC = () => {
             </label>
             <button
               type="button"
+              disabled={isSubmitting}
               onClick={async () => {
-                await addExpense({
-                  accountId: expAccount,
-                  category: expCategory,
-                  amount: expAmount,
-                  description: expDesc || expCategory,
-                  isRecurring: expRecurring,
-                  date: new Date().toISOString(),
-                  storeId: activeStoreId !== 'all' ? activeStoreId : db.stores[0].id,
-                });
-                notify('Xarajat saqlandi', 'success');
-                setExpOpen(false);
-                setExpDesc('');
+                if (isSubmitting) return;
+                if (!Number.isFinite(expAmount) || expAmount <= 0) {
+                  notify("Xarajat summasi 0 dan katta bo'lishi kerak", 'error');
+                  return;
+                }
+                setIsSubmitting(true);
+                try {
+                  await addExpense({
+                    accountId: expAccount,
+                    category: expCategory,
+                    amount: expAmount,
+                    description: expDesc || expCategory,
+                    isRecurring: expRecurring,
+                    date: new Date().toISOString(),
+                    storeId: activeStoreId !== 'all' ? activeStoreId : db.stores[0].id,
+                  });
+                  notify('Xarajat saqlandi', 'success');
+                  setExpOpen(false);
+                  setExpDesc('');
+                } finally {
+                  setIsSubmitting(false);
+                }
               }}
-              className="w-full h-10 rounded-lg bg-teal-700 text-white text-xs font-semibold"
+              className="w-full h-10 rounded-lg bg-teal-700 disabled:opacity-50 text-white text-xs font-semibold"
             >
               {t.common.save}
             </button>
@@ -309,16 +331,31 @@ export const FinancePage: React.FC = () => {
             <select value={trfTo} onChange={(e) => setTrfTo(e.target.value)} className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs">
               {db.accounts.map((a) => <option key={a.id} value={a.id}>Qayerga: {a.name}</option>)}
             </select>
-            <input type="number" value={trfAmount} onChange={(e) => setTrfAmount(Number(e.target.value))} className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-sm font-mono" />
+            <input type="number" min={1} value={trfAmount} onChange={(e) => setTrfAmount(Number(e.target.value))} className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-sm font-mono" />
             <input value={trfNote} onChange={(e) => setTrfNote(e.target.value)} placeholder="Izoh" className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs" />
             <button
               type="button"
+              disabled={isSubmitting}
               onClick={async () => {
-                await transferFunds(trfFrom, trfTo, trfAmount, trfNote);
-                notify("O'tkazma bajarildi", 'success');
-                setTrfOpen(false);
+                if (isSubmitting) return;
+                if (!Number.isFinite(trfAmount) || trfAmount <= 0) {
+                  notify("O'tkazma summasi 0 dan katta bo'lishi kerak", 'error');
+                  return;
+                }
+                if (!trfFrom || !trfTo || trfFrom === trfTo) {
+                  notify("O'tkazma uchun ikki xil hisob tanlang", 'error');
+                  return;
+                }
+                setIsSubmitting(true);
+                try {
+                  await transferFunds(trfFrom, trfTo, trfAmount, trfNote);
+                  notify("O'tkazma bajarildi", 'success');
+                  setTrfOpen(false);
+                } finally {
+                  setIsSubmitting(false);
+                }
               }}
-              className="w-full h-10 rounded-lg bg-teal-700 text-white text-xs font-semibold"
+              className="w-full h-10 rounded-lg bg-teal-700 disabled:opacity-50 text-white text-xs font-semibold"
             >
               O'tkazish
             </button>

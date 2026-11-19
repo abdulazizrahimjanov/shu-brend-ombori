@@ -60,6 +60,10 @@ export interface User extends BaseEntity {
   phone: string;
   password: string;
   pin: string;
+  passwordHash?: string;
+  pinHash?: string;
+  hashAlgo?: 'sha256' | 'pbkdf2-sha256' | 'firebase-auth';
+  authMigrated?: boolean;
   googleEmail?: string;
   roleId: RoleId;
   assignedStoreIds: string[];

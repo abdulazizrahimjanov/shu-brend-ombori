@@ -45,24 +45,29 @@ import { Language } from '../i18n';
 import {
   auth,
   ensureFirestoreNetwork,
-  formatFirebaseErrorMessage,
+  formatFirebaseError,
+  isFirestoreWatchDisabled,
+  onFirestoreWatchDisabled,
+  probeFirestoreConnection,
   signInWithGooglePopup,
   signOutFirebase,
-  testConnection,
   watchAuthState,
 } from '../firebase';
 import {
   ADMIN_BOOTSTRAPPED_EMAILS,
+  isBootstrappedAdminEmail,
   bootstrapOrJoinWorkspace,
   checkWorkspaceSyncHealth,
   clearWorkspaceOperationalData,
   hasCustomLocalMigrationCandidates,
-  isBootstrappedAdminEmail,
+  hashStaffSecret,
+  hydrateWorkspaceViaRest,
   migrateLocalAdditionsToWorkspace,
   pushSyncItemToFirestore,
   savePreCloudSafetyBackup,
   stockItemDocId,
   subscribeWorkspaceRealtime,
+  verifyWorkspaceServerSync,
   WorkspaceContext,
 } from '../data/firebaseSync';
 
@@ -73,8 +78,12 @@ const HELD_CARTS_KEY = 'shu_brend_held_carts_v1';
 
 let unsubscribeRealtime: (() => void) | null = null;
 let unsubscribeAuth: (() => void) | null = null;
-let syncWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+let unsubscribeWatchGuard: (() => void) | null = null;
+let syncIntervalHandle: ReturnType<typeof setInterval> | null = null;
+let activeInitPromise: Promise<void> | null = null;
 let activeConnectPromise: Promise<WorkspaceContext | null> | null = null;
+let activeSyncQueuePromise: Promise<number> | null = null;
+let periodicCheckRunning = false;
 
 export function uid(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -102,14 +111,14 @@ interface AppState {
   cloudConnected: boolean;
   cloudConnecting: boolean;
   cloudError: string | null;
-  lastSyncAt: string | null;
   firebaseUid: string | null;
   firebaseEmail: string | null;
   workspaceContext: WorkspaceContext | null;
   syncStatus: 'online' | 'offline' | 'syncing';
+  lastSyncAt: string | null;
+  lastSyncCheckAt: string | null;
+  isSyncingQueue: boolean;
   fatalSyncError: Error | null;
-  checkAndSyncNow: () => Promise<void>;
-  clearCloudError: () => void;
 
   // Shared Savatcha Cart state
   cartItems: SaleItem[];
@@ -143,10 +152,13 @@ interface AppState {
   can: (perm: Permission) => boolean;
   canAccessStore: (storeId: string) => boolean;
   loginWithPhone: (phone: string, password: string) => boolean;
-  loginWithGoogle: () => Promise<{ ok: boolean; error?: string }>;
+  loginWithGoogle: (options?: { linkOnly?: boolean }) => Promise<{ ok: boolean; error?: string }>;
   switchUserByPin: (pin: string) => User | null;
   verifyManagerPin: (pin: string) => User | null;
   logout: () => void;
+  checkAndSyncNow: () => Promise<void>;
+  forceSyncNow: () => Promise<{ ok: boolean; synced: number; error?: string }>;
+  clearCloudError: () => void;
 
   // Held Carts
   addHeldCart: (cart: HeldCart) => void;
@@ -174,7 +186,7 @@ interface AppState {
   importProducts: (
     products: Product[],
     initialStocks: { productId: string; variantId: string; warehouseId: string; qty: number; unitCost: number }[]
-  ) => Promise<{ imported: number; skipped: number }>;
+  ) => Promise<{ added: number; skipped: number; skippedNames: string[] }>;
 
   // POS & Cash Shifts
   openShift: (startingCash: number, storeId: string) => Promise<CashShift>;
@@ -262,7 +274,7 @@ interface AppState {
   createOnlineOrder: (
     order: Omit<OnlineOrder, 'id' | 'orderNumber' | 'createdAt' | 'updatedAt' | 'createdBy' | 'status'>
   ) => Promise<OnlineOrder>;
-  updateOnlineOrderStatus: (orderId: string, status: OnlineOrder['status']) => Promise<void>;
+  updateOnlineOrderStatus: (orderId: string, status: OnlineOrder['status']) => Promise<{ ok: boolean; error?: string }>;
 
   // Categories CRUD
   isCategoryUsed: (catId: string) => boolean;
@@ -415,6 +427,118 @@ function phonesMatch(a: string, b: string): boolean {
   return false;
 }
 
+function matchesSecret(plain: string | undefined, hash: string | undefined, input: string): boolean {
+  const clean = input.trim();
+  if (!clean) return false;
+  if (plain && plain === clean) return true;
+  if (hash && hash === hashStaffSecret(clean)) return true;
+  return false;
+}
+
+function normalizeProductName(name: string): string {
+  return String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+
+function nextSeqNumber(existingNumbers: string[], tailRegex: RegExp, minStart: number): number {
+  let maxVal = minStart - 1;
+  for (const numStr of existingNumbers) {
+    const m = String(numStr || '').match(tailRegex);
+    if (m && m[1]) {
+      const parsed = Number.parseInt(m[1], 10);
+      if (Number.isFinite(parsed) && parsed > maxVal) {
+        maxVal = parsed;
+      }
+    }
+  }
+  return maxVal + 1;
+}
+
+export function findDuplicateProductReason(
+  existingProducts: Product[],
+  candidate: Product,
+  lang: Language
+): string | null {
+  const cleanName = normalizeProductName(candidate.name);
+  if (!cleanName) {
+    return lang === 'ru' ? 'Введите название товара' : 'Mahsulot nomini kiriting';
+  }
+
+  const nameMatch = existingProducts.find(
+    (p) => p.id !== candidate.id && normalizeProductName(p.name) === cleanName
+  );
+  if (nameMatch) {
+    return lang === 'ru'
+      ? `Товар с таким названием («${nameMatch.name}») уже существует`
+      : `Bu nomdagi mahsulot («${nameMatch.name}») allaqachon mavjud`;
+  }
+
+  // Intra-product duplicate checks across candidate variants
+  const ownSkus = new Set<string>();
+  const ownBarcodes = new Set<string>();
+  const ownAttrs = new Set<string>();
+  for (const v of candidate.variants) {
+    const sku = String(v.sku || '').trim().toLowerCase();
+    if (sku) {
+      if (ownSkus.has(sku)) {
+        return lang === 'ru'
+          ? `Дублирующийся артикул (SKU: ${v.sku}) внутри товара`
+          : `Mahsulot ichida takroriy artikul (SKU: ${v.sku}) mavjud`;
+      }
+      ownSkus.add(sku);
+    }
+    for (const b of v.barcodes || []) {
+      const cleanBc = String(b || '').trim();
+      if (cleanBc) {
+        if (ownBarcodes.has(cleanBc)) {
+          return lang === 'ru'
+            ? `Дублирующийся штрих-код (${cleanBc}) внутри товара`
+            : `Mahsulot ichida takroriy shtrix-kod (${cleanBc}) mavjud`;
+        }
+        ownBarcodes.add(cleanBc);
+      }
+    }
+    if (candidate.variants.length > 1) {
+      const sizeKey = String(v.size || '').trim().toLowerCase();
+      const colorKey = String(v.color || '').trim().toLowerCase();
+      const attrKey = `${sizeKey}|${colorKey}`;
+      if ((sizeKey || colorKey) && ownAttrs.has(attrKey)) {
+        return lang === 'ru'
+          ? `Дублирующийся вариант (${[v.size, v.color].filter(Boolean).join(' / ')}) внутри товара`
+          : `Mahsulot ichida takroriy variant (${[v.size, v.color].filter(Boolean).join(' / ')}) mavjud`;
+      }
+      ownAttrs.add(attrKey);
+    }
+  }
+
+  const candidateSkus = ownSkus;
+  const candidateBarcodes = ownBarcodes;
+
+  for (const existing of existingProducts) {
+    if (existing.id === candidate.id) continue;
+    for (const v of existing.variants) {
+      const sku = String(v.sku || '').trim().toLowerCase();
+      if (sku && candidateSkus.has(sku)) {
+        return lang === 'ru'
+          ? `Артикул (SKU: ${v.sku}) уже используется в товаре «${existing.name}»`
+          : `Bu artikul (SKU: ${v.sku}) «${existing.name}» mahsulotida band`;
+      }
+      for (const b of v.barcodes || []) {
+        const cleanBc = String(b || '').trim();
+        if (cleanBc && candidateBarcodes.has(cleanBc)) {
+          return lang === 'ru'
+            ? `Штрих-код (${cleanBc}) уже используется в товаре «${existing.name}»`
+            : `Bu shtrix-kod (${cleanBc}) «${existing.name}» mahsulotida allaqachon mavjud`;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 let migratedOwnerCloudOnce = false;
 let migratedNamesCloudOnce = false;
 
@@ -430,41 +554,50 @@ export const useAppStore = create<AppState>((set, get) => {
     const { cloudConnected, workspaceContext, isOnline } = get();
 
     // Always persist immediately on device first (offline-first PWA)
-    if (!isOnline || !cloudConnected || !workspaceContext) {
+    if (!isOnline) {
       if (!nextDb.offlineQueue.some((q) => q.id === op.id)) {
         nextDb.offlineQueue.push(op);
       }
       await repository.save(nextDb);
-      set({ db: nextDb, syncStatus: isOnline ? 'online' : 'offline' });
+      set({ db: nextDb, syncStatus: 'offline' });
       return;
     }
 
     await repository.save(nextDb);
-    set({ db: nextDb, syncStatus: 'syncing' });
+    set({ db: nextDb });
 
-    try {
-      await pushSyncItemToFirestore(workspaceContext, op, nextDb);
-      set({
-        syncStatus: get().isOnline ? 'online' : 'offline',
-        cloudError: null,
-        lastSyncAt: new Date().toISOString(),
-      });
-    } catch (err) {
-      const friendlyMsg = formatFirebaseErrorMessage(err, get().language);
-      if (isPermissionError(err)) {
-        get().notify(friendlyMsg, 'error');
+    if (cloudConnected && workspaceContext) {
+      set({ syncStatus: 'syncing' });
+      try {
+        await pushSyncItemToFirestore(workspaceContext, op, nextDb);
+        const syncedAt = new Date().toISOString();
+        set({
+          syncStatus: get().isOnline ? 'online' : 'offline',
+          lastSyncAt: syncedAt,
+          lastSyncCheckAt: syncedAt,
+          cloudError: null,
+        });
+      } catch (err) {
+        if (isPermissionError(err)) {
+          const msg = get().language === 'ru'
+            ? 'У вас недостаточно прав для этой операции'
+            : "Ushbu amalni bulutga yozish uchun ruxsatingiz yetarli emas";
+          get().notify(msg, 'error');
+          set({ syncStatus: get().isOnline ? 'online' : 'offline', cloudError: msg });
+        } else {
+          // Transient / network issue -> queue for auto-sync when connection stabilizes
+          const latestDb = structuredClone(get().db ?? nextDb);
+          if (!latestDb.offlineQueue.some((q) => q.id === op.id)) {
+            latestDb.offlineQueue.push({ ...op, attempts: (op.attempts || 0) + 1 });
+          }
+          await repository.save(latestDb);
+          set({
+            db: latestDb,
+            syncStatus: get().isOnline ? 'online' : 'offline',
+            cloudError: formatFirebaseError(err, get().language),
+          });
+        }
       }
-      // Preserve unsynced operation in offlineQueue until Firestore write actually succeeds
-      const latestDb = structuredClone(get().db ?? nextDb);
-      if (!latestDb.offlineQueue.some((q) => q.id === op.id)) {
-        latestDb.offlineQueue.push({ ...op, attempts: (op.attempts || 0) + 1 });
-      }
-      await repository.save(latestDb);
-      set({
-        db: latestDb,
-        syncStatus: get().isOnline ? 'online' : 'offline',
-        cloudError: friendlyMsg,
-      });
     }
   };
 
@@ -493,12 +626,16 @@ export const useAppStore = create<AppState>((set, get) => {
       const nowIso = new Date().toISOString();
       const newUserId = ctx.staffId || `usr-${ctx.uid.slice(0, 10)}`;
       const fallbackStoreId = ctx.assignedStoreIds[0] || snapshot.stores[0]?.id || 'store-chilonzor';
+      const generatedPin = String(Math.floor(1000 + Math.random() * 8999));
       matched = {
         id: newUserId,
         name: fbUser.displayName || email.split('@')[0] || 'Xodim',
         phone: '',
         password: '',
-        pin: String(Math.floor(1000 + Math.random() * 8999)),
+        pin: generatedPin,
+        pinHash: hashStaffSecret(generatedPin),
+        hashAlgo: 'sha256',
+        authMigrated: true,
         googleEmail: email,
         roleId: ctx.roleId,
         assignedStoreIds: ctx.assignedStoreIds.length ? ctx.assignedStoreIds : [fallbackStoreId],
@@ -515,10 +652,212 @@ export const useAppStore = create<AppState>((set, get) => {
     return { user: matched ?? null, mutatedSnapshot: mutated };
   };
 
+  const handleFatalSyncError = (fatalErr: Error) => {
+    set({
+      fatalSyncError: fatalErr,
+      cloudError: formatFirebaseError(fatalErr, get().language),
+      syncStatus: 'offline',
+    });
+  };
+
+  const applyHydratedSnapshot = (
+    hydratedDb: DatabaseSnapshot,
+    metaUpdate?: Partial<WorkspaceContext>
+  ) => {
+    const prevCtx = get().workspaceContext;
+    if (!prevCtx) return;
+    const nextCtx = metaUpdate ? { ...prevCtx, ...metaUpdate } : prevCtx;
+
+    const activeUserId = get().currentUserId;
+    let resolvedUser = activeUserId
+      ? hydratedDb.users.find((u) => u.id === activeUserId && u.isActive) ?? null
+      : null;
+
+    const activeEmail = (get().firebaseEmail || auth.currentUser?.email || '').trim().toLowerCase();
+    if (!resolvedUser && activeEmail) {
+      resolvedUser =
+        hydratedDb.users.find((u) => u.isActive && u.googleEmail?.trim().toLowerCase() === activeEmail) ??
+        (isBootstrappedAdminEmail(activeEmail)
+          ? hydratedDb.users.find((u) => u.isActive && u.roleId === 'owner') ?? null
+          : null);
+      if (resolvedUser) {
+        localStorage.setItem(SESSION_KEY, resolvedUser.id);
+      }
+    }
+
+    let nextStoreId = get().activeStoreId;
+    if (resolvedUser && resolvedUser.roleId !== 'owner' && resolvedUser.roleId !== 'admin') {
+      const allowed = resolvedUser.assignedStoreIds || [];
+      if (allowed.length > 0 && (nextStoreId === 'all' || !allowed.includes(nextStoreId))) {
+        nextStoreId = allowed[0];
+      }
+    }
+
+    if (!migratedOwnerCloudOnce && nextCtx.isWsAdmin) {
+      const ownerUser = hydratedDb.users.find((u) => u.id === 'usr-owner' || u.roleId === 'owner');
+      if (ownerUser && ownerUser.phone === '+998901112233' && ownerUser.pin === '1111') {
+        migratedOwnerCloudOnce = true;
+        ownerUser.phone = '+998889260404';
+        ownerUser.password = '51111';
+        ownerUser.pin = '51111';
+        ownerUser.passwordHash = hashStaffSecret('51111');
+        ownerUser.pinHash = hashStaffSecret('51111');
+        ownerUser.hashAlgo = 'sha256';
+        ownerUser.authMigrated = true;
+        if (!ownerUser.googleEmail) ownerUser.googleEmail = ADMIN_BOOTSTRAPPED_EMAILS[0];
+        ownerUser.updatedAt = new Date().toISOString();
+        const ownerEmp = hydratedDb.employees.find((e) => e.userId === ownerUser.id);
+        if (ownerEmp) {
+          ownerEmp.phone = '+998889260404';
+          if (!ownerEmp.googleEmail) ownerEmp.googleEmail = ownerUser.googleEmail;
+          ownerEmp.updatedAt = ownerUser.updatedAt;
+        }
+        void pushSyncItemToFirestore(
+          nextCtx,
+          {
+            id: uid('sync'),
+            idempotencyKey: `migrate-owner-${ownerUser.id}`,
+            type: 'employee',
+            payload: { empId: ownerEmp?.id ?? ownerUser.id, userId: ownerUser.id, storeId: ownerUser.storeId },
+            createdAt: ownerUser.updatedAt,
+            attempts: 0,
+          },
+          hydratedDb
+        ).catch(() => {
+          // ignore transient error
+        });
+      }
+    }
+
+    if (!migratedNamesCloudOnce && nextCtx.isWsAdmin) {
+      migratedNamesCloudOnce = true;
+      const nowIso = new Date().toISOString();
+      const ownerUser = hydratedDb.users.find((u) => u.id === 'usr-owner' || u.roleId === 'owner');
+      if (ownerUser && ownerUser.name === 'Sardorbek Karimov') {
+        ownerUser.name = 'ISLOMBEK';
+        ownerUser.updatedAt = nowIso;
+        const ownerEmp = hydratedDb.employees.find((e) => e.userId === ownerUser.id);
+        if (ownerEmp) {
+          ownerEmp.name = 'ISLOMBEK';
+          ownerEmp.updatedAt = nowIso;
+        }
+        void pushSyncItemToFirestore(
+          nextCtx,
+          {
+            id: uid('sync'),
+            idempotencyKey: `migrate-owner-name-v5-${ownerUser.id}`,
+            type: 'employee',
+            payload: { empId: ownerEmp?.id ?? ownerUser.id, userId: ownerUser.id, storeId: ownerUser.storeId },
+            createdAt: nowIso,
+            attempts: 0,
+          },
+          hydratedDb
+        ).catch(() => {});
+      }
+
+      const st1 = hydratedDb.stores.find((s) => s.id === 'store-chilonzor');
+      if (st1 && st1.name === 'Chilonzor Flagman') {
+        st1.name = 'SHU BREND TORAQORGON';
+        st1.address = "To'raqo'rg'on";
+        st1.updatedAt = nowIso;
+        void pushSyncItemToFirestore(
+          nextCtx,
+          {
+            id: uid('sync'),
+            idempotencyKey: 'migrate-store-v5-chilonzor',
+            type: 'store',
+            payload: { storeId: st1.id },
+            createdAt: nowIso,
+            attempts: 0,
+          },
+          hydratedDb
+        ).catch(() => {});
+      }
+
+      const st2 = hydratedDb.stores.find((s) => s.id === 'store-samdarvoza');
+      if (st2 && st2.name === 'Samarqand Darvoza') {
+        st2.name = 'SHU BREND MINGBULOQ';
+        st2.address = 'Mingbuloq';
+        st2.updatedAt = nowIso;
+        void pushSyncItemToFirestore(
+          nextCtx,
+          {
+            id: uid('sync'),
+            idempotencyKey: 'migrate-store-v5-samdarvoza',
+            type: 'store',
+            payload: { storeId: st2.id },
+            createdAt: nowIso,
+            attempts: 0,
+          },
+          hydratedDb
+        ).catch(() => {});
+      }
+
+      const wh1 = hydratedDb.warehouses.find((w) => w.id === 'wh-chilonzor');
+      if (wh1 && wh1.name.includes('Chilonzor')) {
+        wh1.name = 'Ombor — SHU BREND TORAQORGON';
+        wh1.address = "To'raqo'rg'on";
+        wh1.updatedAt = nowIso;
+        void pushSyncItemToFirestore(
+          nextCtx,
+          {
+            id: uid('sync'),
+            idempotencyKey: 'migrate-wh-v5-chilonzor',
+            type: 'warehouse',
+            payload: { warehouseId: wh1.id, storeId: wh1.storeId },
+            createdAt: nowIso,
+            attempts: 0,
+          },
+          hydratedDb
+        ).catch(() => {});
+      }
+
+      const wh2 = hydratedDb.warehouses.find((w) => w.id === 'wh-samdarvoza');
+      if (wh2 && wh2.name.includes('SamDarvoza')) {
+        wh2.name = 'Ombor — SHU BREND MINGBULOQ';
+        wh2.address = 'Mingbuloq';
+        wh2.updatedAt = nowIso;
+        void pushSyncItemToFirestore(
+          nextCtx,
+          {
+            id: uid('sync'),
+            idempotencyKey: 'migrate-wh-v5-samdarvoza',
+            type: 'warehouse',
+            payload: { warehouseId: wh2.id, storeId: wh2.storeId },
+            createdAt: nowIso,
+            attempts: 0,
+          },
+          hydratedDb
+        ).catch(() => {});
+      }
+    }
+
+    const hydratedIso = new Date().toISOString();
+    void repository.save(hydratedDb);
+    set({
+      db: hydratedDb,
+      workspaceContext: nextCtx,
+      ...(resolvedUser ? { currentUserId: resolvedUser.id } : {}),
+      activeStoreId: nextStoreId,
+      lastSyncAt: hydratedIso,
+      lastSyncCheckAt: hydratedIso,
+      cloudError: null,
+    });
+  };
+
   const connectFirebaseUser = async (
     fbUser: FirebaseUser,
     options?: { setSessionIfMissing?: boolean; forceInteractiveLogin?: boolean }
   ): Promise<WorkspaceContext | null> => {
+    if (
+      !options?.forceInteractiveLogin &&
+      get().cloudConnected &&
+      get().firebaseUid === fbUser.uid &&
+      (unsubscribeRealtime || isFirestoreWatchDisabled()) &&
+      get().workspaceContext
+    ) {
+      return get().workspaceContext;
+    }
     if (activeConnectPromise) return activeConnectPromise;
 
     const run = async (): Promise<WorkspaceContext | null> => {
@@ -530,7 +869,6 @@ export const useAppStore = create<AppState>((set, get) => {
       }
 
       try {
-        await ensureFirestoreNetwork();
         const ctx = await bootstrapOrJoinWorkspace(fbUser, currentDb);
         if (unsubscribeRealtime) {
           unsubscribeRealtime();
@@ -551,7 +889,7 @@ export const useAppStore = create<AppState>((set, get) => {
         const nextSessionId =
           options?.forceInteractiveLogin && matchedUser
             ? matchedUser.id
-            : !hasValidSession && matchedUser
+            : (!hasValidSession || options?.setSessionIfMissing) && matchedUser
             ? matchedUser.id
             : currentSession;
 
@@ -562,6 +900,7 @@ export const useAppStore = create<AppState>((set, get) => {
         const effectiveUser =
           (nextSessionId ? localCopy.users.find((u) => u.id === nextSessionId) : null) ?? matchedUser;
 
+        const nowIso = new Date().toISOString();
         set({
           cloudConnected: true,
           cloudConnecting: false,
@@ -570,6 +909,8 @@ export const useAppStore = create<AppState>((set, get) => {
           firebaseEmail: ctx.email,
           workspaceContext: ctx,
           syncStatus: get().isOnline ? 'online' : 'offline',
+          lastSyncAt: nowIso,
+          lastSyncCheckAt: nowIso,
           ...(nextSessionId ? { currentUserId: nextSessionId } : {}),
           ...(effectiveUser && (options?.forceInteractiveLogin || options?.setSessionIfMissing)
             ? { activeStoreId: resolveDefaultStoreForUser(effectiveUser, localCopy) }
@@ -596,188 +937,22 @@ export const useAppStore = create<AppState>((set, get) => {
           }
         }
 
-        unsubscribeRealtime = subscribeWorkspaceRealtime(
-          ctx,
-          () => get().db,
-          (hydratedDb, metaUpdate) => {
-            const prevCtx = get().workspaceContext;
-            const nextCtx = prevCtx && metaUpdate ? { ...prevCtx, ...metaUpdate } : prevCtx;
+        // 1. Hydrate all 30 workspace collections via WatchStream-free Firestore REST API first
+        await hydrateWorkspaceViaRest(ctx, () => get().db, applyHydratedSnapshot, {
+          onFatalError: handleFatalSyncError,
+        });
 
-            const activeUserId = get().currentUserId;
-            let resolvedUser = activeUserId
-              ? hydratedDb.users.find((u) => u.id === activeUserId && u.isActive) ?? null
-              : null;
+        // 2. Attach only 6 staggered core operational Watch listeners (if WatchStream not disabled)
+        if (!isFirestoreWatchDisabled()) {
+          unsubscribeRealtime = subscribeWorkspaceRealtime(
+            ctx,
+            () => get().db,
+            applyHydratedSnapshot,
+            handleFatalSyncError
+          );
+        }
 
-            if (!resolvedUser && fbUser.email) {
-              const email = fbUser.email.trim().toLowerCase();
-              resolvedUser =
-                hydratedDb.users.find((u) => u.isActive && u.googleEmail?.trim().toLowerCase() === email) ??
-                (isBootstrappedAdminEmail(email)
-                  ? hydratedDb.users.find((u) => u.isActive && u.roleId === 'owner') ?? null
-                  : null);
-              if (resolvedUser) {
-                localStorage.setItem(SESSION_KEY, resolvedUser.id);
-              }
-            }
 
-            let nextStoreId = get().activeStoreId;
-            if (resolvedUser && resolvedUser.roleId !== 'owner' && resolvedUser.roleId !== 'admin') {
-              const allowed = resolvedUser.assignedStoreIds || [];
-              if (allowed.length > 0 && (nextStoreId === 'all' || !allowed.includes(nextStoreId))) {
-                nextStoreId = allowed[0];
-              }
-            }
-
-            if (!migratedOwnerCloudOnce && ctx.isWsAdmin) {
-              const ownerUser = hydratedDb.users.find((u) => u.id === 'usr-owner' || u.roleId === 'owner');
-              if (ownerUser && ownerUser.phone === '+998901112233' && ownerUser.pin === '1111') {
-                migratedOwnerCloudOnce = true;
-                ownerUser.phone = '+998889260404';
-                ownerUser.password = '51111';
-                ownerUser.pin = '51111';
-                if (!ownerUser.googleEmail) ownerUser.googleEmail = ADMIN_BOOTSTRAPPED_EMAILS[0];
-                ownerUser.updatedAt = new Date().toISOString();
-                const ownerEmp = hydratedDb.employees.find((e) => e.userId === ownerUser.id);
-                if (ownerEmp) {
-                  ownerEmp.phone = '+998889260404';
-                  if (!ownerEmp.googleEmail) ownerEmp.googleEmail = ownerUser.googleEmail;
-                  ownerEmp.updatedAt = ownerUser.updatedAt;
-                }
-                void pushSyncItemToFirestore(
-                  ctx,
-                  {
-                    id: uid('sync'),
-                    idempotencyKey: `migrate-owner-${ownerUser.id}`,
-                    type: 'employee',
-                    payload: { empId: ownerEmp?.id ?? ownerUser.id, userId: ownerUser.id, storeId: ownerUser.storeId },
-                    createdAt: ownerUser.updatedAt,
-                    attempts: 0,
-                  },
-                  hydratedDb
-                ).catch(() => {
-                  // ignore transient error
-                });
-              }
-            }
-
-            if (!migratedNamesCloudOnce && ctx.isWsAdmin) {
-              migratedNamesCloudOnce = true;
-              const nowIso = new Date().toISOString();
-              const ownerUser = hydratedDb.users.find((u) => u.id === 'usr-owner' || u.roleId === 'owner');
-              if (ownerUser && ownerUser.name === 'Sardorbek Karimov') {
-                ownerUser.name = 'ISLOMBEK';
-                ownerUser.updatedAt = nowIso;
-                const ownerEmp = hydratedDb.employees.find((e) => e.userId === ownerUser.id);
-                if (ownerEmp) {
-                  ownerEmp.name = 'ISLOMBEK';
-                  ownerEmp.updatedAt = nowIso;
-                }
-                void pushSyncItemToFirestore(
-                  ctx,
-                  {
-                    id: uid('sync'),
-                    idempotencyKey: `migrate-owner-name-v5-${ownerUser.id}`,
-                    type: 'employee',
-                    payload: { empId: ownerEmp?.id ?? ownerUser.id, userId: ownerUser.id, storeId: ownerUser.storeId },
-                    createdAt: nowIso,
-                    attempts: 0,
-                  },
-                  hydratedDb
-                ).catch(() => {});
-              }
-
-              const st1 = hydratedDb.stores.find((s) => s.id === 'store-chilonzor');
-              if (st1 && st1.name === 'Chilonzor Flagman') {
-                st1.name = 'SHU BREND TORAQORGON';
-                st1.address = "To'raqo'rg'on";
-                st1.updatedAt = nowIso;
-                void pushSyncItemToFirestore(
-                  ctx,
-                  {
-                    id: uid('sync'),
-                    idempotencyKey: 'migrate-store-v5-chilonzor',
-                    type: 'store',
-                    payload: { storeId: st1.id },
-                    createdAt: nowIso,
-                    attempts: 0,
-                  },
-                  hydratedDb
-                ).catch(() => {});
-              }
-
-              const st2 = hydratedDb.stores.find((s) => s.id === 'store-samdarvoza');
-              if (st2 && st2.name === 'Samarqand Darvoza') {
-                st2.name = 'SHU BREND MINGBULOQ';
-                st2.address = 'Mingbuloq';
-                st2.updatedAt = nowIso;
-                void pushSyncItemToFirestore(
-                  ctx,
-                  {
-                    id: uid('sync'),
-                    idempotencyKey: 'migrate-store-v5-samdarvoza',
-                    type: 'store',
-                    payload: { storeId: st2.id },
-                    createdAt: nowIso,
-                    attempts: 0,
-                  },
-                  hydratedDb
-                ).catch(() => {});
-              }
-
-              const wh1 = hydratedDb.warehouses.find((w) => w.id === 'wh-chilonzor');
-              if (wh1 && wh1.name.includes('Chilonzor')) {
-                wh1.name = 'Ombor — SHU BREND TORAQORGON';
-                wh1.address = "To'raqo'rg'on";
-                wh1.updatedAt = nowIso;
-                void pushSyncItemToFirestore(
-                  ctx,
-                  {
-                    id: uid('sync'),
-                    idempotencyKey: 'migrate-wh-v5-chilonzor',
-                    type: 'warehouse',
-                    payload: { warehouseId: wh1.id, storeId: wh1.storeId },
-                    createdAt: nowIso,
-                    attempts: 0,
-                  },
-                  hydratedDb
-                ).catch(() => {});
-              }
-
-              const wh2 = hydratedDb.warehouses.find((w) => w.id === 'wh-samdarvoza');
-              if (wh2 && wh2.name.includes('SamDarvoza')) {
-                wh2.name = 'Ombor — SHU BREND MINGBULOQ';
-                wh2.address = 'Mingbuloq';
-                wh2.updatedAt = nowIso;
-                void pushSyncItemToFirestore(
-                  ctx,
-                  {
-                    id: uid('sync'),
-                    idempotencyKey: 'migrate-wh-v5-samdarvoza',
-                    type: 'warehouse',
-                    payload: { warehouseId: wh2.id, storeId: wh2.storeId },
-                    createdAt: nowIso,
-                    attempts: 0,
-                  },
-                  hydratedDb
-                ).catch(() => {});
-              }
-            }
-
-            void repository.save(hydratedDb);
-            set({
-              db: hydratedDb,
-              workspaceContext: nextCtx,
-              ...(resolvedUser ? { currentUserId: resolvedUser.id } : {}),
-              activeStoreId: nextStoreId,
-              cloudError: null,
-              lastSyncAt: new Date().toISOString(),
-            });
-          },
-          (fatalErr) => {
-            const friendlyMsg = formatFirebaseErrorMessage(fatalErr, get().language);
-            set({ fatalSyncError: fatalErr, cloudError: friendlyMsg, syncStatus: 'offline' });
-          }
-        );
 
         // Flush any queued offline operations now that we are connected
         if (get().isOnline && (get().db?.offlineQueue.length ?? 0) > 0) {
@@ -786,7 +961,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
         return ctx;
       } catch (err) {
-        const msg = formatFirebaseErrorMessage(err, get().language);
+        const msg = formatFirebaseError(err, get().language);
         set({
           cloudConnected: false,
           cloudConnecting: false,
@@ -828,49 +1003,14 @@ export const useAppStore = create<AppState>((set, get) => {
     cloudConnected: false,
     cloudConnecting: false,
     cloudError: null,
-    lastSyncAt: null,
     firebaseUid: null,
     firebaseEmail: null,
     workspaceContext: null,
     syncStatus: typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'online',
+    lastSyncAt: null,
+    lastSyncCheckAt: null,
+    isSyncingQueue: false,
     fatalSyncError: null,
-    clearCloudError: () => set({ cloudError: null }),
-    checkAndSyncNow: async () => {
-      const online = typeof navigator !== 'undefined' ? navigator.onLine !== false : true;
-      if (!online) {
-        set({ isOnline: false, syncStatus: 'offline' });
-        return;
-      }
-      if (!get().isOnline) {
-        set({ isOnline: true });
-      }
-      const { cloudConnected, cloudConnecting, workspaceContext, db } = get();
-      if (cloudConnected && workspaceContext) {
-        const health = await checkWorkspaceSyncHealth(workspaceContext);
-        if (!health.ok) {
-          set({ cloudError: health.error ?? null });
-          return;
-        }
-        if (db && db.offlineQueue.length > 0) {
-          await get().syncOfflineQueue();
-        }
-        set({
-          cloudError: null,
-          lastSyncAt: new Date().toISOString(),
-          syncStatus: get().isOnline ? 'online' : 'offline',
-        });
-      } else if (auth.currentUser && !cloudConnecting) {
-        await connectFirebaseUser(auth.currentUser, { setSessionIfMissing: false });
-      } else if (!auth.currentUser) {
-        set({
-          cloudConnected: false,
-          firebaseUid: null,
-          firebaseEmail: null,
-          workspaceContext: null,
-          syncStatus: 'online',
-        });
-      }
-    },
 
     cartItems: [],
     cartCustomerId: '',
@@ -901,9 +1041,18 @@ export const useAppStore = create<AppState>((set, get) => {
       }),
 
     init: async () => {
+      if (get().initialized) return;
+      if (activeInitPromise) return activeInitPromise;
+
+      activeInitPromise = (async () => {
       const theme = get().theme;
       applyThemeToDOM(theme);
-      void testConnection();
+      void probeFirestoreConnection(get().language).then((probe) => {
+        set({
+          lastSyncCheckAt: new Date().toISOString(),
+          ...(!probe.ok && probe.error ? { cloudError: probe.error } : {}),
+        });
+      });
 
       const db = await repository.load();
       let changed = false;
@@ -1031,6 +1180,15 @@ export const useAppStore = create<AppState>((set, get) => {
         ...(initialUser ? { activeStoreId: resolveDefaultStoreForUser(initialUser, db) } : {}),
       });
 
+      if (!unsubscribeWatchGuard) {
+        unsubscribeWatchGuard = onFirestoreWatchDisabled(() => {
+          if (unsubscribeRealtime) {
+            unsubscribeRealtime();
+            unsubscribeRealtime = null;
+          }
+        });
+      }
+
       if (!unsubscribeAuth) {
         unsubscribeAuth = watchAuthState((fbUser) => {
           if (fbUser) {
@@ -1051,12 +1209,87 @@ export const useAppStore = create<AppState>((set, get) => {
         });
       }
 
-      // 15-second periodic sync status & offline queue watchdog
-      if (!syncWatchdogTimer && typeof window !== 'undefined') {
-        syncWatchdogTimer = setInterval(() => {
-          void get().checkAndSyncNow();
+      if (!syncIntervalHandle && typeof window !== 'undefined') {
+        const runPeriodicSyncCheck = async () => {
+          if (periodicCheckRunning) return;
+          periodicCheckRunning = true;
+          try {
+            const lang = get().language;
+            const navigatorOnline = typeof navigator !== 'undefined' ? navigator.onLine !== false : true;
+            const checkIso = new Date().toISOString();
+
+            if (!navigatorOnline) {
+              set({
+                isOnline: false,
+                syncStatus: 'offline',
+                lastSyncCheckAt: checkIso,
+              });
+              return;
+            }
+
+            const { cloudConnected, cloudConnecting, workspaceContext, db: latestDb } = get();
+
+            if (cloudConnected && workspaceContext) {
+              const serverAlive = await verifyWorkspaceServerSync(workspaceContext.workspaceId);
+              if (serverAlive) {
+                set({ isOnline: true, lastSyncCheckAt: checkIso });
+                if ((latestDb?.offlineQueue.length ?? 0) > 0) {
+                  await get().syncOfflineQueue();
+                }
+                await hydrateWorkspaceViaRest(
+                  workspaceContext,
+                  () => get().db,
+                  applyHydratedSnapshot,
+                  { onFatalError: handleFatalSyncError }
+                );
+                set({
+                  syncStatus: 'online',
+                  lastSyncAt: new Date().toISOString(),
+                  cloudError: null,
+                });
+              } else {
+                const probe = await probeFirestoreConnection(lang);
+                set({
+                  isOnline: navigatorOnline,
+                  syncStatus: probe.ok ? 'online' : 'offline',
+                  lastSyncCheckAt: checkIso,
+                  cloudError: probe.ok
+                    ? null
+                    : probe.error ||
+                      (lang === 'ru'
+                        ? 'Не удалось проверить серверную синхронизацию Firebase'
+                        : "Firebase serveri bilan sinxronizatsiya tekshiruvidan o'tmadi"),
+                });
+              }
+            } else {
+              const probe = await probeFirestoreConnection(lang);
+              if (!probe.ok) {
+                set({
+                  isOnline: navigatorOnline,
+                  syncStatus: 'offline',
+                  lastSyncCheckAt: checkIso,
+                  ...(get().cloudConnected || !navigatorOnline ? { cloudError: probe.error ?? null } : {}),
+                });
+                return;
+              }
+              set({ isOnline: true, lastSyncCheckAt: checkIso });
+              if (!cloudConnected && !cloudConnecting && auth.currentUser) {
+                await connectFirebaseUser(auth.currentUser, { setSessionIfMissing: true });
+              }
+            }
+          } finally {
+            periodicCheckRunning = false;
+          }
+        };
+
+        syncIntervalHandle = setInterval(() => {
+          void runPeriodicSyncCheck();
         }, 15000);
       }
+      })().finally(() => {
+        activeInitPromise = null;
+      });
+      return activeInitPromise;
     },
 
     setLanguage: (language) => {
@@ -1091,10 +1324,21 @@ export const useAppStore = create<AppState>((set, get) => {
         syncStatus: isOnline ? 'online' : 'offline',
       });
       if (isOnline) {
-        void ensureFirestoreNetwork().then(() => testConnection());
-        if (get().cloudConnected && (get().db?.offlineQueue.length ?? 0) > 0) {
-          void get().syncOfflineQueue();
-        }
+        void ensureFirestoreNetwork()
+          .then(() => probeFirestoreConnection(get().language))
+          .then((probe) => {
+            set({
+              lastSyncCheckAt: new Date().toISOString(),
+              cloudError: probe.ok ? null : probe.error ?? null,
+            });
+            if (probe.ok) {
+              if (!get().cloudConnected && !get().cloudConnecting && auth.currentUser) {
+                void connectFirebaseUser(auth.currentUser, { setSessionIfMissing: true });
+              } else if (get().cloudConnected && (get().db?.offlineQueue.length ?? 0) > 0) {
+                void get().syncOfflineQueue();
+              }
+            }
+          });
       }
     },
 
@@ -1145,7 +1389,8 @@ export const useAppStore = create<AppState>((set, get) => {
         (u) =>
           u.isActive &&
           phonesMatch(u.phone, phone) &&
-          ((u.password && u.password === secret) || (u.pin && u.pin === secret))
+          (matchesSecret(u.password, u.passwordHash, secret) ||
+            matchesSecret(u.pin, u.pinHash, secret))
       );
       if (!user) return false;
       localStorage.setItem(SESSION_KEY, user.id);
@@ -1176,23 +1421,130 @@ export const useAppStore = create<AppState>((set, get) => {
       return true;
     },
 
-    loginWithGoogle: async () => {
+    loginWithGoogle: async (options) => {
       try {
         set({ cloudConnecting: true, cloudError: null });
         const fbUser = await signInWithGooglePopup();
-        await connectFirebaseUser(fbUser, { forceInteractiveLogin: true });
+        await connectFirebaseUser(fbUser, {
+          forceInteractiveLogin: !options?.linkOnly,
+          setSessionIfMissing: true,
+        });
         return { ok: true };
       } catch (err) {
-        const msg = formatFirebaseErrorMessage(err, get().language);
+        const msg = formatFirebaseError(err, get().language);
         set({ cloudConnecting: false, cloudError: msg });
         return { ok: false, error: msg };
       }
     },
 
+    clearCloudError: () => set({ cloudError: null }),
+
+    checkAndSyncNow: async () => {
+      const online = typeof navigator !== 'undefined' ? navigator.onLine !== false : true;
+      if (!online) {
+        set({ isOnline: false, syncStatus: 'offline' });
+        return;
+      }
+      if (!get().isOnline) {
+        set({ isOnline: true });
+      }
+      const { cloudConnected, cloudConnecting, workspaceContext, db } = get();
+      if (cloudConnected && workspaceContext) {
+        const health = await checkWorkspaceSyncHealth(workspaceContext);
+        set({ lastSyncCheckAt: new Date().toISOString() });
+        if (!health.ok) {
+          set({ cloudError: health.error ?? null });
+          return;
+        }
+        if (db && db.offlineQueue.length > 0) {
+          await get().syncOfflineQueue();
+        }
+        await hydrateWorkspaceViaRest(
+          workspaceContext,
+          () => get().db,
+          applyHydratedSnapshot,
+          { onFatalError: handleFatalSyncError }
+        );
+        const syncedAt = new Date().toISOString();
+        set({
+          cloudError: null,
+          lastSyncAt: syncedAt,
+          lastSyncCheckAt: syncedAt,
+          syncStatus: get().isOnline ? 'online' : 'offline',
+        });
+      } else if (auth.currentUser && !cloudConnecting) {
+        await connectFirebaseUser(auth.currentUser, { setSessionIfMissing: false });
+      } else if (!auth.currentUser) {
+        set({
+          cloudConnected: false,
+          firebaseUid: null,
+          firebaseEmail: null,
+          workspaceContext: null,
+          syncStatus: 'online',
+        });
+      }
+    },
+
+    forceSyncNow: async () => {
+      const lang = get().language;
+      const probe = await probeFirestoreConnection(lang);
+      const checkIso = new Date().toISOString();
+      if (!probe.ok) {
+        const errMsg = probe.error || (lang === 'ru' ? 'Нет подключения к серверу Firebase' : "Firebase serveri bilan aloqa yo'q");
+        set({
+          isOnline: typeof navigator !== 'undefined' ? navigator.onLine : false,
+          syncStatus: 'offline',
+          lastSyncCheckAt: checkIso,
+          cloudError: errMsg,
+        });
+        return { ok: false, synced: 0, error: errMsg };
+      }
+
+      set({ isOnline: true, lastSyncCheckAt: checkIso });
+      if (!get().cloudConnected && auth.currentUser) {
+        await connectFirebaseUser(auth.currentUser, { setSessionIfMissing: true });
+      }
+
+      const ctx = get().workspaceContext;
+      if (!get().cloudConnected || !ctx) {
+        const msg =
+          lang === 'ru'
+            ? 'Для облачной синхронизации войдите через Google аккаунт'
+            : "Bulutli sinxronlash uchun Google hisobingiz bilan ulaning";
+        return { ok: false, synced: 0, error: msg };
+      }
+
+      const alive = await verifyWorkspaceServerSync(ctx.workspaceId);
+      if (!alive) {
+        const msg =
+          lang === 'ru'
+            ? 'Сервер базы данных Firebase не отвечает'
+            : "Firebase ma'lumotlar bazasi javob bermayapti";
+        set({ cloudError: msg, syncStatus: 'offline' });
+        return { ok: false, synced: 0, error: msg };
+      }
+
+      const synced = await get().syncOfflineQueue();
+      await hydrateWorkspaceViaRest(
+        ctx,
+        () => get().db,
+        applyHydratedSnapshot,
+        { onFatalError: handleFatalSyncError }
+      );
+      const doneIso = new Date().toISOString();
+      set({
+        syncStatus: 'online',
+        lastSyncAt: doneIso,
+        lastSyncCheckAt: doneIso,
+        cloudError: null,
+      });
+      return { ok: true, synced };
+    },
+
     switchUserByPin: (pin) => {
       const { db } = get();
       if (!db) return null;
-      const user = db.users.find((u) => u.isActive && u.pin === pin);
+      const user = db.users.find((u) => u.isActive && matchesSecret(u.pin, u.pinHash, pin));
       if (!user) return null;
       localStorage.setItem(SESSION_KEY, user.id);
       const fbUser = auth.currentUser;
@@ -1222,7 +1574,7 @@ export const useAppStore = create<AppState>((set, get) => {
         db.users.find(
           (u) =>
             u.isActive &&
-            u.pin === pin &&
+            matchesSecret(u.pin, u.pinHash, pin) &&
             (u.roleId === 'owner' || u.roleId === 'admin' || u.roleId === 'manager')
         ) ?? null
       );
@@ -1292,84 +1644,40 @@ export const useAppStore = create<AppState>((set, get) => {
         return { ok: false, error: language === 'ru' ? 'Недостаточно прав' : "Ruxsat yo'q" };
       }
       const cleanName = product.name.trim();
-      if (!cleanName) {
-        return { ok: false, error: language === 'ru' ? 'Введите название товара' : 'Mahsulot nomini kiriting' };
-      }
-
-      // Duplicate product protection (name, SKU, barcode)
-      const incomingSkus = new Set(
-        (product.variants || []).map((v) => v.sku.trim().toLowerCase()).filter(Boolean)
-      );
-      const incomingBarcodes = new Set(
-        (product.variants || []).flatMap((v) => v.barcodes || []).map((b) => b.trim()).filter(Boolean)
-      );
-
-      for (const existing of db.products) {
-        if (existing.id === product.id) continue;
-        if (existing.name.trim().toLowerCase() === cleanName.toLowerCase()) {
-          return {
-            ok: false,
-            error:
-              language === 'ru'
-                ? `Товар «${cleanName}» уже существует в каталоге`
-                : `"${cleanName}" nomli mahsulot katalogda allaqachon mavjud`,
-          };
-        }
-        for (const ev of existing.variants || []) {
-          const eSku = ev.sku.trim().toLowerCase();
-          if (eSku && incomingSkus.has(eSku)) {
-            return {
-              ok: false,
-              error:
-                language === 'ru'
-                  ? `SKU «${ev.sku}» уже используется другим товаром`
-                  : `"${ev.sku}" SKU kodi boshqa mahsulotda band`,
-            };
-          }
-          for (const eb of ev.barcodes || []) {
-            const cleanB = eb.trim();
-            if (cleanB && incomingBarcodes.has(cleanB)) {
-              return {
-                ok: false,
-                error:
-                  language === 'ru'
-                    ? `Штрих-код «${cleanB}» уже используется другим товаром`
-                    : `"${cleanB}" shtrix-kodi boshqa mahsulotda band`,
-              };
-            }
-          }
-        }
+      const cleanProduct: Product = { ...product, name: cleanName };
+      const dupError = findDuplicateProductReason(db.products, cleanProduct, language);
+      if (dupError) {
+        return { ok: false, error: dupError };
       }
 
       const user = get().getCurrentUser();
       const nextDb: DatabaseSnapshot = structuredClone(db);
       const nowIso = new Date().toISOString();
-      const normalizedProduct: Product = { ...product, name: cleanName };
-      const idx = nextDb.products.findIndex((p) => p.id === normalizedProduct.id);
+      const idx = nextDb.products.findIndex((p) => p.id === cleanProduct.id);
       let auditId: string | undefined;
       if (idx >= 0) {
         const prev = nextDb.products[idx];
         const prevPrice = prev.variants[0]?.retailPrice;
-        const newPrice = normalizedProduct.variants[0]?.retailPrice;
+        const newPrice = cleanProduct.variants[0]?.retailPrice;
         if (prevPrice !== undefined && newPrice !== undefined && prevPrice !== newPrice) {
           auditId = appendAudit(
             nextDb,
             user,
             'price_change',
             'Product',
-            normalizedProduct.id,
-            `${normalizedProduct.name} narxi o'zgartirildi: ${prevPrice} -> ${newPrice}`,
-            normalizedProduct.storeId
+            cleanProduct.id,
+            `${cleanProduct.name} narxi o'zgartirildi: ${prevPrice} -> ${newPrice}`,
+            cleanProduct.storeId
           );
         }
-        nextDb.products[idx] = { ...normalizedProduct, updatedAt: nowIso };
+        nextDb.products[idx] = { ...cleanProduct, updatedAt: nowIso };
       } else {
-        nextDb.products.unshift(normalizedProduct);
+        nextDb.products.unshift({ ...cleanProduct, createdAt: cleanProduct.createdAt || nowIso, updatedAt: nowIso });
       }
       await syncOrEnqueue(nextDb, {
         id: uid('sync'),
         type: 'product',
-        payload: { productId: normalizedProduct.id, auditId, storeId: normalizedProduct.storeId },
+        payload: { productId: cleanProduct.id, auditId, storeId: cleanProduct.storeId },
         createdAt: nowIso,
         attempts: 0,
       });
@@ -1484,50 +1792,36 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     importProducts: async (products, initialStocks) => {
-      const { db } = get();
-      if (!db || !get().can('edit_catalog')) return { imported: 0, skipped: products.length };
+      const { db, language } = get();
+      if (!db || !get().can('edit_catalog')) {
+        return { added: 0, skipped: products.length, skippedNames: products.map((p) => p.name) };
+      }
       const user = get().getCurrentUser();
       const nextDb: DatabaseSnapshot = structuredClone(db);
       const nowIso = new Date().toISOString();
 
-      const seenNames = new Set(nextDb.products.map((p) => p.name.trim().toLowerCase()));
-      const seenSkus = new Set(
-        nextDb.products.flatMap((p) => p.variants.map((v) => v.sku.trim().toLowerCase()).filter(Boolean))
-      );
-      const seenBarcodes = new Set(
-        nextDb.products.flatMap((p) => p.variants.flatMap((v) => v.barcodes || []).map((b) => b.trim()).filter(Boolean))
-      );
-
-      const accepted: Product[] = [];
-      let skipped = 0;
-
-      for (const p of products) {
-        const normName = p.name.trim().toLowerCase();
-        if (!normName || seenNames.has(normName)) {
-          skipped += 1;
-          continue;
+      const addedProducts: Product[] = [];
+      const skippedNames: string[] = [];
+      for (const prod of products) {
+        const cleanProd: Product = { ...prod, name: prod.name.trim() };
+        const pool = [...nextDb.products, ...addedProducts];
+        const dup = findDuplicateProductReason(pool, cleanProd, language);
+        if (dup) {
+          skippedNames.push(cleanProd.name || prod.id);
+        } else {
+          addedProducts.push(cleanProd);
         }
-        const pSkus = p.variants.map((v) => v.sku.trim().toLowerCase()).filter(Boolean);
-        const pBarcodes = p.variants.flatMap((v) => v.barcodes || []).map((b) => b.trim()).filter(Boolean);
-        if (pSkus.some((s) => seenSkus.has(s)) || pBarcodes.some((b) => seenBarcodes.has(b))) {
-          skipped += 1;
-          continue;
-        }
-        seenNames.add(normName);
-        pSkus.forEach((s) => seenSkus.add(s));
-        pBarcodes.forEach((b) => seenBarcodes.add(b));
-        accepted.push({ ...p, name: p.name.trim() });
       }
 
-      if (accepted.length === 0) {
-        return { imported: 0, skipped };
+      if (addedProducts.length === 0) {
+        return { added: 0, skipped: skippedNames.length, skippedNames };
       }
 
-      const acceptedIds = new Set(accepted.map((p) => p.id));
-      nextDb.products.unshift(...accepted);
+      const addedIds = new Set(addedProducts.map((p) => p.id));
+      nextDb.products.unshift(...addedProducts);
       const movementIds: string[] = [];
       initialStocks.forEach((st) => {
-        if (st.qty > 0 && acceptedIds.has(st.productId)) {
+        if (st.qty > 0 && addedIds.has(st.productId)) {
           const wh = nextDb.warehouses.find((w) => w.id === st.warehouseId);
           const mov = mutateStock(nextDb, {
             productId: st.productId,
@@ -1547,14 +1841,14 @@ export const useAppStore = create<AppState>((set, get) => {
         id: uid('sync'),
         type: 'import_products',
         payload: {
-          productIds: accepted.map((p) => p.id),
+          productIds: addedProducts.map((p) => p.id),
           movementIds,
-          storeId: accepted[0]?.storeId ?? nextDb.stores[0]?.id ?? 'store-chilonzor',
+          storeId: addedProducts[0]?.storeId ?? nextDb.stores[0]?.id ?? 'store-chilonzor',
         },
         createdAt: nowIso,
         attempts: 0,
       });
-      return { imported: accepted.length, skipped };
+      return { added: addedProducts.length, skipped: skippedNames.length, skippedNames };
     },
 
     openShift: async (startingCash, storeId) => {
@@ -1564,9 +1858,14 @@ export const useAppStore = create<AppState>((set, get) => {
       const user = get().getCurrentUser();
       const nextDb: DatabaseSnapshot = structuredClone(db);
       const nowIso = new Date().toISOString();
+      const shiftSeq = nextSeqNumber(
+        nextDb.cashShifts.map((s) => s.number),
+        /^SM-(\d+)$/i,
+        43
+      );
       const shift: CashShift = {
         id: uid('shift'),
-        number: `SM-${String(nextDb.cashShifts.length + 43).padStart(3, '0')}`,
+        number: `SM-${String(shiftSeq).padStart(3, '0')}`,
         cashierId: user?.id ?? 'system',
         cashierName: user?.name ?? 'Kassir',
         openedAt: nowIso,
@@ -1597,7 +1896,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
     recordCashOp: async (shiftId, type, amount, reason) => {
       const { db } = get();
-      if (!db) return;
+      if (!db || amount <= 0) return;
       if (!get().can('manage_shifts') && !get().can('use_pos')) return;
       const user = get().getCurrentUser();
       const nextDb: DatabaseSnapshot = structuredClone(db);
@@ -1627,7 +1926,14 @@ export const useAppStore = create<AppState>((set, get) => {
       await syncOrEnqueue(nextDb, {
         id: uid('sync'),
         type: 'cash_op',
-        payload: { opId: op.id, storeId: shift.storeId },
+        payload: {
+          opId: op.id,
+          shiftId: shift.id,
+          shiftCashInDelta: type === 'in' ? amount : 0,
+          shiftCashOutDelta: type === 'out' ? amount : 0,
+          shiftExpectedCashDelta: type === 'in' ? amount : -amount,
+          storeId: shift.storeId,
+        },
         createdAt: nowIso,
         attempts: 0,
       });
@@ -1678,7 +1984,11 @@ export const useAppStore = create<AppState>((set, get) => {
       const storeIdx = Math.max(0, nextDb.stores.findIndex((s) => s.id === input.storeId));
       const store = nextDb.stores[storeIdx];
       const storeCode = store?.storeCode || String(storeIdx + 1).padStart(2, '0');
-      const seqNum = 286 + nextDb.sales.length;
+      const seqNum = nextSeqNumber(
+        nextDb.sales.map((s) => s.receiptNumber),
+        /010104(\d+)$/,
+        286
+      );
       const receiptNumber = `#${storeCode}010104${String(seqNum).padStart(4, '0')}`;
 
       const subtotal = input.items.reduce((s, it) => s + it.lineTotal, 0);
@@ -1753,6 +2063,9 @@ export const useAppStore = create<AppState>((set, get) => {
       if (input.loyaltyPointsSpent !== undefined) {
         sale.loyaltyPointsSpent = input.loyaltyPointsSpent;
         sale.totalAmount = Math.max(0, sale.subtotal - sale.checkDiscountAmount - sale.loyaltyPointsSpent);
+        sale.vatAmount = nextDb.settings.vatEnabled
+          ? Math.round((sale.totalAmount * nextDb.settings.vatRate) / (100 + nextDb.settings.vatRate))
+          : 0;
       }
 
       const totalAmount = sale.totalAmount;
@@ -1780,9 +2093,12 @@ export const useAppStore = create<AppState>((set, get) => {
       let debtId: string | undefined;
 
       let earnedPoints = 0;
+      let loyaltyPointsDelta = 0;
       if (customer && loyaltyAcc) {
         if (sale.loyaltyPointsSpent > 0) {
+          const prevPts = loyaltyAcc.pointsBalance;
           loyaltyAcc.pointsBalance = Math.max(0, loyaltyAcc.pointsBalance - sale.loyaltyPointsSpent);
+          loyaltyPointsDelta += loyaltyAcc.pointsBalance - prevPts;
           const ltxId = uid('ltx');
           loyaltyTxIds.push(ltxId);
           nextDb.loyaltyTransactions.unshift({
@@ -1805,6 +2121,7 @@ export const useAppStore = create<AppState>((set, get) => {
           const expDate = new Date();
           expDate.setDate(expDate.getDate() + (nextDb.settings.cashbackExpiryDays || 180));
           loyaltyAcc.pointsBalance += earnedPoints;
+          loyaltyPointsDelta += earnedPoints;
           loyaltyAcc.expiresAt = expDate.toISOString();
           const ltxId = uid('ltx');
           loyaltyTxIds.push(ltxId);
@@ -1860,9 +2177,13 @@ export const useAppStore = create<AppState>((set, get) => {
         }
       }
 
+      let promoUsedDelta = 0;
       if (sale.promoCode) {
         const promo = nextDb.promoCodes.find((pr) => pr.code.toUpperCase() === sale.promoCode?.toUpperCase());
-        if (promo) promo.usedCount += 1;
+        if (promo) {
+          promo.usedCount += 1;
+          promoUsedDelta = 1;
+        }
       }
 
       const movementIds: string[] = [];
@@ -1903,20 +2224,24 @@ export const useAppStore = create<AppState>((set, get) => {
       }
 
       const touchedAccountIds: string[] = [];
+      const accountDeltas: Record<string, number> = {};
       const cashAcc = nextDb.accounts.find((a) => a.type === 'cash');
       const cardAcc = nextDb.accounts.find((a) => a.type === 'card_terminal');
       const bankAcc = nextDb.accounts.find((a) => a.type === 'bank');
       if (cashAcc && cashPaid > 0) {
         cashAcc.balance += cashPaid;
         touchedAccountIds.push(cashAcc.id);
+        accountDeltas[cashAcc.id] = (accountDeltas[cashAcc.id] ?? 0) + cashPaid;
       }
       if (cardAcc && cardPaid > 0) {
         cardAcc.balance += cardPaid;
         touchedAccountIds.push(cardAcc.id);
+        accountDeltas[cardAcc.id] = (accountDeltas[cardAcc.id] ?? 0) + cardPaid;
       }
       if (bankAcc && otherPaid > 0) {
         bankAcc.balance += otherPaid;
         touchedAccountIds.push(bankAcc.id);
+        accountDeltas[bankAcc.id] = (accountDeltas[bankAcc.id] ?? 0) + otherPaid;
       }
 
       let auditId: string | undefined;
@@ -1957,6 +2282,15 @@ export const useAppStore = create<AppState>((set, get) => {
           loyaltyTxIds,
           debtId,
           accountIds: touchedAccountIds,
+          accountDeltas,
+          customerSpentDelta: customer ? totalAmount : 0,
+          customerOrdersDelta: customer ? 1 : 0,
+          customerDebtDelta: customer ? debtAmount : 0,
+          loyaltyPointsDelta,
+          promoUsedDelta,
+          shiftDeltas: activeShift
+            ? { cashSales: cashPaid, cardSales: cardPaid, otherSales: otherPaid, expectedCash: cashPaid }
+            : undefined,
           auditId,
           storeId: sale.storeId,
         },
@@ -1994,7 +2328,11 @@ export const useAppStore = create<AppState>((set, get) => {
       const storeIdx = Math.max(0, nextDb.stores.findIndex((s) => s.id === input.storeId));
       const store = nextDb.stores[storeIdx];
       const storeCode = store?.storeCode || String(storeIdx + 1).padStart(2, '0');
-      const seqNum = 286 + nextDb.sales.length;
+      const seqNum = nextSeqNumber(
+        nextDb.sales.map((s) => s.receiptNumber),
+        /010104(\d+)$/,
+        286
+      );
       const receiptNumber = `#${storeCode}010104${String(seqNum).padStart(4, '0')}`;
 
       const subtotal = input.items.reduce((s, it) => s + it.lineTotal, 0);
@@ -2021,7 +2359,7 @@ export const useAppStore = create<AppState>((set, get) => {
       const debtAmount = payments
         .filter((p) => p.method === 'debt')
         .reduce((s, p) => s + p.amount, 0);
-      const paidAmount = totalAmount - debtAmount;
+      const paidAmount = Math.max(0, totalAmount - debtAmount);
 
       const customer = input.customerId ? nextDb.customers.find((c) => c.id === input.customerId) : undefined;
       const loyaltyAcc = customer ? nextDb.loyaltyAccounts.find((l) => l.customerId === customer.id) : undefined;
@@ -2029,9 +2367,12 @@ export const useAppStore = create<AppState>((set, get) => {
       let debtId: string | undefined;
 
       let earnedPoints = 0;
+      let loyaltyPointsDelta = 0;
       if (customer && loyaltyAcc) {
         if (input.loyaltyPointsSpent > 0) {
+          const prevPts = loyaltyAcc.pointsBalance;
           loyaltyAcc.pointsBalance = Math.max(0, loyaltyAcc.pointsBalance - input.loyaltyPointsSpent);
+          loyaltyPointsDelta += loyaltyAcc.pointsBalance - prevPts;
           const ltxId = uid('ltx');
           loyaltyTxIds.push(ltxId);
           nextDb.loyaltyTransactions.unshift({
@@ -2054,6 +2395,7 @@ export const useAppStore = create<AppState>((set, get) => {
           const expDate = new Date();
           expDate.setDate(expDate.getDate() + (nextDb.settings.cashbackExpiryDays || 180));
           loyaltyAcc.pointsBalance += earnedPoints;
+          loyaltyPointsDelta += earnedPoints;
           loyaltyAcc.expiresAt = expDate.toISOString();
           const ltxId = uid('ltx');
           loyaltyTxIds.push(ltxId);
@@ -2109,9 +2451,13 @@ export const useAppStore = create<AppState>((set, get) => {
         }
       }
 
+      let promoUsedDelta = 0;
       if (input.promoCode) {
         const promo = nextDb.promoCodes.find((pr) => pr.code.toUpperCase() === input.promoCode?.toUpperCase());
-        if (promo) promo.usedCount += 1;
+        if (promo) {
+          promo.usedCount += 1;
+          promoUsedDelta = 1;
+        }
       }
 
       const movementIds: string[] = [];
@@ -2152,20 +2498,24 @@ export const useAppStore = create<AppState>((set, get) => {
       }
 
       const touchedAccountIds: string[] = [];
+      const accountDeltas: Record<string, number> = {};
       const cashAcc = nextDb.accounts.find((a) => a.type === 'cash');
       const cardAcc = nextDb.accounts.find((a) => a.type === 'card_terminal');
       const bankAcc = nextDb.accounts.find((a) => a.type === 'bank');
       if (cashAcc && cashPaid > 0) {
         cashAcc.balance += cashPaid;
         touchedAccountIds.push(cashAcc.id);
+        accountDeltas[cashAcc.id] = (accountDeltas[cashAcc.id] ?? 0) + cashPaid;
       }
       if (cardAcc && cardPaid > 0) {
         cardAcc.balance += cardPaid;
         touchedAccountIds.push(cardAcc.id);
+        accountDeltas[cardAcc.id] = (accountDeltas[cardAcc.id] ?? 0) + cardPaid;
       }
       if (bankAcc && otherPaid > 0) {
         bankAcc.balance += otherPaid;
         touchedAccountIds.push(bankAcc.id);
+        accountDeltas[bankAcc.id] = (accountDeltas[bankAcc.id] ?? 0) + otherPaid;
       }
 
       let auditId: string | undefined;
@@ -2226,6 +2576,15 @@ export const useAppStore = create<AppState>((set, get) => {
           loyaltyTxIds,
           debtId,
           accountIds: touchedAccountIds,
+          accountDeltas,
+          customerSpentDelta: customer ? totalAmount : 0,
+          customerOrdersDelta: customer ? 1 : 0,
+          customerDebtDelta: customer ? debtAmount : 0,
+          loyaltyPointsDelta,
+          promoUsedDelta,
+          shiftDeltas: activeShift
+            ? { cashSales: cashPaid, cardSales: cardPaid, otherSales: otherPaid, expectedCash: cashPaid }
+            : undefined,
           auditId,
           storeId: input.storeId,
         },
@@ -2243,63 +2602,127 @@ export const useAppStore = create<AppState>((set, get) => {
       const nextDb: DatabaseSnapshot = structuredClone(db);
       const sale = nextDb.sales.find((s) => s.id === input.saleId);
       if (!sale) throw new Error('Sale not found');
+      if (sale.status === 'returned' || sale.status === 'deferred') {
+        throw new Error('Bu chek uchun qaytarish mumkin emas');
+      }
 
+      const prevReturnsForSale = nextDb.returns.filter((r) => r.saleId === sale.id);
+      const alreadyReturnedByItem = new Map<string, number>();
+      let prevReturnedQtyTotal = 0;
+      let prevRefundedTotal = 0;
+      prevReturnsForSale.forEach((r) => {
+        prevRefundedTotal += r.totalRefund;
+        r.items.forEach((ri) => {
+          alreadyReturnedByItem.set(ri.saleItemId, (alreadyReturnedByItem.get(ri.saleItemId) ?? 0) + ri.qty);
+          prevReturnedQtyTotal += ri.qty;
+        });
+      });
+
+      const netFactor = sale.subtotal > 0 ? sale.totalAmount / sale.subtotal : 1;
       const nowIso = new Date().toISOString();
       const retId = uid('ret');
-      const retNum = `QAY-${101 + nextDb.returns.length}`;
+      const retSeq = nextSeqNumber(
+        nextDb.returns.map((r) => r.number),
+        /^QAY-(\d+)$/i,
+        101
+      );
+      const retNum = `QAY-${retSeq}`;
       const movementIds: string[] = [];
 
-      const returnItems = input.items
-        .filter((it) => it.qty > 0)
-        .map((it) => {
-          const sItem = sale.items.find((si) => si.id === it.saleItemId)!;
-          const perUnit = sItem.lineTotal / sItem.qty;
-          const refundAmount = Math.round(perUnit * it.qty);
-          const mov = mutateStock(nextDb, {
-            productId: sItem.productId,
-            variantId: sItem.variantId,
-            warehouseId: sale.warehouseId,
-            storeId: sale.storeId,
-            qtyDelta: it.qty,
-            type: 'qaytarish',
-            unitCost: sItem.purchasePrice,
-            userId: user?.id ?? 'system',
-            referenceId: retId,
-            referenceType: 'Return',
-            note: `Qaytarish ${retNum} (Chek ${sale.receiptNumber})`,
-          });
-          movementIds.push(mov.id);
-          return {
-            saleItemId: sItem.id,
-            productId: sItem.productId,
-            variantId: sItem.variantId,
-            productName: sItem.productName,
-            variantLabel: sItem.variantLabel,
-            qty: it.qty,
-            refundAmount,
-            purchasePrice: sItem.purchasePrice,
-          };
+      const returnItems: Return['items'] = [];
+      let remainingRefundCap = Math.max(0, sale.totalAmount - prevRefundedTotal);
+      for (const it of input.items) {
+        if (it.qty <= 0) continue;
+        const sItem = sale.items.find((si) => si.id === it.saleItemId);
+        if (!sItem) continue;
+        const already = alreadyReturnedByItem.get(sItem.id) ?? 0;
+        const availableToReturn = Math.max(0, sItem.qty - already);
+        const safeQty = Math.min(it.qty, availableToReturn);
+        if (safeQty <= 0) continue;
+
+        const perUnitNet = sItem.qty > 0 ? (sItem.lineTotal / sItem.qty) * netFactor : 0;
+        const rawRefund = Math.round(perUnitNet * safeQty);
+        const refundAmount = Math.min(rawRefund, remainingRefundCap);
+        remainingRefundCap = Math.max(0, remainingRefundCap - refundAmount);
+
+        const mov = mutateStock(nextDb, {
+          productId: sItem.productId,
+          variantId: sItem.variantId,
+          warehouseId: sale.warehouseId,
+          storeId: sale.storeId,
+          qtyDelta: safeQty,
+          type: 'qaytarish',
+          unitCost: sItem.purchasePrice,
+          userId: user?.id ?? 'system',
+          referenceId: retId,
+          referenceType: 'Return',
+          note: `Qaytarish ${retNum} (Chek ${sale.receiptNumber})`,
         });
+        movementIds.push(mov.id);
+        returnItems.push({
+          saleItemId: sItem.id,
+          productId: sItem.productId,
+          variantId: sItem.variantId,
+          productName: sItem.productName,
+          variantLabel: sItem.variantLabel,
+          qty: safeQty,
+          refundAmount,
+          purchasePrice: sItem.purchasePrice,
+        });
+      }
+
+      if (returnItems.length === 0) {
+        throw new Error('Qaytarish uchun yaroqli mahsulot tanlanmadi');
+      }
 
       const totalRefund = returnItems.reduce((s, it) => s + it.refundAmount, 0);
       const totalSoldQty = sale.items.reduce((s, it) => s + it.qty, 0);
-      const totalReturnedQty = returnItems.reduce((s, it) => s + it.qty, 0);
-      sale.status = totalReturnedQty >= totalSoldQty ? 'returned' : 'partial_return';
+      const currentReturnedQty = returnItems.reduce((s, it) => s + it.qty, 0);
+      const cumulativeReturnedQty = prevReturnedQtyTotal + currentReturnedQty;
+      sale.status = cumulativeReturnedQty >= totalSoldQty ? 'returned' : 'partial_return';
       sale.updatedAt = nowIso;
 
       let touchedShiftId: string | undefined;
+      let shiftCashRefundDelta = 0;
       let touchedAccountId: string | undefined;
+      let accountDelta = 0;
+
       if (input.refundMethod === 'cash') {
-        const shift = nextDb.cashShifts.find((s) => s.status === 'open');
+        const shift =
+          nextDb.cashShifts.find((s) => s.status === 'open' && s.storeId === sale.storeId) ??
+          nextDb.cashShifts.find((s) => s.status === 'open');
         if (shift) {
           shift.cashRefundsTotal += totalRefund;
           shift.expectedCash -= totalRefund;
+          shift.updatedAt = nowIso;
           touchedShiftId = shift.id;
+          shiftCashRefundDelta = totalRefund;
         }
-        const cashAcc = nextDb.accounts.find((a) => a.type === 'cash');
+        const cashAcc = nextDb.accounts.find((a) => a.type === 'cash') ?? nextDb.accounts[0];
         if (cashAcc) {
           cashAcc.balance -= totalRefund;
           touchedAccountId = cashAcc.id;
+          accountDelta = -totalRefund;
+        }
+      } else if (['card', 'uzcard', 'humo', 'visa', 'mastercard', 'unionpay'].includes(input.refundMethod)) {
+        const cardAcc =
+          nextDb.accounts.find((a) => a.type === 'card_terminal') ??
+          nextDb.accounts.find((a) => a.type === 'cash') ??
+          nextDb.accounts[0];
+        if (cardAcc) {
+          cardAcc.balance -= totalRefund;
+          touchedAccountId = cardAcc.id;
+          accountDelta = -totalRefund;
+        }
+      } else {
+        const bankAcc =
+          nextDb.accounts.find((a) => a.type === 'bank') ??
+          nextDb.accounts.find((a) => a.type === 'card_terminal') ??
+          nextDb.accounts[0];
+        if (bankAcc) {
+          bankAcc.balance -= totalRefund;
+          touchedAccountId = bankAcc.id;
+          accountDelta = -totalRefund;
         }
       }
 
@@ -2335,9 +2758,12 @@ export const useAppStore = create<AppState>((set, get) => {
         type: 'return',
         payload: {
           returnId: retId,
+          saleId: sale.id,
           movementIds,
           shiftId: touchedShiftId,
+          shiftCashRefundDelta,
           accountId: touchedAccountId,
+          accountDelta,
           auditId,
           storeId: sale.storeId,
         },
@@ -2348,46 +2774,67 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     syncOfflineQueue: async () => {
-      const { db, cloudConnected, workspaceContext, isOnline } = get();
-      if (!db || db.offlineQueue.length === 0) return 0;
+      if (activeSyncQueuePromise) return activeSyncQueuePromise;
 
-      // Never discard queued offline items or falsely mark synced if Firebase is not connected
-      if (!isOnline || !cloudConnected || !workspaceContext) {
-        return 0;
-      }
+      const run = async (): Promise<number> => {
+        const { db, cloudConnected, workspaceContext, isOnline } = get();
+        if (!db || db.offlineQueue.length === 0) return 0;
 
-      set({ syncStatus: 'syncing' });
-
-      const remaining: OfflineSyncItem[] = [];
-      let syncedCount = 0;
-      const workingDb: DatabaseSnapshot = structuredClone(db);
-      const nowIso = new Date().toISOString();
-
-      let lastErrMsg: string | null = null;
-      for (const item of workingDb.offlineQueue) {
-        try {
-          await pushSyncItemToFirestore(workspaceContext, item, workingDb);
-          syncedCount += 1;
-          if (item.type === 'sale' || item.type === 'sale_pay_deferred') {
-            const sId = String((item.payload as Record<string, unknown>)?.saleId || '');
-            const s = workingDb.sales.find((x) => x.id === sId);
-            if (s) s.syncedAt = nowIso;
-          }
-        } catch (err) {
-          lastErrMsg = formatFirebaseErrorMessage(err, get().language);
-          remaining.push({ ...item, attempts: (item.attempts || 0) + 1 });
+        if (!cloudConnected || !workspaceContext) {
+          return 0;
         }
-      }
 
-      workingDb.offlineQueue = remaining;
-      await repository.save(workingDb);
-      set({
-        db: workingDb,
-        syncStatus: get().isOnline ? 'online' : 'offline',
-        cloudError: remaining.length > 0 ? lastErrMsg : null,
-        ...(syncedCount > 0 ? { lastSyncAt: nowIso } : {}),
+        if (!isOnline) return 0;
+        set({ syncStatus: 'syncing', isSyncingQueue: true });
+
+        const remaining: OfflineSyncItem[] = [];
+        let syncedCount = 0;
+        let lastErr: unknown = null;
+        const workingDb: DatabaseSnapshot = structuredClone(db);
+        const nowIso = new Date().toISOString();
+
+        for (const item of workingDb.offlineQueue) {
+          try {
+            await pushSyncItemToFirestore(workspaceContext, item, workingDb);
+            syncedCount += 1;
+            if (item.type === 'sale' || item.type === 'sale_pay_deferred') {
+              const sId = String((item.payload as Record<string, unknown>)?.saleId || '');
+              const s = workingDb.sales.find((x) => x.id === sId);
+              if (s) s.syncedAt = nowIso;
+            }
+          } catch (err) {
+            if (isPermissionError(err)) {
+              // Drop operations rejected by rules so queue doesn't spin forever
+              continue;
+            }
+            lastErr = err;
+            remaining.push({ ...item, attempts: (item.attempts || 0) + 1 });
+          }
+        }
+
+        // Preserve any brand-new items appended locally while pushing earlier items
+        const latestQueue = get().db?.offlineQueue ?? [];
+        const pushedIds = new Set(workingDb.offlineQueue.map((q) => q.id));
+        const concurrentAdditions = latestQueue.filter((q) => !pushedIds.has(q.id));
+        workingDb.offlineQueue = [...remaining, ...concurrentAdditions];
+
+        await repository.save(workingDb);
+        const doneIso = new Date().toISOString();
+        set({
+          db: workingDb,
+          isSyncingQueue: false,
+          syncStatus: get().isOnline ? 'online' : 'offline',
+          lastSyncCheckAt: doneIso,
+          ...(syncedCount > 0 || remaining.length === 0 ? { lastSyncAt: doneIso } : {}),
+          cloudError: remaining.length > 0 && lastErr ? formatFirebaseError(lastErr, get().language) : null,
+        });
+        return syncedCount;
+      };
+
+      activeSyncQueuePromise = run().finally(() => {
+        activeSyncQueuePromise = null;
       });
-      return syncedCount;
+      return activeSyncQueuePromise;
     },
 
     createPurchaseReceipt: async (receipt) => {
@@ -2427,7 +2874,7 @@ export const useAppStore = create<AppState>((set, get) => {
         if (variant && it.purchasePrice > 0) variant.purchasePrice = it.purchasePrice;
       });
 
-      const debt = receipt.totalAmount - receipt.paidAmount;
+      const debt = Math.max(0, receipt.totalAmount - receipt.paidAmount);
       if (debt > 0) {
         const sup = nextDb.suppliers.find((s) => s.id === receipt.supplierId);
         if (sup) sup.debtBalance += debt;
@@ -2446,8 +2893,11 @@ export const useAppStore = create<AppState>((set, get) => {
         type: 'purchase_receipt',
         payload: {
           receiptId: id,
+          supplierId: receipt.supplierId,
+          supplierDebtDelta: debt,
           movementIds,
           accountId: paidAccId,
+          accountDelta: paidAccId ? -receipt.paidAmount : 0,
           storeId: receipt.storeId,
         },
         createdAt: nowIso,
@@ -2740,7 +3190,9 @@ export const useAppStore = create<AppState>((set, get) => {
       const sup = nextDb.suppliers.find((s) => s.id === supplierId);
       const acc = nextDb.accounts.find((a) => a.id === accountId);
       if (!sup || !acc) return;
+      const prevDebt = sup.debtBalance;
       sup.debtBalance = Math.max(0, sup.debtBalance - amount);
+      const debtDelta = sup.debtBalance - prevDebt;
       acc.balance -= amount;
       const nowIso = new Date().toISOString();
       const trxId = uid('trx');
@@ -2760,7 +3212,14 @@ export const useAppStore = create<AppState>((set, get) => {
       await syncOrEnqueue(nextDb, {
         id: uid('sync'),
         type: 'supplier_debt_pay',
-        payload: { supplierId, accountId: acc.id, transactionId: trxId, storeId: acc.storeId },
+        payload: {
+          supplierId,
+          supplierDebtDelta: debtDelta,
+          accountId: acc.id,
+          accountDelta: -amount,
+          transactionId: trxId,
+          storeId: acc.storeId,
+        },
         createdAt: nowIso,
         attempts: 0,
       });
@@ -2782,13 +3241,18 @@ export const useAppStore = create<AppState>((set, get) => {
         const exp = new Date();
         exp.setDate(exp.getDate() + (nextDb.settings.cashbackExpiryDays || 180));
         loyId = uid('loy');
+        const loySeq = nextSeqNumber(
+          nextDb.loyaltyAccounts.map((l) => l.cardNumber),
+          /^SHU-(\d+)$/i,
+          1001
+        );
         nextDb.loyaltyAccounts.unshift({
           id: loyId,
           customerId: customer.id,
           tier: 'bronze',
           cashbackPercent: nextDb.settings.loyaltyTiers[0]?.cashbackPercent ?? 2,
           pointsBalance: 0,
-          cardNumber: `SHU-${1001 + nextDb.loyaltyAccounts.length}`,
+          cardNumber: `SHU-${loySeq}`,
           expiresAt: exp.toISOString(),
           storeId: customer.storeId,
           createdAt: nowIso,
@@ -2822,11 +3286,21 @@ export const useAppStore = create<AppState>((set, get) => {
       debt.updatedAt = nowIso;
 
       const cust = nextDb.customers.find((c) => c.id === debt.customerId);
-      if (cust) cust.debtBalance = Math.max(0, cust.debtBalance - applied);
+      let cDebtDelta = 0;
+      if (cust) {
+        const prevCDebt = cust.debtBalance;
+        cust.debtBalance = Math.max(0, cust.debtBalance - applied);
+        cDebtDelta = cust.debtBalance - prevCDebt;
+      }
 
       const acc =
-        nextDb.accounts.find((a) => (method === 'cash' ? a.type === 'cash' : a.type === 'card_terminal')) ??
-        nextDb.accounts[0];
+        nextDb.accounts.find((a) =>
+          method === 'cash'
+            ? a.type === 'cash'
+            : ['transfer', 'click', 'payme', 'uzum'].includes(method)
+            ? a.type === 'bank'
+            : a.type === 'card_terminal'
+        ) ?? nextDb.accounts[0];
       let trxId: string | undefined;
       if (acc) {
         acc.balance += applied;
@@ -2859,7 +3333,10 @@ export const useAppStore = create<AppState>((set, get) => {
         type: 'debt_pay',
         payload: {
           debtId: debt.id,
+          customerId: debt.customerId,
+          customerDebtDelta: cDebtDelta,
           accountId: acc?.id,
+          accountDelta: acc ? applied : 0,
           transactionId: trxId,
           auditId,
           storeId: debt.storeId,
@@ -2888,7 +3365,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
     addExpense: async (exp) => {
       const { db } = get();
-      if (!db || !get().can('manage_finance')) return;
+      if (!db || exp.amount <= 0 || !get().can('manage_finance')) return;
       const user = get().getCurrentUser();
       const nextDb: DatabaseSnapshot = structuredClone(db);
       const nowIso = new Date().toISOString();
@@ -2919,7 +3396,13 @@ export const useAppStore = create<AppState>((set, get) => {
       await syncOrEnqueue(nextDb, {
         id: uid('sync'),
         type: 'expense',
-        payload: { expenseId: id, transactionId: trxId, storeId: exp.storeId },
+        payload: {
+          expenseId: id,
+          accountId: exp.accountId,
+          accountDelta: acc ? -exp.amount : 0,
+          transactionId: trxId,
+          storeId: exp.storeId,
+        },
         createdAt: nowIso,
         attempts: 0,
       });
@@ -2953,7 +3436,14 @@ export const useAppStore = create<AppState>((set, get) => {
       await syncOrEnqueue(nextDb, {
         id: uid('sync'),
         type: 'finance_transfer',
-        payload: { fromAccountId, toAccountId, transactionId: trxId, storeId: from.storeId },
+        payload: {
+          fromAccountId,
+          toAccountId,
+          fromDelta: -amount,
+          toDelta: amount,
+          transactionId: trxId,
+          storeId: from.storeId,
+        },
         createdAt: nowIso,
         attempts: 0,
       });
@@ -3002,6 +3492,15 @@ export const useAppStore = create<AppState>((set, get) => {
         const nextPassword = userUpdates?.password?.trim()
           ? userUpdates.password.trim()
           : existingUser.password;
+        const nextPin = userUpdates?.pin?.trim()
+          ? userUpdates.pin.trim()
+          : existingUser.pin;
+        const nextPasswordHash = userUpdates?.password?.trim()
+          ? hashStaffSecret(userUpdates.password.trim())
+          : existingUser.passwordHash || (nextPassword ? hashStaffSecret(nextPassword) : undefined);
+        const nextPinHash = userUpdates?.pin?.trim()
+          ? hashStaffSecret(userUpdates.pin.trim())
+          : existingUser.pinHash || (nextPin ? hashStaffSecret(nextPin) : undefined);
         const updatedUser: User = {
           ...existingUser,
           name: emp.name,
@@ -3009,6 +3508,11 @@ export const useAppStore = create<AppState>((set, get) => {
           roleId: emp.roleId,
           ...userUpdates,
           password: nextPassword,
+          pin: nextPin,
+          ...(nextPasswordHash ? { passwordHash: nextPasswordHash } : {}),
+          ...(nextPinHash ? { pinHash: nextPinHash } : {}),
+          hashAlgo: 'sha256',
+          authMigrated: true,
           ...(cleanEmail ? { googleEmail: cleanEmail } : {}),
           updatedAt: nowIso,
         };
@@ -3020,12 +3524,18 @@ export const useAppStore = create<AppState>((set, get) => {
         }
         nextDb.users[uIdx] = updatedUser;
       } else {
+        const initPassword = userUpdates?.password?.trim() || '';
+        const initPin = userUpdates?.pin?.trim() || String(Math.floor(1000 + Math.random() * 8999));
         const newUser: User = {
           id: emp.userId,
           name: emp.name,
           phone: emp.phone,
-          password: userUpdates?.password?.trim() || '',
-          pin: userUpdates?.pin || String(Math.floor(1000 + Math.random() * 8999)),
+          password: initPassword,
+          pin: initPin,
+          ...(initPassword ? { passwordHash: hashStaffSecret(initPassword) } : {}),
+          ...(initPin ? { pinHash: hashStaffSecret(initPin) } : {}),
+          hashAlgo: 'sha256',
+          authMigrated: true,
           ...(cleanEmail ? { googleEmail: cleanEmail } : {}),
           roleId: emp.roleId,
           assignedStoreIds: userUpdates?.assignedStoreIds?.length ? userUpdates.assignedStoreIds : [emp.storeId],
@@ -3071,6 +3581,9 @@ export const useAppStore = create<AppState>((set, get) => {
       const deletedGoogleEmail =
         (emp.googleEmail || linkedUser?.googleEmail || '').trim().toLowerCase() || undefined;
       const nextDb: DatabaseSnapshot = structuredClone(db);
+      const deletedTargetIds = nextDb.targets
+        .filter((tg) => tg.employeeId === empId)
+        .map((tg) => tg.id);
       nextDb.employees = nextDb.employees.filter((e) => e.id !== empId);
       nextDb.users = nextDb.users.filter((u) => u.id !== emp.userId);
       nextDb.targets = nextDb.targets.filter((tg) => tg.employeeId !== empId);
@@ -3080,6 +3593,7 @@ export const useAppStore = create<AppState>((set, get) => {
         payload: {
           empId,
           deletedUserId: emp.userId,
+          deletedTargetIds,
           storeId: emp.storeId,
           ...(deletedGoogleEmail ? { deletedGoogleEmail } : {}),
         },
@@ -3096,7 +3610,11 @@ export const useAppStore = create<AppState>((set, get) => {
       const user = nextDb.users.find((u) => u.id === userId);
       if (!user) return { ok: false, error: 'Foydalanuvchi topilmadi' };
 
-      if (input.currentPassword !== undefined && user.password && input.currentPassword !== user.password) {
+      if (
+        input.currentPassword !== undefined &&
+        (user.password || user.passwordHash) &&
+        !matchesSecret(user.password, user.passwordHash, input.currentPassword)
+      ) {
         return { ok: false, error: "Joriy parol noto'g'ri" };
       }
       if (input.newPin !== undefined) {
@@ -3104,11 +3622,16 @@ export const useAppStore = create<AppState>((set, get) => {
         if (!/^\d{4,6}$/.test(cleanPin)) {
           return { ok: false, error: "PIN-kod 4–6 ta raqamdan iborat bo'lishi kerak" };
         }
-        const duplicate = nextDb.users.find((u) => u.id !== userId && u.pin === cleanPin && u.isActive);
+        const duplicate = nextDb.users.find(
+          (u) => u.id !== userId && u.isActive && matchesSecret(u.pin, u.pinHash, cleanPin)
+        );
         if (duplicate) {
           return { ok: false, error: `Bu PIN-kod (${cleanPin}) boshqa xodimda band` };
         }
         user.pin = cleanPin;
+        user.pinHash = hashStaffSecret(cleanPin);
+        user.hashAlgo = 'sha256';
+        user.authMigrated = true;
       }
       if (input.newPassword !== undefined) {
         const cleanPass = input.newPassword.trim();
@@ -3116,6 +3639,9 @@ export const useAppStore = create<AppState>((set, get) => {
           return { ok: false, error: "Yangi parol kamida 4 ta belgidan iborat bo'lishi kerak" };
         }
         user.password = cleanPass;
+        user.passwordHash = hashStaffSecret(cleanPass);
+        user.hashAlgo = 'sha256';
+        user.authMigrated = true;
       }
       if (input.name !== undefined && input.name.trim()) {
         user.name = input.name.trim();
@@ -3157,10 +3683,15 @@ export const useAppStore = create<AppState>((set, get) => {
       if (!db) throw new Error('DB not loaded');
       const nextDb: DatabaseSnapshot = structuredClone(db);
       const nowIso = new Date().toISOString();
+      const webSeq = nextSeqNumber(
+        nextDb.onlineOrders.map((o) => o.orderNumber),
+        /^WEB-(\d+)$/i,
+        205
+      );
       const order: OnlineOrder = {
         ...orderInput,
         id: uid('ord'),
-        orderNumber: `WEB-${205 + nextDb.onlineOrders.length}`,
+        orderNumber: `WEB-${webSeq}`,
         status: 'new',
         createdAt: nowIso,
         updatedAt: nowIso,
@@ -3184,19 +3715,36 @@ export const useAppStore = create<AppState>((set, get) => {
 
     updateOnlineOrderStatus: async (orderId, status) => {
       const { db } = get();
-      if (!db || !get().can('manage_online_orders')) return;
+      if (!db || !get().can('manage_online_orders')) {
+        return { ok: false, error: "Ruxsat yo'q" };
+      }
       const user = get().getCurrentUser();
       const nextDb: DatabaseSnapshot = structuredClone(db);
       const ord = nextDb.onlineOrders.find((o) => o.id === orderId);
-      if (!ord) return;
+      if (!ord) return { ok: false, error: 'Buyurtma topilmadi' };
       const prevStatus = ord.status;
+      if (prevStatus === status) return { ok: true };
+
+      const whId = get().getWarehouseForStore(ord.storeId);
+      if (prevStatus === 'new' && status === 'confirmed' && !nextDb.settings.allowNegativeStock) {
+        for (const it of ord.items) {
+          const available =
+            nextDb.stockItems.find((s) => s.variantId === it.variantId && s.warehouseId === whId)?.qty ?? 0;
+          if (it.qty > available) {
+            return {
+              ok: false,
+              error: `"${it.productName}" omborda yetarli emas (${available} ta qolgan)`,
+            };
+          }
+        }
+      }
+
       const nowIso = new Date().toISOString();
       ord.status = status;
       ord.updatedAt = nowIso;
 
       const movementIds: string[] = [];
       if (prevStatus === 'new' && status === 'confirmed') {
-        const whId = get().getWarehouseForStore(ord.storeId);
         ord.items.forEach((it) => {
           const prod = nextDb.products.find((p) => p.id === it.productId);
           const variant = prod?.variants.find((v) => v.id === it.variantId);
@@ -3216,7 +3764,6 @@ export const useAppStore = create<AppState>((set, get) => {
           movementIds.push(mov.id);
         });
       } else if (prevStatus === 'confirmed' && status === 'canceled') {
-        const whId = get().getWarehouseForStore(ord.storeId);
         ord.items.forEach((it) => {
           const prod = nextDb.products.find((p) => p.id === it.productId);
           const variant = prod?.variants.find((v) => v.id === it.variantId);
@@ -3244,6 +3791,7 @@ export const useAppStore = create<AppState>((set, get) => {
         createdAt: nowIso,
         attempts: 0,
       });
+      return { ok: true };
     },
 
     upsertStore: async (store) => {
@@ -3666,7 +4214,7 @@ export const useAppStore = create<AppState>((set, get) => {
         const res = await migrateLocalAdditionsToWorkspace(workspaceContext, imported, {
           includeSeedLike: true,
         });
-        await get().checkAndSyncNow();
+        await get().forceSyncNow();
         return {
           uploadedCount: res.uploadedCount,
           skippedDuplicates: res.skippedDuplicates,
@@ -3704,7 +4252,7 @@ export const useAppStore = create<AppState>((set, get) => {
         const res = await migrateLocalAdditionsToWorkspace(workspaceContext, db, {
           includeSeedLike: true,
         });
-        await get().checkAndSyncNow();
+        await get().forceSyncNow();
         return {
           ok: true,
           uploadedCount: res.uploadedCount,
@@ -3715,7 +4263,7 @@ export const useAppStore = create<AppState>((set, get) => {
           ok: false,
           uploadedCount: 0,
           skippedDuplicates: 0,
-          error: formatFirebaseErrorMessage(err, get().language),
+          error: formatFirebaseError(err, get().language),
         };
       }
     },

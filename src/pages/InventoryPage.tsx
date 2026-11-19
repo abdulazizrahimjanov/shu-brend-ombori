@@ -138,6 +138,7 @@ export const InventoryPage: React.FC = () => {
   const [poSupplierId, setPoSupplierId] = useState('');
   const [poVariantId, setPoVariantId] = useState('');
   const [poQty, setPoQty] = useState(15);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const variantLookup = useMemo(() => {
     const map = new Map<string, { product: Product; variant: Variant }>();
@@ -636,25 +637,32 @@ export const InventoryPage: React.FC = () => {
                 />
                 <button
                   type="button"
+                  disabled={isSubmitting}
                   onClick={async () => {
-                    const wh = db.warehouses.find((w) => w.id === activeStocktakeWh);
-                    const discrepancyVal = stocktakeItems.reduce(
-                      (s, it) => s + (it.countedQty - it.systemQty) * it.unitCost,
-                      0
-                    );
-                    const st = await saveStocktake({
-                      number: `INV-${String(db.stocktakes.length + 1).padStart(3, '0')}`,
-                      warehouseId: activeStocktakeWh,
-                      status: 'in_progress',
-                      items: stocktakeItems,
-                      totalDiscrepancyValue: discrepancyVal,
-                      storeId: wh?.storeId ?? db.stores[0].id,
-                    });
-                    await applyStocktake(st.id);
-                    setStocktakeItems([]);
-                    notify('Inventarizatsiya tasdiqlandi va qoldiqlar tuzatildi', 'success');
+                    if (isSubmitting) return;
+                    setIsSubmitting(true);
+                    try {
+                      const wh = db.warehouses.find((w) => w.id === activeStocktakeWh);
+                      const discrepancyVal = stocktakeItems.reduce(
+                        (s, it) => s + (it.countedQty - it.systemQty) * it.unitCost,
+                        0
+                      );
+                      const st = await saveStocktake({
+                        number: `INV-${String(db.stocktakes.length + 1).padStart(3, '0')}`,
+                        warehouseId: activeStocktakeWh,
+                        status: 'in_progress',
+                        items: stocktakeItems,
+                        totalDiscrepancyValue: discrepancyVal,
+                        storeId: wh?.storeId ?? db.stores[0].id,
+                      });
+                      await applyStocktake(st.id);
+                      setStocktakeItems([]);
+                      notify('Inventarizatsiya tasdiqlandi va qoldiqlar tuzatildi', 'success');
+                    } finally {
+                      setIsSubmitting(false);
+                    }
                   }}
-                  className="h-10 px-4 rounded-lg bg-emerald-600 text-white text-xs font-semibold inline-flex items-center gap-1.5"
+                  className="h-10 px-4 rounded-lg bg-emerald-600 disabled:opacity-50 text-white text-xs font-semibold inline-flex items-center gap-1.5"
                 >
                   <Check className="w-4 h-4" />
                   <span>Tuzatishni qo'llash</span>
@@ -809,11 +817,18 @@ export const InventoryPage: React.FC = () => {
                   {sup.debtBalance > 0 && can('manage_finance') && (
                     <button
                       type="button"
+                      disabled={isSubmitting}
                       onClick={async () => {
-                        await paySupplierDebt(sup.id, sup.debtBalance, db.accounts[0]?.id ?? 'acc-cash-1');
-                        notify("Ta'minotchi qarzi to'landi", 'success');
+                        if (isSubmitting) return;
+                        setIsSubmitting(true);
+                        try {
+                          await paySupplierDebt(sup.id, sup.debtBalance, db.accounts[0]?.id ?? 'acc-cash-1');
+                          notify("Ta'minotchi qarzi to'landi", 'success');
+                        } finally {
+                          setIsSubmitting(false);
+                        }
                       }}
-                      className="px-2.5 py-1 rounded bg-slate-900 dark:bg-slate-700 text-white text-[11px] font-medium"
+                      className="px-2.5 py-1 rounded bg-slate-900 dark:bg-slate-700 disabled:opacity-50 text-white text-[11px] font-medium"
                     >
                       Qarzni yopish
                     </button>
@@ -1068,23 +1083,33 @@ export const InventoryPage: React.FC = () => {
             </div>
             <button
               type="button"
-              disabled={recItems.length === 0}
+              disabled={recItems.length === 0 || isSubmitting}
               onClick={async () => {
-                const totalAmount = recItems.reduce((s, i) => s + i.total, 0);
-                const wh = db.warehouses.find((w) => w.id === recWarehouseId);
-                await createPurchaseReceipt({
-                  number: `KIR-${String(db.purchaseReceipts.length + 19).padStart(3, '0')}`,
-                  supplierId: recSupplierId,
-                  warehouseId: recWarehouseId,
-                  categoryId: recCategoryId !== 'all' ? recCategoryId : undefined,
-                  items: recItems,
-                  totalAmount,
-                  paidAmount: recPaid,
-                  paymentStatus: recPaid >= totalAmount ? 'paid' : recPaid > 0 ? 'partial' : 'debt',
-                  storeId: wh?.storeId ?? db.stores[0].id,
-                });
-                notify('Kirim hujjati saqlandi', 'success');
-                setRecOpen(false);
+                if (isSubmitting || recItems.length === 0) return;
+                if (!Number.isFinite(recPaid) || recPaid < 0) {
+                  notify("To'langan summa manfiy bo'lishi mumkin emas", 'error');
+                  return;
+                }
+                setIsSubmitting(true);
+                try {
+                  const totalAmount = recItems.reduce((s, i) => s + i.total, 0);
+                  const wh = db.warehouses.find((w) => w.id === recWarehouseId);
+                  await createPurchaseReceipt({
+                    number: `KIR-${String(db.purchaseReceipts.length + 19).padStart(3, '0')}`,
+                    supplierId: recSupplierId,
+                    warehouseId: recWarehouseId,
+                    categoryId: recCategoryId !== 'all' ? recCategoryId : undefined,
+                    items: recItems,
+                    totalAmount,
+                    paidAmount: recPaid,
+                    paymentStatus: recPaid >= totalAmount ? 'paid' : recPaid > 0 ? 'partial' : 'debt',
+                    storeId: wh?.storeId ?? db.stores[0].id,
+                  });
+                  notify('Kirim hujjati saqlandi', 'success');
+                  setRecOpen(false);
+                } finally {
+                  setIsSubmitting(false);
+                }
               }}
               className="w-full h-11 rounded-xl bg-teal-700 text-white text-xs font-semibold disabled:opacity-40"
             >
@@ -1377,18 +1402,24 @@ export const InventoryPage: React.FC = () => {
             ))}
             <button
               type="button"
-              disabled={trfItems.length === 0 || trfFrom === trfTo}
+              disabled={trfItems.length === 0 || trfFrom === trfTo || isSubmitting}
               onClick={async () => {
-                const wh = db.warehouses.find((w) => w.id === trfFrom);
-                await createTransfer({
-                  number: `TRF-${String(db.transfers.length + 1).padStart(3, '0')}`,
-                  fromWarehouseId: trfFrom,
-                  toWarehouseId: trfTo,
-                  items: trfItems,
-                  storeId: wh?.storeId ?? db.stores[0].id,
-                });
-                notify("Ko'chirish yuborildi", 'success');
-                setTrfOpen(false);
+                if (isSubmitting || trfItems.length === 0 || trfFrom === trfTo) return;
+                setIsSubmitting(true);
+                try {
+                  const wh = db.warehouses.find((w) => w.id === trfFrom);
+                  await createTransfer({
+                    number: `TRF-${String(db.transfers.length + 1).padStart(3, '0')}`,
+                    fromWarehouseId: trfFrom,
+                    toWarehouseId: trfTo,
+                    items: trfItems,
+                    storeId: wh?.storeId ?? db.stores[0].id,
+                  });
+                  notify("Ko'chirish yuborildi", 'success');
+                  setTrfOpen(false);
+                } finally {
+                  setIsSubmitting(false);
+                }
               }}
               className="w-full h-11 rounded-xl bg-teal-700 text-white text-xs font-semibold disabled:opacity-40"
             >
@@ -1422,31 +1453,42 @@ export const InventoryPage: React.FC = () => {
             <input value={woNote} onChange={(e) => setWoNote(e.target.value)} placeholder="Izoh" className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs" />
             <button
               type="button"
+              disabled={isSubmitting}
               onClick={async () => {
+                if (isSubmitting) return;
+                if (!Number.isFinite(woQty) || woQty <= 0) {
+                  notify("Miqdor 0 dan katta bo'lishi kerak", 'error');
+                  return;
+                }
                 const found = variantLookup.get(woVariantId);
                 if (!found) return;
-                const item: WriteOffItem = {
-                  productId: found.product.id,
-                  variantId: found.variant.id,
-                  productName: found.product.name,
-                  variantLabel: found.variant.sku,
-                  qty: woQty,
-                  unitCost: found.variant.purchasePrice,
-                };
-                const wh = db.warehouses.find((w) => w.id === woWarehouse);
-                await createWriteOff({
-                  number: `CHI-${String(db.writeOffs.length + 1).padStart(3, '0')}`,
-                  warehouseId: woWarehouse,
-                  reason: woReason,
-                  items: [item],
-                  totalCost: item.qty * item.unitCost,
-                  note: woNote,
-                  storeId: wh?.storeId ?? db.stores[0].id,
-                });
-                notify('Hisobdan chiqarildi', 'info');
-                setWoOpen(false);
+                setIsSubmitting(true);
+                try {
+                  const item: WriteOffItem = {
+                    productId: found.product.id,
+                    variantId: found.variant.id,
+                    productName: found.product.name,
+                    variantLabel: found.variant.sku,
+                    qty: woQty,
+                    unitCost: found.variant.purchasePrice,
+                  };
+                  const wh = db.warehouses.find((w) => w.id === woWarehouse);
+                  await createWriteOff({
+                    number: `CHI-${String(db.writeOffs.length + 1).padStart(3, '0')}`,
+                    warehouseId: woWarehouse,
+                    reason: woReason,
+                    items: [item],
+                    totalCost: item.qty * item.unitCost,
+                    note: woNote,
+                    storeId: wh?.storeId ?? db.stores[0].id,
+                  });
+                  notify('Hisobdan chiqarildi', 'info');
+                  setWoOpen(false);
+                } finally {
+                  setIsSubmitting(false);
+                }
               }}
-              className="w-full h-11 rounded-xl bg-red-600 text-white text-xs font-semibold"
+              className="w-full h-11 rounded-xl bg-red-600 disabled:opacity-50 text-white text-xs font-semibold"
             >
               Hisobdan chiqarish
             </button>
@@ -1725,6 +1767,11 @@ export const InventoryPage: React.FC = () => {
                 return;
               }
 
+              if (!res.ok) {
+                setProdError(res.error || 'Bu nomdagi mahsulot katalogda allaqachon mavjud');
+                return;
+              }
+
               if (recCategoryId !== 'all' && recCategoryId !== targetCatId) {
                 setRecCategoryId(targetCatId);
               }
@@ -1873,24 +1920,35 @@ export const InventoryPage: React.FC = () => {
             <input type="number" min={1} value={poQty} onChange={(e) => setPoQty(Number(e.target.value))} className="w-full h-10 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-xs font-mono" />
             <button
               type="button"
+              disabled={isSubmitting}
               onClick={async () => {
+                if (isSubmitting) return;
+                if (!Number.isFinite(poQty) || poQty <= 0) {
+                  notify("Buyurtma miqdori 0 dan katta bo'lishi kerak", 'error');
+                  return;
+                }
                 const found = variantLookup.get(poVariantId);
                 if (!found) return;
-                const total = found.variant.purchasePrice * poQty;
-                await createPurchaseOrder({
-                  number: `BUY-${String(db.purchaseOrders.length + 10).padStart(3, '0')}`,
-                  supplierId: poSupplierId,
-                  warehouseId: db.warehouses[0].id,
-                  items: [{ productId: found.product.id, variantId: found.variant.id, productName: found.product.name, variantLabel: found.variant.sku, qty: poQty, purchasePrice: found.variant.purchasePrice, total }],
-                  totalAmount: total,
-                  status: 'ordered',
-                  expectedDate: new Date(Date.now() + 3 * 86400000).toISOString(),
-                  storeId: db.stores[0].id,
-                });
-                notify('Buyurtma yaratildi', 'success');
-                setPoOpen(false);
+                setIsSubmitting(true);
+                try {
+                  const total = found.variant.purchasePrice * poQty;
+                  await createPurchaseOrder({
+                    number: `BUY-${String(db.purchaseOrders.length + 10).padStart(3, '0')}`,
+                    supplierId: poSupplierId,
+                    warehouseId: db.warehouses[0].id,
+                    items: [{ productId: found.product.id, variantId: found.variant.id, productName: found.product.name, variantLabel: found.variant.sku, qty: poQty, purchasePrice: found.variant.purchasePrice, total }],
+                    totalAmount: total,
+                    status: 'ordered',
+                    expectedDate: new Date(Date.now() + 3 * 86400000).toISOString(),
+                    storeId: db.stores[0].id,
+                  });
+                  notify('Buyurtma yaratildi', 'success');
+                  setPoOpen(false);
+                } finally {
+                  setIsSubmitting(false);
+                }
               }}
-              className="w-full h-10 rounded-lg bg-teal-700 text-white text-xs font-semibold"
+              className="w-full h-10 rounded-lg bg-teal-700 disabled:opacity-50 text-white text-xs font-semibold"
             >
               Buyurtma berish
             </button>

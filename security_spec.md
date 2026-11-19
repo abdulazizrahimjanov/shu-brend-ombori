@@ -7,11 +7,12 @@
    - Every single-document `get`, `create`, `update`, `delete` verifies membership on `/workspaces/{workspaceId}` and `/workspaces/{workspaceId}/members/{request.auth.uid}`.
    - Every `list` query evaluates `resource.data.ownerUid == request.auth.uid || request.auth.uid in resource.data.memberUids` (or `adminUids` on admin-restricted collections) with **zero** `get()`/`exists()` inside `allow list`.
 3. **Role & Branch Scoping (RBAC)**:
-   - `owner` and `admin` (plus bootstrapped verified admin email `a1sanjar73@gmail.com`) can manage workspace settings, stores, roles, employees, private credentials, and all branches.
-   - `manager`, `cashier`, and `warehouse` can only write documents in collections permitted by their role/custom permissions AND scoped to their `assignedStoreIds`.
+   - `owner` and `admin` (plus bootstrapped verified admin emails `assalomu408@gmail.com`, `assdsh993@gmail.com`, `a1sanjar73@gmail.com`) can manage workspace settings, stores, roles, employees, private credentials, and all branches.
+   - `manager`, `cashier`, and `warehouse` can only write documents in collections permitted by their role/custom permissions AND scoped to their `assignedStoreIds`, and branch-isolated collections enforce `canGetStoreDoc` / `canReadStoreRow` on both `get` and `list`.
 4. **PII & Credential Isolation**:
    - `/userProfiles/{uid}/private/info` is readable/writable strictly by `uid`.
-   - `/workspaces/{wsId}/staffCredentials/{staffId}` (phone, password, PIN, Google email, base salary, commission) and `/workspaces/{wsId}/privateSettings/{docId}` (OFD/Click/Payme/Telegram API keys) are restricted exclusively to workspace Owner/Admin (`adminUids`).
+   - `/workspaces/{wsId}/staffCredentials/{staffId}` (phone, `passwordHash`, `pinHash`, `hashAlgo`, `authMigrated`, Google email, base salary, commission; rejecting plaintext `password`/`pin` on create) and `/workspaces/{wsId}/privateSettings/{docId}` (OFD/Click/Payme/Telegram API keys) are restricted exclusively to workspace Owner/Admin (`adminUids`).
+   - `/workspaces/{wsId}/staffInvites/{emailHash}` stores zero-PII role/store bindings keyed by lowercase email SHA-256 hash so invited employees can claim only their admin-assigned role and branches upon Google sign-in.
 5. **Immutable & Server-Timestamped Integrity**:
    - `createdAt == request.time` on `create`.
    - `createdAt == existing().createdAt && updatedAt == request.time && ownerUid == existing().ownerUid` on `update`.

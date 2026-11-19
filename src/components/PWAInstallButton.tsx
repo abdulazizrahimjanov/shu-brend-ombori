@@ -122,45 +122,63 @@ export const PWAInstallButton: React.FC = () => {
 export const OfflineIndicator: React.FC = () => {
   const isOnline = useAppStore((s) => s.isOnline);
   const syncStatus = useAppStore((s) => s.syncStatus);
+  const cloudError = useAppStore((s) => s.cloudError);
   const cloudConnected = useAppStore((s) => s.cloudConnected);
   const pendingCount = useAppStore((s) => s.db?.offlineQueue.length ?? 0);
-  const syncOfflineQueue = useAppStore((s) => s.syncOfflineQueue);
-  const loginWithGoogle = useAppStore((s) => s.loginWithGoogle);
+  const forceSyncNow = useAppStore((s) => s.forceSyncNow);
+  const clearCloudError = useAppStore((s) => s.clearCloudError);
   const notify = useAppStore((s) => s.notify);
   const t = useT();
 
-  if (isOnline && pendingCount === 0 && syncStatus !== 'syncing') return null;
+  const showError = Boolean(cloudError && (cloudConnected || !isOnline));
+  if (isOnline && pendingCount === 0 && syncStatus !== 'syncing' && !showError) return null;
 
   return (
-    <div className="no-print fixed bottom-20 md:bottom-4 left-4 z-50 flex items-center gap-2.5 rounded-lg border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/95 px-3 py-2 text-xs font-medium text-amber-900 dark:text-amber-100 shadow-lg">
+    <div
+      className={`no-print fixed bottom-20 md:bottom-4 left-4 right-4 sm:right-auto sm:max-w-md z-50 flex items-center justify-between gap-2.5 rounded-lg border px-3 py-2 text-xs font-medium shadow-lg ${
+        showError && isOnline
+          ? 'border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-950/95 text-red-900 dark:text-red-100'
+          : 'border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/95 text-amber-900 dark:text-amber-100'
+      }`}
+    >
       {!isOnline ? (
-        <>
+        <div className="flex items-center gap-2 min-w-0">
           <WifiOff className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
-          <span>{t.common.offline}</span>
-        </>
+          <span className="truncate">
+            {t.common.offline}
+            {pendingCount > 0 ? ` (${pendingCount})` : ''}
+          </span>
+        </div>
       ) : syncStatus === 'syncing' ? (
-        <>
+        <div className="flex items-center gap-2">
           <RefreshCw className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 animate-spin shrink-0" />
           <span>{t.common.syncing}</span>
-        </>
-      ) : !cloudConnected ? (
+        </div>
+      ) : showError ? (
         <>
-          <span>
-            {t.common.syncPending}: {pendingCount}
-          </span>
-          <button
-            type="button"
-            onClick={async () => {
-              const res = await loginWithGoogle();
-              if (!res.ok && res.error) {
-                notify(res.error, 'error');
-              }
-            }}
-            className="inline-flex items-center gap-1 rounded bg-amber-600 px-2 py-1 text-[11px] text-white hover:bg-amber-700"
-          >
-            <RefreshCw className="w-3 h-3" />
-            {t.auth.googleSignIn}
-          </button>
+          <span className="line-clamp-2">{cloudError}</span>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={async () => {
+                const res = await forceSyncNow();
+                if (res.ok) notify(`${res.synced} ta yozuv sinxronlandi`, 'success');
+                else if (res.error) notify(res.error, 'error');
+              }}
+              className="inline-flex items-center gap-1 rounded bg-red-600 px-2 py-1 text-[11px] text-white hover:bg-red-700"
+            >
+              <RefreshCw className="w-3 h-3" />
+              {t.common.syncNow}
+            </button>
+            <button
+              type="button"
+              onClick={clearCloudError}
+              className="px-1.5 py-1 text-[11px] opacity-75 hover:opacity-100"
+              aria-label={t.common.close}
+            >
+              ✕
+            </button>
+          </div>
         </>
       ) : (
         <>
@@ -170,15 +188,11 @@ export const OfflineIndicator: React.FC = () => {
           <button
             type="button"
             onClick={async () => {
-              const count = await syncOfflineQueue();
-              if (count > 0) {
-                notify(`${count} ta yozuv sinxronlandi`, 'success');
-              } else {
-                const err = useAppStore.getState().cloudError;
-                notify(err || "Sinxronlash amalga oshmadi", 'error');
-              }
+              const res = await forceSyncNow();
+              if (res.ok) notify(`${res.synced} ta yozuv sinxronlandi`, 'success');
+              else if (res.error) notify(res.error, 'error');
             }}
-            className="inline-flex items-center gap-1 rounded bg-amber-600 px-2 py-1 text-[11px] text-white hover:bg-amber-700"
+            className="inline-flex items-center gap-1 rounded bg-amber-600 px-2 py-1 text-[11px] text-white hover:bg-amber-700 shrink-0"
           >
             <RefreshCw className="w-3 h-3" />
             {t.common.syncNow}

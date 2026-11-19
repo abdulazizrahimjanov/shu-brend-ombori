@@ -312,6 +312,7 @@ export const POSPage: React.FC = () => {
   const [returnQtys, setReturnQtys] = useState<Record<string, number>>({});
   const [returnReason, setReturnReason] = useState("O'lchami to'g'ri kelmadi");
   const [returnMethod, setReturnMethod] = useState<PaymentMethod>('cash');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const usbBufferRef = useRef('');
@@ -558,7 +559,7 @@ export const POSPage: React.FC = () => {
     };
     const res = await upsertProduct(product);
     if (!res.ok) {
-      notify(res.error || 'Mahsulot saqlashda xatolik', 'error');
+      notify(res.error || 'Bu mahsulot allaqachon mavjud', 'error');
       return;
     }
     await quickAddStock(pId, vId, currentWarehouseId, Math.max(1, quickProdQty), 'Savatcha tezkor yaratish');
@@ -611,23 +612,28 @@ export const POSPage: React.FC = () => {
   };
 
   const handleProceedToPayment = async () => {
-    if (cartItems.length === 0) return;
+    if (isSubmitting || cartItems.length === 0) return;
     if (hasOverStockError) {
       notify("Ba'zi tovarlar qoldig'i omborda yetarli emas", 'error');
       return;
     }
-    const tx = await createDeferredTransaction({
-      storeId: currentStoreId,
-      warehouseId: currentWarehouseId,
-      items: cartItems,
-      customerId: cartCustomerId || undefined,
-      checkDiscountAmount: totalCheckDiscount,
-      checkDiscountPercent: cartDiscountPercent,
-      loyaltyPointsSpent: effectiveLoyaltySpent,
-      promoCode: cartPromoCode || undefined,
-    });
-    clearCart();
-    navigate(`/transactions/${tx.id}?tab=payment`);
+    setIsSubmitting(true);
+    try {
+      const tx = await createDeferredTransaction({
+        storeId: currentStoreId,
+        warehouseId: currentWarehouseId,
+        items: cartItems,
+        customerId: cartCustomerId || undefined,
+        checkDiscountAmount: totalCheckDiscount,
+        checkDiscountPercent: cartDiscountPercent,
+        loyaltyPointsSpent: effectiveLoyaltySpent,
+        promoCode: cartPromoCode || undefined,
+      });
+      clearCart();
+      navigate(`/transactions/${tx.id}?tab=payment`);
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const filteredCustomers = db.customers.filter((c) => {
@@ -845,7 +851,7 @@ export const POSPage: React.FC = () => {
 
               <button
                 type="button"
-                disabled={hasOverStockError}
+                disabled={hasOverStockError || isSubmitting}
                 onClick={handleProceedToPayment}
                 className="h-12 px-6 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-bold inline-flex items-center gap-2 shadow-sm transition-colors"
               >
@@ -1460,11 +1466,18 @@ export const POSPage: React.FC = () => {
                 />
                 <button
                   type="button"
+                  disabled={isSubmitting}
                   onClick={async () => {
-                    await openShift(startingCash, currentStoreId);
-                    notify('Kassa smenasi ochildi', 'success');
+                    if (isSubmitting) return;
+                    setIsSubmitting(true);
+                    try {
+                      await openShift(Math.max(0, startingCash), currentStoreId);
+                      notify('Kassa smenasi ochildi', 'success');
+                    } finally {
+                      setIsSubmitting(false);
+                    }
                   }}
-                  className="w-full h-11 rounded-xl bg-blue-600 text-white text-sm font-bold"
+                  className="w-full h-11 rounded-xl bg-blue-600 disabled:opacity-50 text-white text-sm font-bold"
                 >
                   {t.pos.openShift}
                 </button>
@@ -1523,11 +1536,18 @@ export const POSPage: React.FC = () => {
                     />
                     <button
                       type="button"
+                      disabled={isSubmitting || cashOpAmount <= 0}
                       onClick={async () => {
-                        await recordCashOp(activeShift.id, cashOpType, cashOpAmount, cashOpReason);
-                        notify('Kassa amaliyoti saqlandi', 'success');
+                        if (isSubmitting || cashOpAmount <= 0) return;
+                        setIsSubmitting(true);
+                        try {
+                          await recordCashOp(activeShift.id, cashOpType, cashOpAmount, cashOpReason);
+                          notify('Kassa amaliyoti saqlandi', 'success');
+                        } finally {
+                          setIsSubmitting(false);
+                        }
                       }}
-                      className="h-10 px-4 rounded-lg bg-slate-900 dark:bg-slate-800 text-white font-semibold"
+                      className="h-10 px-4 rounded-lg bg-slate-900 dark:bg-slate-800 disabled:opacity-50 text-white font-semibold"
                     >
                       OK
                     </button>
@@ -1546,12 +1566,19 @@ export const POSPage: React.FC = () => {
                     />
                     <button
                       type="button"
+                      disabled={isSubmitting}
                       onClick={async () => {
-                        await closeShift(activeShift.id, actualClosingCash || activeShift.expectedCash);
-                        setShiftModalOpen(false);
-                        notify('Smena yopildi va Z-hisobot saqlandi', 'success');
+                        if (isSubmitting) return;
+                        setIsSubmitting(true);
+                        try {
+                          await closeShift(activeShift.id, actualClosingCash || activeShift.expectedCash);
+                          setShiftModalOpen(false);
+                          notify('Smena yopildi va Z-hisobot saqlandi', 'success');
+                        } finally {
+                          setIsSubmitting(false);
+                        }
                       }}
-                      className="h-10 px-4 rounded-lg bg-red-600 text-white font-semibold"
+                      className="h-10 px-4 rounded-lg bg-red-600 disabled:opacity-50 text-white font-semibold"
                     >
                       Yopish
                     </button>
@@ -1591,7 +1618,7 @@ export const POSPage: React.FC = () => {
                   {db.sales
                     .filter(
                       (s) =>
-                        s.status === 'completed' &&
+                        (s.status === 'completed' || s.status === 'partial_return') &&
                         (!returnSearch ||
                           s.receiptNumber.toLowerCase().includes(returnSearch.toLowerCase()) ||
                           (s.customerName?.toLowerCase().includes(returnSearch.toLowerCase()) ?? false))
@@ -1603,9 +1630,17 @@ export const POSPage: React.FC = () => {
                         type="button"
                         onClick={() => {
                           setSelectedSaleForReturn(s);
+                          const priorReturnedByItem: Record<string, number> = {};
+                          db.returns
+                            .filter((r) => r.saleId === s.id)
+                            .forEach((r) =>
+                              r.items.forEach((ri) => {
+                                priorReturnedByItem[ri.saleItemId] = (priorReturnedByItem[ri.saleItemId] || 0) + ri.qty;
+                              })
+                            );
                           const initQ: Record<string, number> = {};
                           s.items.forEach((it) => {
-                            initQ[it.id] = it.qty;
+                            initQ[it.id] = Math.max(0, it.qty - (priorReturnedByItem[it.id] || 0));
                           });
                           setReturnQtys(initQ);
                         }}
@@ -1630,27 +1665,40 @@ export const POSPage: React.FC = () => {
                   {selectedSaleForReturn.receiptNumber} ·{' '}
                   {formatMoney(selectedSaleForReturn.totalAmount, { lang: language })}
                 </div>
-                {selectedSaleForReturn.items.map((it) => (
-                  <div key={it.id} className="flex items-center justify-between gap-2 py-2 border-b border-slate-100 dark:border-slate-800">
-                    <div>
-                      <div className="font-semibold">{it.productName}</div>
-                      <div className="text-slate-400">Sotilgan: {it.qty}</div>
+                {selectedSaleForReturn.items.map((it) => {
+                  const alreadyRet = db.returns
+                    .filter((r) => r.saleId === selectedSaleForReturn.id)
+                    .reduce(
+                      (sum, r) =>
+                        sum + r.items.filter((ri) => ri.saleItemId === it.id).reduce((s2, ri) => s2 + ri.qty, 0),
+                      0
+                    );
+                  const remainingQty = Math.max(0, it.qty - alreadyRet);
+                  return (
+                    <div key={it.id} className="flex items-center justify-between gap-2 py-2 border-b border-slate-100 dark:border-slate-800">
+                      <div>
+                        <div className="font-semibold">{it.productName}</div>
+                        <div className="text-slate-400">
+                          Sotilgan: {it.qty} {alreadyRet > 0 ? `· Qaytgan: ${alreadyRet} · Qoldi: ${remainingQty}` : ''}
+                        </div>
+                      </div>
+                      <input
+                        type="number"
+                        min={0}
+                        max={remainingQty}
+                        disabled={remainingQty === 0}
+                        value={returnQtys[it.id] ?? 0}
+                        onChange={(e) =>
+                          setReturnQtys({
+                            ...returnQtys,
+                            [it.id]: Math.min(remainingQty, Math.max(0, Number(e.target.value))),
+                          })
+                        }
+                        className="w-16 h-9 px-2 rounded-lg border border-slate-200 dark:border-slate-700 text-center font-mono disabled:opacity-40"
+                      />
                     </div>
-                    <input
-                      type="number"
-                      min={0}
-                      max={it.qty}
-                      value={returnQtys[it.id] ?? 0}
-                      onChange={(e) =>
-                        setReturnQtys({
-                          ...returnQtys,
-                          [it.id]: Math.min(it.qty, Math.max(0, Number(e.target.value))),
-                        })
-                      }
-                      className="w-16 h-9 px-2 rounded-lg border border-slate-200 dark:border-slate-700 text-center font-mono"
-                    />
-                  </div>
-                ))}
+                  );
+                })}
                 <div className="grid grid-cols-2 gap-2">
                   <select
                     value={returnMethod}
@@ -1677,22 +1725,29 @@ export const POSPage: React.FC = () => {
                   </button>
                   <button
                     type="button"
+                    disabled={isSubmitting}
                     onClick={async () => {
+                      if (isSubmitting) return;
                       const retItems = Object.entries(returnQtys)
                         .filter(([, q]) => q > 0)
                         .map(([saleItemId, qty]) => ({ saleItemId, qty }));
                       if (retItems.length === 0) return;
-                      await processReturn({
-                        saleId: selectedSaleForReturn.id,
-                        items: retItems,
-                        refundMethod: returnMethod,
-                        reason: returnReason,
-                      });
-                      setReturnsModalOpen(false);
-                      setSelectedSaleForReturn(null);
-                      notify("Qaytarish rasmiylashtirildi va qoldiq omborga qaytdi", 'success');
+                      setIsSubmitting(true);
+                      try {
+                        await processReturn({
+                          saleId: selectedSaleForReturn.id,
+                          items: retItems,
+                          refundMethod: returnMethod,
+                          reason: returnReason,
+                        });
+                        setReturnsModalOpen(false);
+                        setSelectedSaleForReturn(null);
+                        notify("Qaytarish rasmiylashtirildi va qoldiq omborga qaytdi", 'success');
+                      } finally {
+                        setIsSubmitting(false);
+                      }
                     }}
-                    className="flex-1 h-10 rounded-xl bg-red-600 text-white font-semibold"
+                    className="flex-1 h-10 rounded-xl bg-red-600 disabled:opacity-50 text-white font-semibold"
                   >
                     Qaytarishni tasdiqlash
                   </button>

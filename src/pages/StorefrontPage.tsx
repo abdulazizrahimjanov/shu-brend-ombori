@@ -51,6 +51,7 @@ export const StorefrontPage: React.FC<{ publicStandalone?: boolean; onBackToLogi
   // Share QR modal
   const [shareOpen, setShareOpen] = useState(false);
   const [shareQrUrl, setShareQrUrl] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const catalogProducts = useMemo(() => {
     if (!db) return [];
@@ -105,24 +106,29 @@ export const StorefrontPage: React.FC<{ publicStandalone?: boolean; onBackToLogi
 
   const handlePlaceOrder = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (bag.length === 0 || !custName.trim() || !custPhone.trim()) return;
-    if (payMethod === 'online_placeholder') {
-      const res = await paymentGateway.createPaymentLink({ orderId: 'temp', amount: bagTotal, provider: 'click' });
-      notify(res.note, 'info');
+    if (isSubmitting || bag.length === 0 || !custName.trim() || !custPhone.trim()) return;
+    setIsSubmitting(true);
+    try {
+      if (payMethod === 'online_placeholder') {
+        const res = await paymentGateway.createPaymentLink({ orderId: 'temp', amount: bagTotal, provider: 'click' });
+        notify(res.note, 'info');
+      }
+      const order = await createOnlineOrder({
+        customerName: custName.trim(),
+        customerPhone: custPhone.trim(),
+        deliveryAddress: deliveryMethod === 'pickup' ? 'Do\'kondan olib ketish' : custAddress.trim(),
+        deliveryMethod,
+        paymentMethod: payMethod,
+        items: bag,
+        totalAmount: bagTotal,
+        storeId: db.stores[0].id,
+      });
+      setBag([]);
+      setPlacedOrderNum(order.orderNumber);
+      notify(`Buyurtma #${order.orderNumber} yuborildi`, 'success');
+    } finally {
+      setIsSubmitting(false);
     }
-    const order = await createOnlineOrder({
-      customerName: custName.trim(),
-      customerPhone: custPhone.trim(),
-      deliveryAddress: deliveryMethod === 'pickup' ? 'Do\'kondan olib ketish' : custAddress.trim(),
-      deliveryMethod,
-      paymentMethod: payMethod,
-      items: bag,
-      totalAmount: bagTotal,
-      storeId: db.stores[0].id,
-    });
-    setBag([]);
-    setPlacedOrderNum(order.orderNumber);
-    notify(`Buyurtma #${order.orderNumber} yuborildi`, 'success');
   };
 
   return (
@@ -330,11 +336,22 @@ export const StorefrontPage: React.FC<{ publicStandalone?: boolean; onBackToLogi
                   {ord.status === 'new' && (
                     <button
                       type="button"
+                      disabled={isSubmitting}
                       onClick={async () => {
-                        await updateOnlineOrderStatus(ord.id, 'confirmed');
-                        notify('Buyurtma tasdiqlandi va ombordan yechildi', 'success');
+                        if (isSubmitting) return;
+                        setIsSubmitting(true);
+                        try {
+                          const res = await updateOnlineOrderStatus(ord.id, 'confirmed');
+                          if (!res.ok) {
+                            notify(res.error || "Omborda yetarli qoldiq yo'q", 'error');
+                            return;
+                          }
+                          notify('Buyurtma tasdiqlandi va ombordan yechildi', 'success');
+                        } finally {
+                          setIsSubmitting(false);
+                        }
                       }}
-                      className="px-2.5 py-1 rounded bg-teal-700 text-white font-semibold"
+                      className="px-2.5 py-1 rounded bg-teal-700 disabled:opacity-50 text-white font-semibold"
                     >
                       Tasdiqlash
                     </button>
@@ -342,8 +359,17 @@ export const StorefrontPage: React.FC<{ publicStandalone?: boolean; onBackToLogi
                   {ord.status === 'confirmed' && (
                     <button
                       type="button"
-                      onClick={() => updateOnlineOrderStatus(ord.id, 'delivered')}
-                      className="px-2.5 py-1 rounded bg-emerald-600 text-white font-semibold"
+                      disabled={isSubmitting}
+                      onClick={async () => {
+                        if (isSubmitting) return;
+                        setIsSubmitting(true);
+                        try {
+                          await updateOnlineOrderStatus(ord.id, 'delivered');
+                        } finally {
+                          setIsSubmitting(false);
+                        }
+                      }}
+                      className="px-2.5 py-1 rounded bg-emerald-600 disabled:opacity-50 text-white font-semibold"
                     >
                       Yetkazildi
                     </button>
@@ -351,8 +377,17 @@ export const StorefrontPage: React.FC<{ publicStandalone?: boolean; onBackToLogi
                   {(ord.status === 'new' || ord.status === 'confirmed') && (
                     <button
                       type="button"
-                      onClick={() => updateOnlineOrderStatus(ord.id, 'canceled')}
-                      className="px-2.5 py-1 rounded border border-red-300 text-red-600 font-semibold"
+                      disabled={isSubmitting}
+                      onClick={async () => {
+                        if (isSubmitting) return;
+                        setIsSubmitting(true);
+                        try {
+                          await updateOnlineOrderStatus(ord.id, 'canceled');
+                        } finally {
+                          setIsSubmitting(false);
+                        }
+                      }}
+                      className="px-2.5 py-1 rounded border border-red-300 disabled:opacity-50 text-red-600 font-semibold"
                     >
                       Bekor qilish
                     </button>
@@ -451,7 +486,7 @@ export const StorefrontPage: React.FC<{ publicStandalone?: boolean; onBackToLogi
                       <span>Jami</span>
                       <span className="font-mono text-teal-700 dark:text-teal-400">{formatMoney(bagTotal, { lang: language })}</span>
                     </div>
-                    <button type="submit" className="w-full h-11 rounded-xl bg-teal-700 text-white text-xs font-bold">
+                    <button type="submit" disabled={isSubmitting} className="w-full h-11 rounded-xl bg-teal-700 disabled:opacity-50 text-white text-xs font-bold">
                       {t.storefront.checkout}
                     </button>
                   </form>

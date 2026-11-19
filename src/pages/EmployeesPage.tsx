@@ -98,20 +98,34 @@ export const EmployeesPage: React.FC = () => {
     if (!db) return [];
     const now = new Date();
     const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const saleById = new Map(db.sales.map((s) => [s.id, s]));
 
     return db.employees.map((emp) => {
       const linkedUser = db.users.find((u) => u.id === emp.userId);
       const empSales = db.sales.filter(
-        (s) => s.cashierId === emp.userId && s.status !== 'returned' && s.status !== 'deferred'
+        (s) =>
+          s.cashierId === emp.userId &&
+          s.status !== 'deferred' &&
+          s.createdAt.slice(0, 7) === monthKey
       );
-      const salesTotal = empSales.reduce((sum, s) => sum + s.totalAmount, 0);
-      const avgCheck = empSales.length > 0 ? Math.round(salesTotal / empSales.length) : 0;
+      const empReturns = db.returns.filter((r) => {
+        if (r.createdAt.slice(0, 7) !== monthKey) return false;
+        const orig = saleById.get(r.saleId);
+        return orig?.cashierId === emp.userId;
+      });
+      const salesTotal = Math.max(
+        0,
+        empSales.reduce((sum, s) => sum + s.totalAmount, 0) -
+          empReturns.reduce((sum, r) => sum + r.totalRefund, 0)
+      );
+      const activeSalesCount = empSales.filter((s) => s.status !== 'returned').length;
+      const avgCheck = activeSalesCount > 0 ? Math.round(salesTotal / activeSalesCount) : 0;
       const target = db.targets.find((tg) => tg.employeeId === emp.id && tg.month === monthKey)?.targetAmount ?? 30000000;
       const kpiPct = target > 0 ? Math.round((salesTotal / target) * 100) : 0;
       const commission = Math.round((salesTotal * emp.commissionPercent) / 100);
       const bonus = kpiPct >= 100 ? 500000 : 0;
       const totalPay = emp.baseSalary + commission + bonus;
-      return { emp, linkedUser, salesCount: empSales.length, salesTotal, avgCheck, target, kpiPct, commission, bonus, totalPay };
+      return { emp, linkedUser, salesCount: activeSalesCount, salesTotal, avgCheck, target, kpiPct, commission, bonus, totalPay };
     });
   }, [db]);
 
@@ -213,6 +227,14 @@ export const EmployeesPage: React.FC = () => {
 
     if (!editingEmp && !password.trim() && !googleEmail.trim()) {
       notify('Kamida parol yoki Google Email kiriting', 'error');
+      return;
+    }
+    if (!Number.isFinite(baseSalary) || baseSalary < 0) {
+      notify("Oylik maosh manfiy bo'lishi mumkin emas", 'error');
+      return;
+    }
+    if (!Number.isFinite(commissionPct) || commissionPct < 0 || commissionPct > 100) {
+      notify("Komissiya foizi 0 dan 100 gacha bo'lishi kerak", 'error');
       return;
     }
 

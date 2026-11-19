@@ -99,10 +99,10 @@ export const OnboardingWizard: React.FC<{ onGoToPos: () => void }> = ({ onGoToPo
       createdBy: 'usr-owner',
     });
     if (!res.ok) {
-      notify(res.error || 'Mahsulot saqlashda xatolik', 'error');
+      notify(res.error || "Mahsulot qo'shilmadi", 'error');
       return;
     }
-    await quickAddStock(pId, vId, whId, prodQty, 'Usta orqali boshlang\'ich qoldiq');
+    await quickAddStock(pId, vId, whId, prodQty, "Usta orqali boshlang'ich qoldiq");
     notify("Mahsulot qo'shildi", 'success');
     setStep(3);
   };

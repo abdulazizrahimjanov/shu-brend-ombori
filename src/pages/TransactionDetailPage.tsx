@@ -86,6 +86,7 @@ export const TransactionDetailPage: React.FC = () => {
   const [returnQtys, setReturnQtys] = useState<Record<string, number>>({});
   const [returnReason, setReturnReason] = useState("O'lchami to'g'ri kelmadi");
   const [returnMethod, setReturnMethod] = useState<PaymentMethod>('cash');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const sale = useMemo(() => db?.sales.find((s) => s.id === id) ?? null, [db, id]);
 
@@ -100,12 +101,20 @@ export const TransactionDetailPage: React.FC = () => {
     setOverrideCustomerId(sale.customerId ?? '');
     setCashGiven(sale.totalAmount);
     setSplitAmounts({ cash: sale.totalAmount });
+    const priorReturned: Record<string, number> = {};
+    (db?.returns ?? [])
+      .filter((r) => r.saleId === sale.id)
+      .forEach((r) =>
+        r.items.forEach((ri) => {
+          priorReturned[ri.saleItemId] = (priorReturned[ri.saleItemId] || 0) + ri.qty;
+        })
+      );
     const initRet: Record<string, number> = {};
     sale.items.forEach((it) => {
-      initRet[it.id] = it.qty;
+      initRet[it.id] = Math.max(0, it.qty - (priorReturned[it.id] || 0));
     });
     setReturnQtys(initRet);
-  }, [sale?.id]);
+  }, [sale?.id, db?.returns]);
 
   if (!db) return null;
 
@@ -178,7 +187,7 @@ export const TransactionDetailPage: React.FC = () => {
   };
 
   const handlePayNow = async () => {
-    if (sale.status !== 'deferred') return;
+    if (isSubmitting || sale.status !== 'deferred') return;
     if (!isCovered) {
       notify("To'lov summasi to'liq qoplanmagan", 'error');
       return;
@@ -204,16 +213,21 @@ export const TransactionDetailPage: React.FC = () => {
       }
     }
 
-    const updatedSale = await payDeferredTransaction(sale.id, {
-      payments: activePaymentList,
-      cashGiven: cashTarget > 0 ? effectiveCashGiven : undefined,
-      changeAmount: cashTarget > 0 ? changeAmount : undefined,
-      customerId: effectiveCustomerId || undefined,
-    });
+    setIsSubmitting(true);
+    try {
+      const updatedSale = await payDeferredTransaction(sale.id, {
+        payments: activePaymentList,
+        cashGiven: cashTarget > 0 ? effectiveCashGiven : undefined,
+        changeAmount: cashTarget > 0 ? changeAmount : undefined,
+        customerId: effectiveCustomerId || undefined,
+      });
 
-    const qrUrl = await generateSaleQr(updatedSale, db.settings.showReceiptQr);
-    setPaidSuccessSale({ sale: updatedSale, qrUrl });
-    notify(`Tranzaksiya ${updatedSale.receiptNumber} to'landi`, 'success');
+      const qrUrl = await generateSaleQr(updatedSale, db.settings.showReceiptQr);
+      setPaidSuccessSale({ sale: updatedSale, qrUrl });
+      notify(`Tranzaksiya ${updatedSale.receiptNumber} to'landi`, 'success');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const handlePrint = async (targetSale: Sale) => {
@@ -646,7 +660,7 @@ export const TransactionDetailPage: React.FC = () => {
 
                 <button
                   type="button"
-                  disabled={!isCovered}
+                  disabled={!isCovered || isSubmitting}
                   onClick={handlePayNow}
                   className="h-12 rounded-2xl bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white text-sm font-bold inline-flex items-center justify-center gap-2 shadow-sm transition-colors"
                 >
@@ -925,30 +939,43 @@ export const TransactionDetailPage: React.FC = () => {
             </div>
 
             <div className="space-y-2 max-h-60 overflow-y-auto">
-              {sale.items.map((it) => (
-                <div
-                  key={it.id}
-                  className="flex items-center justify-between gap-2 py-2 border-b border-slate-100 dark:border-slate-800 text-xs"
-                >
-                  <div className="min-w-0">
-                    <div className="font-semibold truncate">{it.productName}</div>
-                    <div className="text-slate-400">Sotilgan: {it.qty}</div>
+              {sale.items.map((it) => {
+                const alreadyRet = db.returns
+                  .filter((r) => r.saleId === sale.id)
+                  .reduce(
+                    (sum, r) =>
+                      sum + r.items.filter((ri) => ri.saleItemId === it.id).reduce((s2, ri) => s2 + ri.qty, 0),
+                    0
+                  );
+                const remainingQty = Math.max(0, it.qty - alreadyRet);
+                return (
+                  <div
+                    key={it.id}
+                    className="flex items-center justify-between gap-2 py-2 border-b border-slate-100 dark:border-slate-800 text-xs"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-semibold truncate">{it.productName}</div>
+                      <div className="text-slate-400">
+                        Sotilgan: {it.qty} {alreadyRet > 0 ? `· Qaytgan: ${alreadyRet} · Qoldi: ${remainingQty}` : ''}
+                      </div>
+                    </div>
+                    <input
+                      type="number"
+                      min={0}
+                      max={remainingQty}
+                      disabled={remainingQty === 0}
+                      value={returnQtys[it.id] ?? 0}
+                      onChange={(e) =>
+                        setReturnQtys((prev) => ({
+                          ...prev,
+                          [it.id]: Math.min(remainingQty, Math.max(0, Number(e.target.value))),
+                        }))
+                      }
+                      className="w-16 h-9 px-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-center font-mono disabled:opacity-40"
+                    />
                   </div>
-                  <input
-                    type="number"
-                    min={0}
-                    max={it.qty}
-                    value={returnQtys[it.id] ?? 0}
-                    onChange={(e) =>
-                      setReturnQtys((prev) => ({
-                        ...prev,
-                        [it.id]: Math.min(it.qty, Math.max(0, Number(e.target.value))),
-                      }))
-                    }
-                    className="w-16 h-9 px-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-center font-mono"
-                  />
-                </div>
-              ))}
+                );
+              })}
             </div>
 
             <div className="grid grid-cols-2 gap-2 text-xs">
@@ -970,28 +997,35 @@ export const TransactionDetailPage: React.FC = () => {
 
             <button
               type="button"
+              disabled={isSubmitting}
               onClick={async () => {
+                if (isSubmitting) return;
                 const itemsToReturn = Object.entries(returnQtys)
                   .filter(([, q]) => q > 0)
                   .map(([saleItemId, qty]) => ({ saleItemId, qty }));
                 if (itemsToReturn.length === 0) return;
-                await processReturn({
-                  saleId: sale.id,
-                  items: itemsToReturn,
-                  refundMethod: returnMethod,
-                  reason: returnReason,
-                  isExchange: returnModalMode === 'exchange',
-                });
-                const mode = returnModalMode;
-                setReturnModalMode(null);
-                if (mode === 'exchange') {
-                  notify("Qaytarish omborga qayd etildi — yangi tovarni Savatchadan tanlang", 'success');
-                  navigate('/pos');
-                } else {
-                  notify("Qaytarish rasmiylashtirildi", 'success');
+                setIsSubmitting(true);
+                try {
+                  await processReturn({
+                    saleId: sale.id,
+                    items: itemsToReturn,
+                    refundMethod: returnMethod,
+                    reason: returnReason,
+                    isExchange: returnModalMode === 'exchange',
+                  });
+                  const mode = returnModalMode;
+                  setReturnModalMode(null);
+                  if (mode === 'exchange') {
+                    notify("Qaytarish omborga qayd etildi — yangi tovarni Savatchadan tanlang", 'success');
+                    navigate('/pos');
+                  } else {
+                    notify("Qaytarish rasmiylashtirildi", 'success');
+                  }
+                } finally {
+                  setIsSubmitting(false);
                 }
               }}
-              className="w-full h-11 rounded-xl bg-red-600 text-white text-xs font-bold"
+              className="w-full h-11 rounded-xl bg-red-600 disabled:opacity-50 text-white text-xs font-bold"
             >
               {returnModalMode === 'exchange'
                 ? "Qaytarib, Savatchaga o'tish"
